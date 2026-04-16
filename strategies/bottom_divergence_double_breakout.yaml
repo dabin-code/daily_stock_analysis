@@ -27,15 +27,16 @@ screening:
       value: 10
   scoring:
     - field: bottom_divergence_signal_strength
-      weight: 40
+      weight: 30
       cap: 1.0
+    - field: bottom_divergence_buy_point_count
+      weight: 25
+      cap: 3
     - field: volume_ratio
       weight: 25
       cap: 5.0
     - field: trend_score
       weight: 20
-    - field: liquidity_score
-      weight: 15
 
 instructions: |
   **底背离双突破（Strategy E — 联合检测器版）**

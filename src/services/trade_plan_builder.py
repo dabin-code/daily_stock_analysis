@@ -22,7 +22,7 @@ from src.schemas.trading_types import (
 
 _STOP_LOSS_TEMPLATES: Dict[SetupType, str] = {
     SetupType.BOTTOM_DIVERGENCE_BREAKOUT: "跌破底背离确认K线低点止损",
-    SetupType.LOW123_BREAKOUT: "跌破123结构第3低点止损",
+    SetupType.LOW123_BREAKOUT: "初始跌破P3止损;突破后形成新低点→止损上移至最新低点（自然止损法）",
     SetupType.TREND_BREAKOUT: "跌破突破K线实体下沿或MA20止损",
     SetupType.TREND_PULLBACK: "跌破回踩MA20低点止损",
     SetupType.GAP_BREAKOUT: "回补缺口止损",
@@ -35,7 +35,7 @@ _DEFAULT_STOP_LOSS = "跌破近期支撑位止损"
 
 _TAKE_PROFIT_TEMPLATES: Dict[SetupType, str] = {
     SetupType.BOTTOM_DIVERGENCE_BREAKOUT: "目标前高压力位;分批止盈,首目标+10%减半",
-    SetupType.LOW123_BREAKOUT: "目标前高或MA100;突破后逐步移动止盈",
+    SetupType.LOW123_BREAKOUT: "目标前高或MA100;突破后随新低点推升止损;冲高分批减仓",
     SetupType.TREND_BREAKOUT: "沿MA10移动止盈;跌破MA10减仓",
     SetupType.TREND_PULLBACK: "反弹至前高区域止盈;跌破MA20离场",
     SetupType.GAP_BREAKOUT: "持仓3日内冲高减仓;缩量回落离场",
@@ -48,7 +48,7 @@ _DEFAULT_TAKE_PROFIT = "分批止盈;跌破关键均线离场"
 
 _ADD_RULE_TEMPLATES: Dict[SetupType, str] = {
     SetupType.BOTTOM_DIVERGENCE_BREAKOUT: "突破前高+放量确认后加仓;最多加仓1次;跌破加仓K低点取消",
-    SetupType.LOW123_BREAKOUT: "突破颈线+放量后加仓;最多加仓1次;跌破颈线取消",
+    SetupType.LOW123_BREAKOUT: "回踩P2支撑位+缩量企稳二次加仓;最多加仓1次;跌破P2支撑取消",
     SetupType.TREND_BREAKOUT: "回踩MA20不破+放量反弹加仓;最多加仓1次;跌破MA20取消",
     SetupType.TREND_PULLBACK: "二次回踩MA20+缩量企稳加仓;最多加仓1次;跌破前低取消",
     SetupType.GAP_BREAKOUT: "缺口上方放量突破前高加仓;最多加仓1次;回补缺口取消",
@@ -133,19 +133,47 @@ class TradePlanBuilder:
 
         is_add_on = trade_stage == TradeStage.ADD_ON_STRENGTH
 
+        # 底背离双突破：用检测器输出的量化数据替代文本模板
+        stop_loss_rule = _STOP_LOSS_TEMPLATES.get(setup_type, _DEFAULT_STOP_LOSS)
+        take_profit_plan = _TAKE_PROFIT_TEMPLATES.get(setup_type, _DEFAULT_TAKE_PROFIT)
+        initial_position = (
+            _ADD_ON_POSITION.get(risk_level, "1/3仓")
+            if is_add_on
+            else _PROBE_POSITION.get(risk_level, "1/5仓")
+        )
+
+        if setup_type == SetupType.BOTTOM_DIVERGENCE_BREAKOUT:
+            exit_plan = factor_snapshot.get("bottom_divergence_exit_plan") or {}
+            buy_points = factor_snapshot.get("bottom_divergence_buy_points") or []
+
+            sl_price = exit_plan.get("initial_stop_loss")
+            if sl_price:
+                stop_loss_rule = (
+                    f"止损价{sl_price:.2f}（底背离新低点下方3%）；"
+                    f"方法：自然止损法，突破后每形成新低点→止损上移至最新低点"
+                )
+
+            tp_targets = exit_plan.get("take_profit_targets", [])
+            if tp_targets:
+                take_profit_plan = "；".join(
+                    f"{t['label']}→{t['action']}" for t in tp_targets
+                )
+
+            # 从买点结构中提取仓位建议
+            triggered_bps = [bp for bp in buy_points if bp.get("triggered")]
+            if triggered_bps:
+                latest_bp = max(triggered_bps, key=lambda x: x.get("level", 0))
+                initial_position = latest_bp.get("position_ratio", initial_position)
+
         return TradePlan(
-            initial_position=(
-                _ADD_ON_POSITION.get(risk_level, "1/3仓")
-                if is_add_on
-                else _PROBE_POSITION.get(risk_level, "1/5仓")
-            ),
+            initial_position=initial_position,
             add_rule=(
                 _ADD_RULE_TEMPLATES.get(setup_type, _DEFAULT_ADD_RULE)
                 if is_add_on
                 else None
             ),
-            stop_loss_rule=_STOP_LOSS_TEMPLATES.get(setup_type, _DEFAULT_STOP_LOSS),
-            take_profit_plan=_TAKE_PROFIT_TEMPLATES.get(setup_type, _DEFAULT_TAKE_PROFIT),
+            stop_loss_rule=stop_loss_rule,
+            take_profit_plan=take_profit_plan,
             invalidation_rule=_INVALIDATION_RULE,
             risk_level=risk_level,
             holding_expectation=(

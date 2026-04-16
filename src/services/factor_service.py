@@ -582,6 +582,10 @@ class FactorService:
                 "pattern_123_stop_loss": None,
                 "pattern_123_signal_strength": 0.0,
                 "pattern_123_rejection_reason": "insufficient_data",
+                "pattern_123_pullback_reentry": False,
+                "pattern_123_pullback_support_price": None,
+                "pattern_123_trailing_stop_price": None,
+                "pattern_123_trailing_stop_upgrades": 0,
             }, empty_raw
 
         # Legacy (PatternDetector) — kept for backward compat
@@ -604,13 +608,32 @@ class FactorService:
             "pattern_123_bottom": found_legacy,
             "pattern_123_breakout": confirmed_legacy,
             "pattern_123_higher_low_pct": higher_low_pct,
-            # New joint-detector fields
+            # New detector fields (P2突破即confirmed，趋势线为可选加分项)
             "pattern_123_low_trendline": state == "confirmed",
             "pattern_123_state": state,
             "pattern_123_entry_price": joint.get("entry_price"),
             "pattern_123_stop_loss": joint.get("stop_loss_price"),
             "pattern_123_signal_strength": joint.get("signal_strength", 0.0),
             "pattern_123_rejection_reason": joint.get("rejection_reason"),
+            # 回踩支撑 + 动态止损
+            "pattern_123_pullback_reentry": bool(
+                joint.get("pullback_reentry") and joint["pullback_reentry"].get("detected")
+            ),
+            "pattern_123_pullback_support_price": (
+                joint["pullback_reentry"]["support_price"]
+                if joint.get("pullback_reentry") and joint["pullback_reentry"].get("detected")
+                else None
+            ),
+            "pattern_123_trailing_stop_price": (
+                joint["trailing_stop"]["price"]
+                if joint.get("trailing_stop")
+                else None
+            ),
+            "pattern_123_trailing_stop_upgrades": (
+                joint["trailing_stop"]["upgrades"]
+                if joint.get("trailing_stop")
+                else 0
+            ),
         }
         return factors, joint
 
@@ -631,6 +654,9 @@ class FactorService:
                 "bottom_divergence_sync_breakout": False,
                 "bottom_divergence_confirmation_days": None,
                 "bottom_divergence_hit_reasons": [],
+                "bottom_divergence_buy_points": [],
+                "bottom_divergence_exit_plan": None,
+                "bottom_divergence_buy_point_count": 0,
             }
 
         result = BottomDivergenceBreakoutDetector.detect(group)
@@ -654,6 +680,11 @@ class FactorService:
             "bottom_divergence_sync_breakout": result.get("double_breakout_sync", False),
             "bottom_divergence_confirmation_days": confirmation_days,
             "bottom_divergence_hit_reasons": result.get("hit_reasons", []),
+            "bottom_divergence_buy_points": result.get("buy_points", []),
+            "bottom_divergence_exit_plan": result.get("exit_plan"),
+            "bottom_divergence_buy_point_count": len([
+                bp for bp in result.get("buy_points", []) if bp.get("triggered")
+            ]),
         }
 
     @staticmethod
@@ -720,8 +751,7 @@ class FactorService:
         data_complete = bars_since_entry is not None
 
         # Low123 detector and MA100 gate both need to be fresh enough to stay
-        # actionable. Even if the detector still reports a valid confirmed
-        # structure, we suppress stale breakouts once the trendline breakout
+        # actionable. We suppress stale breakouts once the P2 breakout
         # is more than 3 bars old.
         validation_status = "confirmed"
         validation_reason: Optional[str] = None
@@ -790,9 +820,15 @@ class FactorService:
         group: pd.DataFrame,
         detector_result: dict,
     ) -> Optional[int]:
-        """Compute bars since Low123 trendline breakout confirmation."""
-        downtrend_line = detector_result.get("downtrend_line") or {}
-        confirmation_bar = downtrend_line.get("breakout_bar_index")
+        """Compute bars since Low123 P2 breakout confirmation.
+
+        Primary: breakout_p2_bar_index (actual buy signal).
+        Fallback: downtrend_line.breakout_bar_index (legacy compat).
+        """
+        confirmation_bar = detector_result.get("breakout_p2_bar_index")
+        if confirmation_bar is None:
+            downtrend_line = detector_result.get("downtrend_line") or {}
+            confirmation_bar = downtrend_line.get("breakout_bar_index")
         if confirmation_bar is None:
             return None
         try:
@@ -948,15 +984,13 @@ def _build_ma100_low123_hit_reasons(
             f"{tl_status}{tl_detail}"
         )
 
-    # 3. P2 突破与趋势线突破同步性
+    # 3. P2 突破确认（趋势线为加分项）
     bo_p2 = raw.get("breakout_point2_confirmed", False)
     bo_tl = raw.get("breakout_trendline_confirmed", False)
     if bo_p2 and bo_tl:
-        reasons.append("【同步突破】P2高点与下降趋势线同步突破确认")
+        reasons.append("【P2突破】已突破P2高点确认买入信号，趋势线同步突破（加分项）")
     elif bo_p2:
-        reasons.append("【P2突破】已突破P2高点，趋势线未突破")
-    elif bo_tl:
-        reasons.append("【趋势线突破】已突破下降趋势线，P2高点未突破")
+        reasons.append("【P2突破】已突破P2高点确认买入信号")
 
     # 4. MA100 站上确认
     ma100_val = ma100_factors.get("ma100", 0)
@@ -965,7 +999,20 @@ def _build_ma100_low123_hit_reasons(
         f"MA100={ma100_val:.2f}，距离{distance_pct:.1f}%"
     )
 
-    # 5. 信号强度
+    # 5. 回踩支撑 + 动态止损
+    pb = raw.get("pullback_reentry") or {}
+    if pb.get("detected"):
+        reasons.append(
+            f"【回踩加仓】回踩P2支撑位{pb['support_price']:.2f}，"
+            f"深度{pb['depth_pct']:.1f}%，企稳确认"
+        )
+    ts = raw.get("trailing_stop") or {}
+    if ts.get("upgrades", 0) > 0:
+        reasons.append(
+            f"【动态止损】止损已从P3上移{ts['upgrades']}次至{ts['price']:.2f}"
+        )
+
+    # 6. 信号强度
     entry_price = pattern_123_factors.get("pattern_123_entry_price")
     stop_loss = pattern_123_factors.get("pattern_123_stop_loss")
     reasons.append(

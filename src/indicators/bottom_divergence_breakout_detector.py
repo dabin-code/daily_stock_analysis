@@ -118,6 +118,8 @@ def _empty_result(
         "signal_strength": 0.0,
         "rejection_reason": rejection_reason,
         "hit_reasons": [],
+        "buy_points": [],
+        "exit_plan": None,
     }
 
 
@@ -704,11 +706,43 @@ class BottomDivergenceBreakoutDetector:
 
         entry_price = None
         stop_loss_price = None
+        # 书中要求止损设在"新低点下方"，留3%缓冲
+        initial_stop_loss = round(min(a_price, b_price) * 0.97, 4)
 
         if state == "confirmed":
             entry_bar = confirmation_bar
             entry_price = round(float(close.iloc[entry_bar]), 4)
-            stop_loss_price = round(min(a_price, b_price), 4)
+            stop_loss_price = initial_stop_loss
+
+        # --- 三级买点（书中：递进买入） ---
+        tl_proj = dtl.get("projected_value_at_breakout")
+        buy_points = cls._build_buy_points(
+            tl_breakout_bar=tl_breakout_bar,
+            tl_breakout_confirmed=tl_breakout_confirmed,
+            tl_projected_price=tl_proj,
+            h_breakout_bar=h_breakout_bar,
+            h_breakout_confirmed=h_breakout_confirmed,
+            h_price=h_price,
+            initial_stop_loss=initial_stop_loss,
+            close=close,
+            low_col=df["low"].reset_index(drop=True) if "low" in df.columns else close,
+        )
+
+        # --- 退出计划（书中：自然止损法 + 分批止盈） ---
+        exit_plan = {
+            "initial_stop_loss": initial_stop_loss,
+            "critical_zone_lower": round(min(
+                tl_proj or initial_stop_loss,
+                h_price * 0.97,
+            ), 4),
+            "take_profit_targets": [
+                {"pct": 10, "action": "减半仓", "label": "首目标+10%"},
+                {"pct": 20, "action": "再减1/4", "label": "次目标+20%"},
+                {"remaining": True, "action": "跌破最近低点清仓", "label": "尾仓跟踪止损"},
+            ],
+            "invalidation_days": 3,
+            "trailing_stop_method": "natural_stop_loss",
+        }
 
         # --- 信号强度 ---
         signal_strength = cls._compute_signal_strength(
@@ -752,6 +786,8 @@ class BottomDivergenceBreakoutDetector:
             double_sync=double_sync,
             state=state,
             signal_strength=signal_strength,
+            buy_points=buy_points,
+            exit_plan=exit_plan,
         )
 
         return {
@@ -778,7 +814,106 @@ class BottomDivergenceBreakoutDetector:
             "signal_strength": round(signal_strength, 4),
             "rejection_reason": None,
             "hit_reasons": hit_reasons,
+            "buy_points": buy_points,
+            "exit_plan": exit_plan,
         }
+
+    @classmethod
+    def _build_buy_points(
+        cls,
+        *,
+        tl_breakout_bar: Optional[int],
+        tl_breakout_confirmed: bool,
+        tl_projected_price: Optional[float],
+        h_breakout_bar: Optional[int],
+        h_breakout_confirmed: bool,
+        h_price: float,
+        initial_stop_loss: float,
+        close: pd.Series,
+        low_col: pd.Series,
+    ) -> List[Dict[str, Any]]:
+        """构建书中三级递进买点。
+
+        买点1: 趋势线突破（轻仓试探，1/5仓）
+        买点2: 阻力线突破（确认加仓，1/3仓）
+        买点3: 回踩支撑（再加仓，1/3仓）— 突破阻力线后回踩原阻力位
+        """
+        buy_points: List[Dict[str, Any]] = []
+
+        # 买点1 — 趋势线突破
+        bp1_price = round(tl_projected_price, 4) if tl_projected_price else None
+        buy_points.append({
+            "level": 1,
+            "label": "趋势线突破",
+            "trigger_price": bp1_price,
+            "trigger_bar_index": tl_breakout_bar,
+            "triggered": tl_breakout_confirmed,
+            "position_ratio": "1/5仓",
+            "stop_loss_price": initial_stop_loss,
+        })
+
+        # 买点2 — 阻力线突破
+        # 止损设在趋势线与阻力线临界区域下沿
+        bp2_stop = round(min(
+            h_price * 0.97,
+            tl_projected_price * 0.97 if tl_projected_price else h_price * 0.97,
+        ), 4)
+        buy_points.append({
+            "level": 2,
+            "label": "阻力线突破",
+            "trigger_price": round(h_price, 4),
+            "trigger_bar_index": h_breakout_bar,
+            "triggered": h_breakout_confirmed,
+            "position_ratio": "1/3仓",
+            "stop_loss_price": bp2_stop,
+        })
+
+        # 买点3 — 回踩支撑
+        pullback = None
+        if h_breakout_confirmed and h_breakout_bar is not None:
+            pullback = cls._detect_pullback_support(
+                close=close,
+                low_col=low_col,
+                resistance_price=h_price,
+                breakout_bar=h_breakout_bar,
+            )
+        buy_points.append({
+            "level": 3,
+            "label": "回踩支撑",
+            "trigger_price": round(pullback["price"], 4) if pullback else round(h_price, 4),
+            "trigger_bar_index": pullback["bar_index"] if pullback else None,
+            "triggered": pullback is not None,
+            "position_ratio": "1/3仓",
+            "stop_loss_price": round(h_price * 0.97, 4),
+        })
+
+        return buy_points
+
+    @staticmethod
+    def _detect_pullback_support(
+        *,
+        close: pd.Series,
+        low_col: pd.Series,
+        resistance_price: float,
+        breakout_bar: int,
+        scan_window: int = 20,
+        tolerance: float = 0.02,
+    ) -> Optional[Dict[str, Any]]:
+        """检测突破阻力线后的回踩支撑买点。
+
+        书中描述：突破阻力线后回踩，在原阻力线（现支撑线）附近企稳买入。
+        条件：bar.low 回到阻力线附近（±容差），且 bar.close 站稳阻力线上方。
+        """
+        upper_bound = min(len(close), breakout_bar + scan_window)
+        for i in range(breakout_bar + 1, upper_bound):
+            bar_low = float(low_col.iloc[i])
+            bar_close = float(close.iloc[i])
+            # 回踩到阻力线附近（下探到阻力线 × (1 + tolerance) 以内）
+            if bar_low <= resistance_price * (1 + tolerance):
+                # 且收盘站稳阻力线上方
+                if bar_close >= resistance_price:
+                    return {"bar_index": i, "price": round(bar_close, 4)}
+        return None
 
     @staticmethod
     def _get_date_str(df: pd.DataFrame, idx: int) -> str:
@@ -819,6 +954,8 @@ class BottomDivergenceBreakoutDetector:
         double_sync: bool,
         state: str,
         signal_strength: float,
+        buy_points: Optional[List[Dict[str, Any]]] = None,
+        exit_plan: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         """构建命中原因列表（中文描述）。"""
         reasons: List[str] = []
@@ -910,6 +1047,26 @@ class BottomDivergenceBreakoutDetector:
 
         # 7. 信号强度
         reasons.append(f"【信号强度】综合评分 {signal_strength:.4f}")
+
+        # 8. 三级买点状态
+        if buy_points:
+            for bp in buy_points:
+                status = "已触发" if bp.get("triggered") else "待触发"
+                tp = bp.get("trigger_price")
+                tp_str = f"{tp:.2f}" if tp is not None else "待定"
+                sl = bp.get("stop_loss_price", 0)
+                reasons.append(
+                    f"【买点{bp['level']}】{bp['label']}：{status}，"
+                    f"触发价{tp_str}，仓位{bp['position_ratio']}，止损{sl:.2f}"
+                )
+
+        # 9. 退出计划
+        if exit_plan:
+            isl = exit_plan.get("initial_stop_loss", 0)
+            reasons.append(
+                f"【止损计划】初始止损{isl:.2f}（新低点下方3%），"
+                f"方法：自然止损法（逐步上移）"
+            )
 
         return reasons
 
