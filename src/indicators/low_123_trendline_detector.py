@@ -1,20 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-低位123 + 下降趋势线联合检测器。
+低位123检测器（趋势线为可选加分项）。
 
-识别完整的买入结构："低位123反转 + 下降压力线确认突破"。
+识别交易结构："低位123反转 — 结构成立 / 观察 / 突破成熟"。
+趋势线突破作为信号强度加分项，不作为结构是否成立的门控条件。
 
 设计文档：docs/superpowers/specs/2026-03-24-low-123-trendline-design.md
 
 输出状态说明：
   rejected       — 前置条件不满足（无先行下跌 / 非低位）
-  structure_only — 123结构已形成，但尚无可执行买点（趋势线未突破）
-  confirmed      — 联合确认：P2 与趋势线在同步窗口内同时突破
-  late_or_weak   — P2已突破但趋势线突破滞后 / 不同步
+  structure_only — 123结构已形成，但最新收盘价仍未站上 P3
+  watching       — 123结构已形成，且最新收盘价 > P3 但尚未突破 P2
+  breakout_ready — 最新收盘价已突破 P2，次日重点观察买入
 """
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -31,8 +33,10 @@ _LOOKBACK = 80                 # 候选搜索的最大回溯根数
 _LOW_POS_WINDOW = 60           # 判断"低位"时使用的观察窗口
 _LOW_POS_RANK = 0.30           # P1 须处于窗口价格区间最低 30% 分位以内
 _MIN_BOUNCE_PCT = 0.025        # P1→P2 最小反弹幅度（2.5%）
-_MAX_RETRACE_PCT = 0.85        # P2→P3 最大回撤比例（P3 不能太深）
-_MIN_RETRACE_PCT = 0.15        # P2→P3 最小回撤比例（确保结构有意义）
+# 历史兼容参数：低位123不再以 P2→P3 回撤深度作为硬门槛，
+# 仅保留 P3 > P1 的结构要求。detect() 仍保留这两个参数以兼容旧调用。
+_MAX_RETRACE_PCT = 0.85
+_MIN_RETRACE_PCT = 0.15
 _SYNC_WINDOW = 3               # 突破 P2 与突破趋势线的同步容忍窗口（根数）
 _TRENDLINE_TOLERANCE = 0.025   # 判断"趋势线接触"的价格容差比例
 
@@ -217,7 +221,7 @@ def _generate_candidates(
     在回溯窗口内生成所有满足条件的 P1/P2/P3 候选三元组。
 
     每个候选为字典：{p1_idx, p1_val, p2_idx, p2_val, p3_idx, p3_val}
-    按 p1_idx 升序排列（最旧在前）；调用方应从最新候选开始评估。
+    按 p1_idx 升序排列（最旧在前）；调用方应优先取最新候选。
 
     关键逻辑：对每个 P1，从最新 P2 候选开始遍历，只有在找到合法 P3 后
     才锁定该 P2。这样可避免末端的突破高点"抢占" P2 槽位，导致真正的
@@ -256,10 +260,6 @@ def _generate_candidates(
                 p3_val = float(low_col.iloc[l])
                 if p3_val <= p1_val:
                     continue
-                swing = p2_val - p1_val
-                retrace = (p2_val - p3_val) / swing if swing > 0 else 1.0
-                if retrace > max_retrace_pct or retrace < min_retrace_pct:
-                    continue
                 candidates.append({
                     "p1_idx": p1_idx, "p1_val": p1_val,
                     "p2_idx": int(h), "p2_val": p2_val,
@@ -291,10 +291,13 @@ def _rejected(reason: str) -> Dict[str, Any]:
         "downtrend_line": None,
         "breakout_point2_confirmed": False,
         "breakout_trendline_confirmed": False,
+        "breakout_p2_bar_index": None,
         "ma_confirmation": False,
         "entry_price": None,
         "stop_loss_price": None,
         "signal_strength": 0.0,
+        "pullback_reentry": None,
+        "trailing_stop": None,
     }
 
 
@@ -308,6 +311,9 @@ def _structure_result(
     entry_price: Optional[float],
     stop_loss: Optional[float],
     signal_strength: float,
+    breakout_p2_bar_index: Optional[int] = None,
+    pullback_reentry: Optional[Dict[str, Any]] = None,
+    trailing_stop: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """构造结构已识别状态的标准结果字典。"""
     return {
@@ -321,10 +327,13 @@ def _structure_result(
         "downtrend_line": downtrend_line,
         "breakout_point2_confirmed": bo_p2,
         "breakout_trendline_confirmed": bo_tl,
+        "breakout_p2_bar_index": breakout_p2_bar_index,
         "ma_confirmation": ma_conf,
         "entry_price": entry_price,
         "stop_loss_price": stop_loss,
         "signal_strength": signal_strength,
+        "pullback_reentry": pullback_reentry,
+        "trailing_stop": trailing_stop,
     }
 
 
@@ -334,12 +343,12 @@ def _structure_result(
 
 class Low123TrendlineDetector:
     """
-    低位123 + 下降趋势线联合检测器。
+        低位123 + 下降趋势线联合检测器。
 
     用法示例::
 
         result = Low123TrendlineDetector.detect(df)
-        if result["state"] == "confirmed":
+        if result["state"] == "breakout_ready":
             entry = result["entry_price"]
             stop  = result["stop_loss_price"]
     """
@@ -365,8 +374,8 @@ class Low123TrendlineDetector:
             low_pos_window: 低位判断所用的观察窗口根数。
             low_pos_rank: 低位判断的分位阈值（0~1）。
             min_bounce_pct: P1→P2 最小反弹幅度。
-            max_retrace_pct: P2→P3 最大回撤比例。
-            min_retrace_pct: P2→P3 最小回撤比例。
+            max_retrace_pct: 兼容旧调用，当前不参与结构合法性过滤。
+            min_retrace_pct: 兼容旧调用，当前不参与结构合法性过滤。
             sync_window: P2 突破与趋势线突破的同步容忍窗口（根数）。
 
         返回：
@@ -375,6 +384,21 @@ class Low123TrendlineDetector:
         df = df.reset_index(drop=True)
         if len(df) < _MIN_BARS:
             return _rejected("insufficient_data")
+
+        if max_retrace_pct != _MAX_RETRACE_PCT or min_retrace_pct != _MIN_RETRACE_PCT:
+            warnings.warn(
+                "max_retrace_pct/min_retrace_pct are deprecated no-op compatibility "
+                "parameters; low123 validity now only requires P3 > P1.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if sync_window != _SYNC_WINDOW:
+            warnings.warn(
+                "sync_window is a deprecated no-op compatibility parameter; "
+                "trendline breakout is now only a bonus signal.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
         close = df["close"]
         last_idx = len(df) - 1
@@ -387,7 +411,7 @@ class Low123TrendlineDetector:
             return _rejected("no_123_structure")
 
         # 第二步：过滤候选 — 检查前置下跌 + 低位条件
-        # 从最新 P1 开始评估，保留所有通过的候选，后续取最优
+        # 只认最近一组有效结构，旧结构自动失效。
         valid_candidates: List[Dict[str, Any]] = []
         for cand in reversed(candidates):   # 最新 P1 优先
             p1_idx = cand["p1_idx"]
@@ -409,26 +433,11 @@ class Low123TrendlineDetector:
                 return _rejected("not_low_level_position")
             return _rejected("no_prior_downtrend")
 
-        # 第三步：对每个有效候选评估趋势线 + 突破同步性
-        # 优先级：confirmed > late_or_weak > structure_only，同优先级取最新
-        best_confirmed: Optional[Dict[str, Any]] = None
-        best_late: Optional[Dict[str, Any]] = None
-        best_structure: Optional[Dict[str, Any]] = None
-
-        for cand in valid_candidates:   # 已按最新优先排列
-            result = cls._evaluate_candidate(
-                df, close, last_idx, cand, sync_window,
-            )
-            state = result["state"]
-            if state == "confirmed" and best_confirmed is None:
-                best_confirmed = result
-            elif state == "late_or_weak" and best_late is None:
-                best_late = result
-            elif state == "structure_only" and best_structure is None:
-                best_structure = result
-
-        # 返回最高优先级的结果
-        return best_confirmed or best_late or best_structure or _rejected("no_valid_structure")
+        # 第三步：只评估最近一组有效候选。
+        latest_candidate = valid_candidates[0]
+        return cls._evaluate_candidate(
+            df, close, last_idx, latest_candidate, sync_window,
+        )
 
     # -----------------------------------------------------------------------
     @classmethod
@@ -479,38 +488,127 @@ class Low123TrendlineDetector:
             p3_idx, bo_p2_bar, last_idx,
         )
 
-        # 判定状态
-        if bo_p2 and bo_tl and dtl["found"]:
-            in_sync = abs(bo_p2_bar - bo_tl_bar) <= sync_window  # type: ignore[operator]
-            if in_sync:
-                # 联合确认：同步突破
-                entry_price = float(close.iloc[bo_p2_bar])
-                stop_loss = round(p3_val, 4)
-                return _structure_result(
-                    "confirmed", p1, p2, p3, dtl,
-                    True, True, ma_conf,
-                    round(entry_price, 4), stop_loss, strength,
-                )
-            else:
-                # 突破不同步 → 滞后或弱信号
-                return _structure_result(
-                    "late_or_weak", p1, p2, p3, dtl,
-                    bo_p2, bo_tl, ma_conf,
-                    None, None, strength * 0.5,
-                )
-        elif bo_p2 and not dtl["found"]:
-            # P2 已突破但无有效趋势线，无法联合确认
+        latest_close = float(close.iloc[last_idx])
+
+        # 判定状态：
+        # - latest_close > P2 → breakout_ready
+        # - latest_close > P3 → watching
+        # - 其他 → structure_only
+        if latest_close > p2_val and bo_p2_bar is not None:
+            entry_price = float(close.iloc[bo_p2_bar])
+            stop_loss = round(p3_val, 4)
+            pb_reentry, tr_stop = cls._compute_post_breakout_signals(
+                df, close, p2_val, p3_val, bo_p2_bar, last_idx,
+            )
             return _structure_result(
-                "structure_only", p1, p2, p3, dtl,
-                bo_p2, False, ma_conf,
+                "breakout_ready", p1, p2, p3, dtl,
+                True, bo_tl, ma_conf,
+                round(entry_price, 4), stop_loss, strength,
+                breakout_p2_bar_index=int(bo_p2_bar),
+                pullback_reentry=pb_reentry,
+                trailing_stop=tr_stop,
+            )
+        if latest_close > p3_val:
+            return _structure_result(
+                "watching", p1, p2, p3, dtl,
+                False, bo_tl, ma_conf,
                 None, None, strength,
             )
         else:
             return _structure_result(
                 "structure_only", p1, p2, p3, dtl,
-                bo_p2, bo_tl, ma_conf,
+                False, bo_tl, ma_conf,
                 None, None, strength,
             )
+
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def _compute_post_breakout_signals(
+        df: pd.DataFrame,
+        close: pd.Series,
+        p2_val: float,
+        p3_val: float,
+        bo_p2_bar: int,
+        last_idx: int,
+        pullback_tolerance: float = 0.03,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """
+        计算P2突破后的两个附加信号：回踩支撑 + 动态止损推升。
+
+        回踩支撑（pullback_reentry）：
+          突破P2后价格回落至P2附近(±tolerance)并再次企稳（后续收盘>P2）。
+
+        动态止损（trailing_stop，自然止损法）：
+          从P3出发，扫描突破后的swing lows，每找到一个更高的低点就上移止损。
+        """
+        low_col = df["low"] if "low" in df.columns else close
+
+        # --- 回踩支撑检测 ---
+        pb_reentry: Dict[str, Any] = {
+            "detected": False,
+            "support_price": round(p2_val, 4),
+            "pullback_low": None,
+            "depth_pct": None,
+            "bars_since_pullback": None,
+        }
+
+        p2_lower = p2_val * (1 - pullback_tolerance)
+        scan_start = bo_p2_bar + 1
+        if scan_start <= last_idx:
+            pullback_low_val = None
+            pullback_low_idx = None
+            # 找到突破后回落至P2附近的最低点
+            for i in range(scan_start, last_idx + 1):
+                lo = float(low_col.iloc[i])
+                if lo <= p2_val * (1 + pullback_tolerance):
+                    if pullback_low_val is None or lo < pullback_low_val:
+                        pullback_low_val = lo
+                        pullback_low_idx = i
+
+            # 确认回踩后企稳：低点之后至少有一根收盘 > P2
+            if pullback_low_val is not None and pullback_low_val >= p2_lower:
+                stabilized = False
+                for j in range(pullback_low_idx + 1, last_idx + 1):
+                    if float(close.iloc[j]) > p2_val:
+                        stabilized = True
+                        break
+                if stabilized:
+                    depth = (p2_val - pullback_low_val) / p2_val if p2_val > 0 else 0.0
+                    pb_reentry = {
+                        "detected": True,
+                        "support_price": round(p2_val, 4),
+                        "pullback_low": round(pullback_low_val, 4),
+                        "depth_pct": round(depth * 100, 2),
+                        "bars_since_pullback": last_idx - pullback_low_idx,
+                    }
+
+        # --- 动态止损推升（自然止损法） ---
+        current_stop = p3_val
+        stop_source = "P3"
+        stop_idx = None
+        upgrades = 0
+
+        # 扫描突破后的swing lows
+        swing_low_col = low_col.reset_index(drop=True)
+        post_lows = find_swing_lows(swing_low_col, order=_SWING_ORDER)
+        for sl_idx in post_lows:
+            if sl_idx <= bo_p2_bar:
+                continue
+            sl_val = float(swing_low_col.iloc[sl_idx])
+            if sl_val > current_stop:
+                current_stop = sl_val
+                stop_source = "swing_low_after_breakout"
+                stop_idx = int(sl_idx)
+                upgrades += 1
+
+        tr_stop: Dict[str, Any] = {
+            "price": round(current_stop, 4),
+            "source": stop_source,
+            "swing_low_idx": stop_idx,
+            "upgrades": upgrades,
+        }
+
+        return pb_reentry, tr_stop
 
     # -----------------------------------------------------------------------
     @staticmethod
@@ -539,37 +637,37 @@ class Low123TrendlineDetector:
         信号强度评分，范围 [0, 1]，越高表示信号越强/越新鲜。
 
         各分量权重：
-          0.30 — P2 突破
-          0.30 — 趋势线突破
-          0.20 — 趋势线质量（接触点数量）
-          0.10 — 均线确认
-          0.10 — 新鲜度（距 P3 的根数）
+          0.40 — P2 突破（核心买入信号）
+          0.20 — 趋势线突破（加分项）
+          0.10 — 趋势线质量（接触点数量，加分项）
+          0.15 — 均线确认
+          0.15 — 新鲜度（距 P3 的根数）
         """
         score = 0.0
         if bo_p2:
-            score += 0.30
+            score += 0.40
         if bo_tl:
-            score += 0.30
+            score += 0.20
 
         # 趋势线质量加分
         tc = dtl.get("touch_count", 0)
         if tc >= 4:
-            score += 0.20
+            score += 0.10
         elif tc == 3:
-            score += 0.15
+            score += 0.07
         elif tc == 2:
-            score += 0.08
+            score += 0.04
 
         if ma_conf:
-            score += 0.10
+            score += 0.15
 
         # 新鲜度加分：距 P3 越近分越高
         bars_since_p3 = last_idx - p3_idx
         if bars_since_p3 <= 3:
-            score += 0.10
+            score += 0.15
         elif bars_since_p3 <= 8:
-            score += 0.06
+            score += 0.10
         elif bars_since_p3 <= 15:
-            score += 0.03
+            score += 0.05
 
         return round(min(score, 1.0), 4)

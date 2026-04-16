@@ -157,7 +157,7 @@
 ```python
 {
     "found": bool,
-    "state": "rejected" | "structure_only" | "confirmed" | "late_or_weak",
+    "state": "rejected" | "structure_only" | "confirmed",
     "rejection_reason": str | None,
     "is_low_level": bool,
     "point1": {"idx": int, "price": float} | None,
@@ -175,6 +175,7 @@
     } | None,
     "breakout_point2_confirmed": bool,
     "breakout_trendline_confirmed": bool,
+    "breakout_p2_bar_index": int | None,
     "ma_confirmation": bool,
     "entry_price": float | None,
     "stop_loss_price": float | None,
@@ -184,9 +185,10 @@
 
 交易语义约定：
 
+- `confirmed`：P2突破确认，可执行买点（趋势线突破为加分项）
 - 入场价：确认突破 `位置2` 时的入场价
 - 止损价：`位置3`
-- `structure_only`：结构已形成，但还没形成可执行买点
+- `structure_only`：结构已形成，但P2尚未被突破
 
 ## 六、文件级设计
 
@@ -199,7 +201,7 @@
 
 - `src/strategies/entry_strategies.py`
   - Strategy B 改为消费联合检测器结果
-  - 策略触发条件不再只是“123 已识别 + P2 被突破”，而是统一使用联合确认状态
+  - 策略触发条件：联合检测器 state = confirmed（P2突破确认，趋势线为加分项）
 
 - `src/services/factor_service.py`
   - 为筛选系统增加联合结构因子
@@ -289,10 +291,10 @@
 建议至少新增以下测试用例：
 
 - 纯震荡数据：应拒绝
-- 标准低位123，但未突破趋势线：应返回 `structure_only`
-- 标准低位123，同时突破 `P2` 和趋势线：应返回 `confirmed`
+- 标准低位123，P2未突破：应返回 `structure_only`
+- 标准低位123，突破 `P2`：应返回 `confirmed`（趋势线突破为加分项，不影响状态）
 - 高位123：应拒绝为非低位结构
-- 旧突破或滞后突破：应降级或拒绝
+- P2突破但趋势线延迟：应返回 `confirmed`（趋势线非门控条件）
 - 趋势线接触点质量差：应降低置信度或拒绝
 - 同一数据中存在多个候选结构：应选择“最新且质量更高”的那个，而不是第一个局部三元组
 

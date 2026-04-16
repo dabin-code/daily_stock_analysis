@@ -3,7 +3,7 @@
 
 name: ma100_low123_combined
 display_name: MA100+低位123结构
-description: 站上MA100均线 + 低位123底部反转形态联合确认。P1须在低位区间，P2与下降趋势线同步突破，且入场时效≤3根K线。
+description: 站上MA100均线 + 低位123底部反转形态进入 breakout_ready（P2突破成熟，趋势线突破为加分项），且入场时效≤3根K线。
 category: reversal
 core_rules: [1, 3]
 required_tools:
@@ -39,7 +39,7 @@ instructions: |
   **MA100+低位123结构（Strategy 2 — 联合策略）**
 
   本策略将 MA100 突破确认与低位 123 底部反转形态联合为一个选股条件。
-  核心逻辑：股价站上 MA100 均线 + 形成低位 123 反转结构 + 入场时效严格把控。
+  核心逻辑：股价站上 MA100 均线 + 低位123处于 breakout_ready 成熟态 + 入场时效严格把控。
 
   入选条件（全部满足 → ma100_low123_confirmed = True）：
 
@@ -47,16 +47,17 @@ instructions: |
      - 收盘价 > MA100 均线（above_ma100 = True）。
 
   2. **低位123底部反转确认**：
-     - Low123TrendlineDetector 检测状态为 confirmed。
+     - Low123TrendlineDetector 检测状态为 breakout_ready（P2突破即进入成熟买点）。
      - P1 须在近 60 根 K 线收盘区间最低 30% 分位内。
-     - P2 与下降趋势线在 3 根 K 线窗口内同步突破。
+     - 趋势线同步突破为加分项（提高 signal_strength），非必要条件。
+     - 若仅为 watching（收盘价 > P3 但未突破 P2），进入观察池，不进入本策略主筛选。
 
   3. **入场时效门控（硬性截断）**：
      - 123 结构突破发生在最近 3 根 K 线内（由检测器内置时效控制）。
      - 超过 3 根 K 线直接不入选。
 
   评分权重：
-  - ma100_low123_pattern_strength（45%）：123 结构信号强度，包含 P2 突破、趋势线突破、MA 确认等。
+  - ma100_low123_pattern_strength（45%）：123 结构信号强度，P2突破为核心，趋势线突破/MA确认为加分项。
   - ma100_low123_ma_score（25%）：MA100 突破天数（≤5天=1.0, ≤10天=0.7）× 距离得分。
   - volume_ratio（15%）：量比，流动性确认。
   - trend_score（15%）：趋势评分辅助确认。

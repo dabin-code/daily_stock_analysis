@@ -30,9 +30,11 @@ def _assess_bottom_divergence(fs: dict) -> EntryMaturity:
 def _assess_low123(fs: dict) -> EntryMaturity:
     state = fs.get("pattern_123_state", "")
     strength = fs.get("pattern_123_signal_strength", 0.0)
-    if state == "confirmed" and strength >= 0.5:
+    if state == "breakout_ready" and strength >= 0.5:
         return EntryMaturity.HIGH
-    if state == "confirmed":
+    if state == "breakout_ready":
+        return EntryMaturity.MEDIUM
+    if state == "watching":
         return EntryMaturity.MEDIUM
     return EntryMaturity.LOW
 

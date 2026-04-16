@@ -58,6 +58,9 @@ class TestComputePattern123Factors(unittest.TestCase):
         self.assertIn("pattern_123_bottom", result)
         self.assertIn("pattern_123_breakout", result)
         self.assertIn("pattern_123_higher_low_pct", result)
+        self.assertIn("pattern_123_watchlist", result)
+        self.assertIn("pattern_123_breakout_ready", result)
+        self.assertIn("pattern_123_state", result)
 
     def test_values_are_correct_types(self):
         from src.services.factor_service import FactorService
@@ -66,6 +69,8 @@ class TestComputePattern123Factors(unittest.TestCase):
         self.assertIsInstance(result["pattern_123_bottom"], bool)
         self.assertIsInstance(result["pattern_123_breakout"], bool)
         self.assertIsInstance(result["pattern_123_higher_low_pct"], float)
+        self.assertIsInstance(result["pattern_123_watchlist"], bool)
+        self.assertIsInstance(result["pattern_123_breakout_ready"], bool)
 
 
 class TestExtendedFactorsIncludePhase3(unittest.TestCase):

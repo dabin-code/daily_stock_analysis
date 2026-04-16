@@ -21,11 +21,13 @@ class ExtremeStrengthScorer:
         pattern_123_low_trendline: bool,
         is_limit_up: bool,
         bottom_divergence_double_breakout: bool,
+        pattern_123_watchlist: bool = False,
     ) -> float:
         """
         Calculate signal bonus (0-49 points).
         - gap_breakaway: 15
         - pattern_123_low_trendline: 12
+        - pattern_123_watchlist: 8
         - is_limit_up: 10
         - bottom_divergence_double_breakout: 12
         """
@@ -34,6 +36,8 @@ class ExtremeStrengthScorer:
             score += 15.0
         if pattern_123_low_trendline:
             score += 12.0
+        elif pattern_123_watchlist:
+            score += 8.0
         if is_limit_up:
             score += 10.0
         if bottom_divergence_double_breakout:
@@ -100,6 +104,7 @@ class ExtremeStrengthScorer:
         turnover_rate: Optional[float],
         circ_mv: Optional[float],
         breakout_ratio: float,
+        pattern_123_watchlist: bool = False,
     ) -> float:
         """
         Calculate total extreme strength score.
@@ -115,6 +120,7 @@ class ExtremeStrengthScorer:
             pattern_123_low_trendline=pattern_123_low_trendline,
             is_limit_up=is_limit_up,
             bottom_divergence_double_breakout=bottom_divergence_double_breakout,
+            pattern_123_watchlist=pattern_123_watchlist,
         )
         auxiliary = self.calculate_auxiliary_bonus(
             theme_heat_score=theme_heat_score,

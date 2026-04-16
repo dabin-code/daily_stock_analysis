@@ -49,11 +49,17 @@ class EntryMaturityAssessorTestCase(unittest.TestCase):
         result = self.assessor.assess(SetupType.BOTTOM_DIVERGENCE_BREAKOUT, fs)
         self.assertEqual(result, EntryMaturity.LOW)
 
-    def test_low123_confirmed_fresh_high(self) -> None:
-        """Low123 confirmed + 新鲜 → HIGH。"""
-        fs = {"pattern_123_state": "confirmed", "pattern_123_signal_strength": 0.8}
+    def test_low123_breakout_ready_high(self) -> None:
+        """Low123 breakout_ready → HIGH。"""
+        fs = {"pattern_123_state": "breakout_ready", "pattern_123_signal_strength": 0.8}
         result = self.assessor.assess(SetupType.LOW123_BREAKOUT, fs)
         self.assertEqual(result, EntryMaturity.HIGH)
+
+    def test_low123_watching_medium(self) -> None:
+        """Low123 watching → MEDIUM。"""
+        fs = {"pattern_123_state": "watching", "pattern_123_signal_strength": 0.4}
+        result = self.assessor.assess(SetupType.LOW123_BREAKOUT, fs)
+        self.assertEqual(result, EntryMaturity.MEDIUM)
 
     def test_trend_breakout_fresh_high(self) -> None:
         """趋势突破 ≤5 天 → HIGH。"""

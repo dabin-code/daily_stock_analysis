@@ -2,14 +2,15 @@
 """
 Tests for Low123TrendlineDetector.
 
-Scenario coverage (7 cases from design doc §9):
+Scenario coverage:
   1. Pure oscillation  → rejected (no prior downtrend)
-  2. Low-position 123, no trendline breakout → structure_only
-  3. Low-position 123 + joint breakout (P2 + trendline) → confirmed
+  2. Low-position 123, latest close > P3 but <= P2 → watching
+  3. Low-position 123 + P2 breakout (+ trendline) → breakout_ready
   4. High-position 123 → rejected (not low-level)
-  5. Late/stale breakout (beyond sync window) → late_or_weak
+  5. P2 breakout with delayed trendline → breakout_ready (trendline is bonus)
   6. Trendline with only 2 poor-quality points → lower signal_strength
-  7. Multiple candidates → picks newest + highest quality
+  7. Multiple candidates → always picks newest valid structure
+  8. Deep retrace but P3 > P1 remains a valid low123
 """
 
 import numpy as np
@@ -92,7 +93,32 @@ def _downtrend_then_low123_no_trendline_break(sync_window: int = 3) -> pd.DataFr
     return _make_df(prices, highs=highs, lows=lows)
 
 
-def _downtrend_then_confirmed_low123(sync_window: int = 3) -> pd.DataFrame:
+def _downtrend_then_low123_below_p3() -> pd.DataFrame:
+    """
+    Clear low-level 123 structure exists, but latest close is still at/below P3.
+    This should remain structure_only rather than watching.
+    """
+    n = 51
+    prices = np.zeros(n)
+    prices[:30] = _zigzag_downtrend(120, 90, 30, amplitude=4.0)
+    prices[30] = 88
+    prices[31:40] = np.linspace(88, 96, 9)
+    prices[39] = 96  # P2
+    prices[40:45] = np.linspace(96, 90, 5)
+    prices[44] = 90  # P3
+    prices[45:48] = [91.4, 91.0, 90.7]  # confirm bar 44 as the swing low
+    prices[48:] = [89.4, 89.3, 89.2]    # latest close falls back below P3 without creating a new confirmed swing low
+
+    highs = prices * 1.005
+    lows = prices * 0.995
+    highs[39] = 96.5
+    lows[30] = 87.5
+    lows[44] = 89.5
+
+    return _make_df(prices, highs=highs, lows=lows)
+
+
+def _downtrend_then_breakout_ready_low123(sync_window: int = 3) -> pd.DataFrame:
     """
     Prior downtrend with zigzag swing highs → trendline can be fitted.
     Low-level 123 formed, both P2 and trendline broken on the same bar.
@@ -273,15 +299,15 @@ class TestPureOscillation:
 
 
 # ---------------------------------------------------------------------------
-# Scenario 2: low 123 formed, no trendline breakout → structure_only
+# Scenario 2: low 123 formed, latest close above P3 → watching
 # ---------------------------------------------------------------------------
 
-class TestStructureOnlyNoTrendlineBreak:
-    def test_returns_structure_only(self):
+class TestWatchingState:
+    def test_returns_watching(self):
         df = _downtrend_then_low123_no_trendline_break()
         result = Low123TrendlineDetector.detect(df)
         assert result["found"] is True
-        assert result["state"] == "structure_only"
+        assert result["state"] == "watching"
 
     def test_points_populated(self):
         df = _downtrend_then_low123_no_trendline_break()
@@ -301,25 +327,34 @@ class TestStructureOnlyNoTrendlineBreak:
         assert result["entry_price"] is None
 
 
-# ---------------------------------------------------------------------------
-# Scenario 3: standard low 123 + joint breakout → confirmed
-# ---------------------------------------------------------------------------
-
-class TestConfirmedJointBreakout:
-    def test_returns_confirmed(self):
-        df = _downtrend_then_confirmed_low123()
+class TestStructureOnlyState:
+    def test_returns_structure_only_when_price_not_above_p3(self):
+        df = _downtrend_then_low123_below_p3()
         result = Low123TrendlineDetector.detect(df)
         assert result["found"] is True
-        assert result["state"] == "confirmed"
+        assert result["state"] == "structure_only"
+        assert result["entry_price"] is None
+
+
+# ---------------------------------------------------------------------------
+# Scenario 3: standard low 123 + joint breakout → breakout_ready
+# ---------------------------------------------------------------------------
+
+class TestBreakoutReadyJointBreakout:
+    def test_returns_breakout_ready(self):
+        df = _downtrend_then_breakout_ready_low123()
+        result = Low123TrendlineDetector.detect(df)
+        assert result["found"] is True
+        assert result["state"] == "breakout_ready"
 
     def test_both_breakouts_confirmed(self):
-        df = _downtrend_then_confirmed_low123()
+        df = _downtrend_then_breakout_ready_low123()
         result = Low123TrendlineDetector.detect(df)
         assert result["breakout_point2_confirmed"] is True
         assert result["breakout_trendline_confirmed"] is True
 
     def test_entry_and_stop_prices(self):
-        df = _downtrend_then_confirmed_low123()
+        df = _downtrend_then_breakout_ready_low123()
         result = Low123TrendlineDetector.detect(df)
         assert result["entry_price"] is not None
         assert result["stop_loss_price"] is not None
@@ -328,7 +363,7 @@ class TestConfirmedJointBreakout:
         assert result["stop_loss_price"] <= p3_price * 1.001  # tiny tolerance
 
     def test_trendline_found_with_negative_slope(self):
-        df = _downtrend_then_confirmed_low123()
+        df = _downtrend_then_breakout_ready_low123()
         result = Low123TrendlineDetector.detect(df)
         dtl = result["downtrend_line"]
         assert dtl is not None
@@ -336,7 +371,7 @@ class TestConfirmedJointBreakout:
         assert dtl["slope"] < 0
 
     def test_signal_strength_nonzero(self):
-        df = _downtrend_then_confirmed_low123()
+        df = _downtrend_then_breakout_ready_low123()
         result = Low123TrendlineDetector.detect(df)
         assert result["signal_strength"] > 0.0
 
@@ -365,21 +400,32 @@ class TestHighPosition123:
 
 
 # ---------------------------------------------------------------------------
-# Scenario 5: late/stale trendline breakout → late_or_weak
+# Scenario 5: P2 breakout with delayed trendline → breakout_ready
 # ---------------------------------------------------------------------------
 
 class TestLateBreakout:
-    def test_returns_late_or_weak(self):
+    def test_returns_breakout_ready(self):
+        """P2 breakout alone is sufficient for confirmed state."""
         df = _late_breakout()
         result = Low123TrendlineDetector.detect(df, sync_window=3)
         assert result["found"] is True
-        assert result["state"] in ("late_or_weak", "structure_only")
+        assert result["state"] == "breakout_ready"
 
-    def test_p2_breakout_confirmed_but_trendline_delayed(self):
+    def test_entry_price_set(self):
         df = _late_breakout()
         result = Low123TrendlineDetector.detect(df, sync_window=3)
-        # P2 breakout happened but sync was lost
+        assert result["entry_price"] is not None
+        assert result["stop_loss_price"] is not None
+
+    def test_p2_breakout_confirmed(self):
+        df = _late_breakout()
+        result = Low123TrendlineDetector.detect(df, sync_window=3)
         assert result["breakout_point2_confirmed"] is True
+
+    def test_breakout_p2_bar_index_present(self):
+        df = _late_breakout()
+        result = Low123TrendlineDetector.detect(df, sync_window=3)
+        assert result["breakout_p2_bar_index"] is not None
 
 
 # ---------------------------------------------------------------------------
@@ -387,12 +433,12 @@ class TestLateBreakout:
 # ---------------------------------------------------------------------------
 
 class TestTwoPointTrendline:
-    def test_still_confirmed(self):
+    def test_still_breakout_ready(self):
         df = _two_point_trendline()
         result = Low123TrendlineDetector.detect(df)
         # Should still confirm (2 touches meets minimum)
         assert result["found"] is True
-        assert result["state"] == "confirmed"
+        assert result["state"] == "breakout_ready"
 
     def test_touch_count_is_two(self):
         df = _two_point_trendline()
@@ -404,22 +450,22 @@ class TestTwoPointTrendline:
     def test_signal_strength_lower_than_confirmed(self):
         """2-touch trendline should score lower than a well-touched one."""
         df_two = _two_point_trendline()
-        df_full = _downtrend_then_confirmed_low123()
+        df_full = _downtrend_then_breakout_ready_low123()
         r_two = Low123TrendlineDetector.detect(df_two)
         r_full = Low123TrendlineDetector.detect(df_full)
         assert r_two["signal_strength"] <= r_full["signal_strength"]
 
 
 # ---------------------------------------------------------------------------
-# Scenario 7: multiple candidates → newest confirmed wins
+# Scenario 7: multiple candidates → newest valid structure wins
 # ---------------------------------------------------------------------------
 
 class TestMultipleCandidates:
-    def test_returns_confirmed_state(self):
+    def test_returns_breakout_ready_state(self):
         df = _multiple_candidates()
         result = Low123TrendlineDetector.detect(df)
         assert result["found"] is True
-        assert result["state"] == "confirmed"
+        assert result["state"] == "breakout_ready"
 
     def test_selects_newer_p1(self):
         """The selected P1 should be in the second (newer) 123 structure."""
@@ -428,6 +474,311 @@ class TestMultipleCandidates:
         p1_idx = result["point1"]["idx"]
         # First structure P1 is around bar 30, second around bar 50
         assert p1_idx >= 45, f"Expected newer P1 (idx>=45), got {p1_idx}"
+
+
+def _older_breakout_newer_watching() -> pd.DataFrame:
+    """
+    An older structure already broke out, but a newer valid structure is now
+    watching. The detector should return the newer structure instead of
+    reviving the old breakout.
+    """
+    n = 110
+    prices = np.zeros(n)
+    prices[:25] = _zigzag_downtrend(130, 95, 25, amplitude=4.0)
+
+    # Older structure — already breakout_ready.
+    prices[25] = 90
+    prices[26:34] = np.linspace(90, 98, 8)
+    prices[33] = 98
+    prices[34:39] = np.linspace(98, 92, 5)
+    prices[38] = 92
+    prices[39] = 101
+    prices[40:70] = np.linspace(101, 103, 30)
+
+    # Newer structure — valid but still watching.
+    prices[70:82] = _zigzag_downtrend(103, 86, 12, amplitude=1.8)
+    prices[82] = 84
+    prices[83:90] = np.linspace(84, 94, 7)
+    prices[89] = 94
+    prices[90:95] = np.linspace(94, 87, 5)
+    prices[94] = 87
+    prices[95:] = np.linspace(88, 92, n - 95)  # above P3 but below P2
+
+    highs = prices * 1.005
+    lows = prices * 0.995
+    highs[33] = 98.5
+    lows[25] = 89.5
+    lows[38] = 91.5
+    highs[39] = 102.0
+    lows[82] = 83.5
+    highs[89] = 94.5
+    lows[94] = 86.5
+
+    return _make_df(prices, highs=highs, lows=lows)
+
+
+class TestLatestStructurePriority:
+    def test_prefers_newer_watching_over_older_breakout(self):
+        df = _older_breakout_newer_watching()
+        result = Low123TrendlineDetector.detect(df)
+        assert result["state"] == "watching"
+        assert result["point1"]["idx"] >= 80
+
+
+def _deep_retrace_breakout_ready() -> pd.DataFrame:
+    """
+    Deep retrace close to P1 but still P3 > P1. This should remain a valid
+    low123 and turn breakout_ready once P2 is broken.
+    """
+    n = 90
+    prices = np.zeros(n)
+    prices[:30] = _zigzag_downtrend(120, 85, 30, amplitude=4.0)
+    prices[30] = 80.0
+    prices[31:40] = np.linspace(80, 90, 9)
+    prices[39] = 90.0
+    prices[40:45] = np.linspace(90, 80.4, 5)
+    prices[44] = 80.4
+    prices[45:54] = np.linspace(80.4, 88.5, 9)
+    prices[54] = 91.5  # breakout above P2
+    prices[55:] = np.linspace(91.5, 94.0, n - 55)
+
+    highs = prices * 1.005
+    lows = prices * 0.995
+    highs[39] = 90.5
+    lows[30] = 79.8
+    lows[44] = 80.2
+    highs[54] = 92.0
+
+    return _make_df(prices, highs=highs, lows=lows)
+
+
+class TestDeepRetraceCandidate:
+    def test_deep_retrace_still_valid_when_p3_above_p1(self):
+        df = _deep_retrace_breakout_ready()
+        result = Low123TrendlineDetector.detect(df)
+        assert result["found"] is True
+        assert result["state"] == "breakout_ready"
+        assert result["point3"]["price"] > result["point1"]["price"]
+
+
+class Test603032StyleRegression:
+    def test_recent_structure_wins_instead_of_reviving_old_breakout(self):
+        """603032 风格：新结构存在时，旧结构不可在远期被重新激活。"""
+        df = _older_breakout_newer_watching()
+        result = Low123TrendlineDetector.detect(df)
+        assert result["state"] == "watching"
+        assert result["point1"]["idx"] >= 80
+
+    def test_deep_retrace_recent_structure_remains_valid(self):
+        """603032 风格：深回撤但 P3 > P1 时仍应保留为有效结构。"""
+        df = _deep_retrace_breakout_ready()
+        result = Low123TrendlineDetector.detect(df)
+        assert result["state"] == "breakout_ready"
+        assert result["point3"]["price"] > result["point1"]["price"]
+
+
+class TestDeprecatedCompatibilityParams:
+    def test_warns_when_legacy_retrace_params_are_overridden(self):
+        df = _deep_retrace_breakout_ready()
+        with pytest.warns(DeprecationWarning, match="max_retrace_pct|min_retrace_pct"):
+            Low123TrendlineDetector.detect(df, max_retrace_pct=0.2, min_retrace_pct=0.1)
+
+    def test_warns_when_sync_window_is_overridden(self):
+        df = _late_breakout()
+        with pytest.warns(DeprecationWarning, match="sync_window"):
+            Low123TrendlineDetector.detect(df, sync_window=1)
+
+
+def _confirmed_with_pullback() -> pd.DataFrame:
+    """
+    Confirmed 123 with pullback to P2 support zone:
+    Downtrend → P1(bar30) → P2(bar39,97) → P3(bar44,89) → breakout bar45(99)
+    → pullback to ~96 at bar48 → recovery above P2 at bar50.
+    """
+    n = 80
+    prices = np.zeros(n)
+    prices[:30] = _zigzag_downtrend(130, 90, 30, amplitude=5.0)
+    prices[30] = 86
+    prices[31:40] = np.linspace(86, 97, 9)
+    prices[39] = 97   # P2
+    prices[40:45] = np.linspace(97, 89, 5)
+    prices[44] = 89   # P3
+    prices[45] = 99   # breakout
+    prices[46] = 98
+    prices[47] = 96   # pullback to P2 zone
+    prices[48] = 95.5  # pullback low (within 3% of P2=97)
+    prices[49] = 97.5  # recovery above P2
+    prices[50:] = np.linspace(98, 102, n - 50)
+
+    highs = prices * 1.005
+    lows = prices * 0.995
+    highs[39] = 97.5
+    lows[30] = 85.5
+    lows[44] = 88.5
+    highs[45] = 100
+    lows[48] = 95.0  # explicit pullback low
+
+    return _make_df(prices, highs=highs, lows=lows)
+
+
+def _confirmed_no_pullback() -> pd.DataFrame:
+    """
+    Confirmed 123 where price runs away without pulling back to P2.
+    Breakout at bar45(99), then immediately jumps well above P2(97).
+    """
+    n = 80
+    prices = np.zeros(n)
+    prices[:30] = _zigzag_downtrend(130, 90, 30, amplitude=5.0)
+    prices[30] = 86
+    prices[31:40] = np.linspace(86, 97, 9)
+    prices[39] = 97   # P2
+    prices[40:45] = np.linspace(97, 89, 5)
+    prices[44] = 89   # P3
+    prices[45] = 102   # breakout well above P2
+    prices[46:] = np.linspace(103, 115, n - 46)  # straight up, never near P2
+
+    highs = prices * 1.01
+    lows = prices * 0.995
+    lows[46:] = prices[46:] * 0.99  # lows stay well above P2
+    highs[39] = 97.5
+    lows[30] = 85.5
+    lows[44] = 88.5
+    highs[45] = 103
+
+    return _make_df(prices, highs=highs, lows=lows)
+
+
+def _confirmed_with_trailing_stop_upgrade() -> pd.DataFrame:
+    """
+    Confirmed 123 with higher swing lows after breakout → trailing stop upgrade.
+
+    After breakout, price trends upward with small dips forming swing lows.
+    The dips are shallow enough (< 15% retrace of any bounce) to NOT form a
+    new valid 123 structure, but they ARE swing lows detectable by find_swing_lows.
+    """
+    n = 120
+    prices = np.zeros(n)
+    # Deep downtrend
+    prices[:50] = _zigzag_downtrend(120, 60, 50, amplitude=4.0)
+    prices[50] = 58    # P1
+    prices[51:58] = np.linspace(58, 70, 7)
+    prices[57] = 70    # P2
+    prices[58:63] = np.linspace(70, 62, 5)
+    prices[62] = 62    # P3 (> P1)
+    prices[63] = 72    # breakout bar
+    # Gentle uptrend with two small dips that form swing lows
+    # Each dip is only ~3-4 points from a peak of ~76-85 → <10% retrace
+    prices[64] = 74
+    prices[65] = 76
+    prices[66] = 77
+    prices[67] = 76.5
+    prices[68] = 76
+    prices[69] = 75
+    prices[70] = 74
+    prices[71] = 73
+    prices[72] = 72    # swing low 1 — needs 3 bars higher on each side (69,70,71 vs 73,74,75)
+    # Wait: 69=75, 70=74, 71=73 — that's DECREASING, not all > 72.
+    # For order=3 swing low, low[72] must be < low[69..71] AND < low[73..75].
+    # So I need lows[69], lows[70], lows[71] > lows[72] AND lows[73], lows[74], lows[75] > lows[72]
+    prices[73] = 73
+    prices[74] = 74
+    prices[75] = 76
+    prices[76] = 78
+    prices[77] = 80
+    prices[78] = 82
+    prices[79] = 83
+    prices[80] = 82.5
+    prices[81] = 81
+    prices[82] = 80    # swing low 2 (> swing low 1 = 72)
+    prices[83] = 81
+    prices[84] = 82
+    prices[85] = 83
+    prices[86] = 85
+    prices[87:] = np.linspace(86, 95, n - 87)
+
+    highs = prices * 1.005
+    lows = prices * 0.995
+    highs[57] = 70.5
+    lows[50] = 57.5
+    lows[62] = 61.5
+    # Swing low lows must be clearly lower than their neighbors
+    lows[72] = 71.0    # swing low 1
+    lows[82] = 79.0    # swing low 2
+
+    return _make_df(prices, highs=highs, lows=lows)
+
+
+# ---------------------------------------------------------------------------
+# Scenario 8: pullback reentry detection
+# ---------------------------------------------------------------------------
+
+class TestPullbackReentry:
+    def test_pullback_detected(self):
+        df = _confirmed_with_pullback()
+        result = Low123TrendlineDetector.detect(df)
+        assert result["state"] == "breakout_ready"
+        pb = result["pullback_reentry"]
+        assert pb is not None
+        assert pb["detected"] is True
+        assert pb["support_price"] > 0
+        assert pb["depth_pct"] is not None
+
+    def test_no_pullback(self):
+        df = _confirmed_no_pullback()
+        result = Low123TrendlineDetector.detect(df)
+        assert result["state"] == "breakout_ready"
+        pb = result["pullback_reentry"]
+        assert pb is not None
+        assert pb["detected"] is False
+
+    def test_watching_has_no_pullback(self):
+        df = _downtrend_then_low123_no_trendline_break()
+        result = Low123TrendlineDetector.detect(df)
+        assert result["pullback_reentry"] is None
+
+    def test_rejected_has_no_pullback(self):
+        df = _pure_oscillation()
+        result = Low123TrendlineDetector.detect(df)
+        assert result["pullback_reentry"] is None
+
+
+# ---------------------------------------------------------------------------
+# Scenario 9: trailing stop upgrade
+# ---------------------------------------------------------------------------
+
+class TestTrailingStop:
+    def test_trailing_stop_upgraded(self):
+        """
+        Confirmed 123 should detect trailing stop upgrades when higher swing
+        lows form after the breakout bar.
+        """
+        df = _confirmed_with_trailing_stop_upgrade()
+        result = Low123TrendlineDetector.detect(df)
+        assert result["state"] == "breakout_ready"
+        ts = result["trailing_stop"]
+        assert ts is not None
+        # At minimum, trailing stop price >= P3
+        assert ts["price"] >= result["point3"]["price"]
+        # If upgrades happened, source should be swing_low_after_breakout
+        if ts["upgrades"] > 0:
+            assert ts["price"] > result["point3"]["price"]
+            assert ts["source"] == "swing_low_after_breakout"
+
+    def test_no_upgrade_when_no_higher_low(self):
+        """Confirmed 123 with joint breakout — short data, no higher swing low."""
+        df = _downtrend_then_breakout_ready_low123()
+        result = Low123TrendlineDetector.detect(df)
+        assert result["state"] == "breakout_ready"
+        ts = result["trailing_stop"]
+        assert ts is not None
+        assert ts["source"] in ("P3", "swing_low_after_breakout")
+        # Even if no upgrade, price >= P3
+        assert ts["price"] >= result["point3"]["price"]
+
+    def test_structure_only_has_no_trailing_stop(self):
+        df = _downtrend_then_low123_no_trendline_break()
+        result = Low123TrendlineDetector.detect(df)
+        assert result["trailing_stop"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -441,13 +792,16 @@ class TestOutputSchema:
         "found", "state", "rejection_reason", "is_low_level",
         "point1", "point2", "point3", "downtrend_line",
         "breakout_point2_confirmed", "breakout_trendline_confirmed",
+        "breakout_p2_bar_index",
         "ma_confirmation", "entry_price", "stop_loss_price", "signal_strength",
+        "pullback_reentry", "trailing_stop",
     }
 
     @pytest.mark.parametrize("make_df", [
         _pure_oscillation,
+        _downtrend_then_low123_below_p3,
         _downtrend_then_low123_no_trendline_break,
-        _downtrend_then_confirmed_low123,
+        _downtrend_then_breakout_ready_low123,
         _high_position_123,
     ])
     def test_all_keys_present(self, make_df):
@@ -457,7 +811,7 @@ class TestOutputSchema:
         assert not missing, f"Missing keys: {missing}"
 
     def test_point_structure_when_found(self):
-        df = _downtrend_then_confirmed_low123()
+        df = _downtrend_then_breakout_ready_low123()
         result = Low123TrendlineDetector.detect(df)
         for pt in ("point1", "point2", "point3"):
             p = result[pt]
@@ -465,7 +819,7 @@ class TestOutputSchema:
             assert "idx" in p and "price" in p
 
     def test_downtrend_line_sub_schema(self):
-        df = _downtrend_then_confirmed_low123()
+        df = _downtrend_then_breakout_ready_low123()
         result = Low123TrendlineDetector.detect(df)
         dtl = result["downtrend_line"]
         required = {

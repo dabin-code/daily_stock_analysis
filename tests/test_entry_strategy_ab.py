@@ -9,7 +9,7 @@ Strategy A: Trendline Breakout
 
 Strategy B: 123 Bottom Reversal
   - Detects 123 bottom pattern
-  - Breakout above Point 2 confirmed
+  - watching / breakout_ready state machine
   - Above MA100 filter (optional)
 """
 
@@ -140,6 +140,22 @@ class TestEntryStrategyB(unittest.TestCase):
         self.assertIn("point1", p)
         self.assertIn("point2", p)
         self.assertIn("point3", p)
+
+    def test_triggered_only_when_breakout_ready(self):
+        """Strategy B should only trigger on breakout_ready, not watching."""
+        from src.strategies.entry_strategies import EntryStrategyB
+        from tests.test_low_123_trendline_detector import (
+            _downtrend_then_breakout_ready_low123,
+            _downtrend_then_low123_no_trendline_break,
+        )
+
+        watching_result = EntryStrategyB.evaluate(_downtrend_then_low123_no_trendline_break())
+        ready_result = EntryStrategyB.evaluate(_downtrend_then_breakout_ready_low123())
+
+        self.assertFalse(watching_result["triggered"])
+        self.assertEqual(watching_result["pattern_123_state"], "watching")
+        self.assertTrue(ready_result["triggered"])
+        self.assertEqual(ready_result["pattern_123_state"], "breakout_ready")
 
     def test_stale_breakout_not_triggered(self):
         """Strategy B must NOT trigger when the breakout is too old."""

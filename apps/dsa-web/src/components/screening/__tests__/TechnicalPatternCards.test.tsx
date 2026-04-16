@@ -61,7 +61,7 @@ describe('extractTechnicalPatterns', () => {
       expect(patterns).toHaveLength(1);
       expect(patterns[0]).toMatchObject({
         id: 'ma100_low123',
-        name: 'MA100+低位123结构',
+        name: 'MA100+低位123突破成熟',
         signalStrength: 0.75,
       });
       expect(patterns[0].metrics).toHaveLength(2);
@@ -78,6 +78,29 @@ describe('extractTechnicalPatterns', () => {
 
       expect(patterns).toHaveLength(1);
       expect(patterns[0].id).toBe('ma100_low123');
+    });
+
+    it('extracts MA100+Low123 watchlist pattern', () => {
+      const snapshot: ScreeningFactorSnapshot = {
+        above_ma100: true,
+        ma100_low123_watchlist: true,
+        ma100_low123_pattern_strength: 0.61,
+        ma100_low123_ma_score: 0.72,
+        ma100_low123_watch_hit_reasons: ['【观察池】最新收盘价已大于P3但尚未突破P2，纳入重点观察'],
+      };
+
+      const patterns = extractTechnicalPatterns(snapshot);
+
+      expect(patterns).toHaveLength(1);
+      expect(patterns[0]).toMatchObject({
+        id: 'ma100_low123_watchlist',
+        name: 'MA100+低位123观察池',
+        signalStrength: 0.61,
+      });
+      expect(patterns[0].hitReasons).toEqual([
+        '【观察池】最新收盘价已大于P3但尚未突破P2，纳入重点观察',
+      ]);
+      expect(patterns.map((pattern) => pattern.id)).not.toContain('above_ma100');
     });
   });
 
@@ -116,6 +139,7 @@ describe('extractTechnicalPatterns', () => {
     it('extracts standalone pattern_123 when not part of combo', () => {
       const snapshot: ScreeningFactorSnapshot = {
         pattern_123_low_trendline: true,
+        pattern_123_state: 'breakout_ready',
         pattern_123_entry_price: 8.0,
         pattern_123_stop_loss: 7.5,
         pattern_123_signal_strength: 0.7,
@@ -126,7 +150,23 @@ describe('extractTechnicalPatterns', () => {
       expect(patterns).toHaveLength(1);
       expect(patterns[0]).toMatchObject({
         id: 'pattern_123',
-        name: '低位123趋势线突破',
+        name: '低位123突破成熟',
+      });
+    });
+
+    it('extracts standalone watching pattern when not above ma100 combo', () => {
+      const snapshot: ScreeningFactorSnapshot = {
+        pattern_123_state: 'watching',
+        pattern_123_signal_strength: 0.52,
+      };
+
+      const patterns = extractTechnicalPatterns(snapshot);
+
+      expect(patterns).toHaveLength(1);
+      expect(patterns[0]).toMatchObject({
+        id: 'pattern_123',
+        name: '低位123观察中',
+        signalStrength: 0.52,
       });
     });
   });

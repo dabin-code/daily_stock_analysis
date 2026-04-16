@@ -76,7 +76,31 @@ function extractMA100Low123Pattern(snapshot: ScreeningFactorSnapshot): Technical
 
   return {
     id: 'ma100_low123',
-    name: 'MA100+低位123结构',
+    name: 'MA100+低位123突破成熟',
+    signalStrength: snapshot.ma100_low123_pattern_strength,
+    metrics,
+    hitReasons,
+  };
+}
+
+function extractMA100Low123WatchlistPattern(snapshot: ScreeningFactorSnapshot): TechnicalPattern | null {
+  if (!snapshot.ma100_low123_watchlist) return null;
+
+  const metrics: TechnicalPatternMetric[] = [];
+  if (snapshot.ma100_low123_pattern_strength != null) {
+    metrics.push(createMetric('形态强度', snapshot.ma100_low123_pattern_strength));
+  }
+  if (snapshot.ma100_low123_ma_score != null) {
+    metrics.push(createMetric('MA评分', snapshot.ma100_low123_ma_score));
+  }
+
+  const hitReasons = Array.isArray(snapshot.ma100_low123_watch_hit_reasons)
+    ? snapshot.ma100_low123_watch_hit_reasons
+    : [];
+
+  return {
+    id: 'ma100_low123_watchlist',
+    name: 'MA100+低位123观察池',
     signalStrength: snapshot.ma100_low123_pattern_strength,
     metrics,
     hitReasons,
@@ -108,10 +132,17 @@ function extractMA10060minPattern(snapshot: ScreeningFactorSnapshot): TechnicalP
 }
 
 function extractPattern123Pattern(snapshot: ScreeningFactorSnapshot): TechnicalPattern | null {
-  if (!snapshot.pattern_123_low_trendline) return null;
+  const state = snapshot.pattern_123_state;
+  const isBreakoutReady = snapshot.pattern_123_breakout_ready ?? snapshot.pattern_123_low_trendline ?? state === 'breakout_ready';
+  const isWatching = snapshot.pattern_123_watchlist ?? state === 'watching';
+  if (!isBreakoutReady && !isWatching) return null;
   if (snapshot.ma100_low123_confirmed) return null;
+  if (snapshot.ma100_low123_watchlist) return null;
 
   const metrics: TechnicalPatternMetric[] = [];
+  if (state) {
+    metrics.push(createMetric('状态', state === 'breakout_ready' ? '突破成熟' : state === 'watching' ? '观察中' : state));
+  }
   if (snapshot.pattern_123_entry_price != null) {
     metrics.push(createMetric('入场参考', snapshot.pattern_123_entry_price));
   }
@@ -124,7 +155,7 @@ function extractPattern123Pattern(snapshot: ScreeningFactorSnapshot): TechnicalP
 
   return {
     id: 'pattern_123',
-    name: '低位123趋势线突破',
+    name: isWatching ? '低位123观察中' : '低位123突破成熟',
     signalStrength: snapshot.pattern_123_signal_strength,
     metrics,
     hitReasons: [],
@@ -152,7 +183,12 @@ function extractSimplePatterns(snapshot: ScreeningFactorSnapshot): TechnicalPatt
     });
   }
 
-  if (snapshot.above_ma100 && !snapshot.ma100_low123_confirmed && !snapshot.ma100_60min_confirmed) {
+  if (
+    snapshot.above_ma100
+    && !snapshot.ma100_low123_confirmed
+    && !snapshot.ma100_low123_watchlist
+    && !snapshot.ma100_60min_confirmed
+  ) {
     patterns.push({
       id: 'above_ma100',
       name: '站上MA100',
@@ -175,6 +211,9 @@ export function extractTechnicalPatterns(
 
   const ma100Low123 = extractMA100Low123Pattern(snapshot);
   if (ma100Low123) patterns.push(ma100Low123);
+
+  const ma100Low123Watchlist = extractMA100Low123WatchlistPattern(snapshot);
+  if (ma100Low123Watchlist) patterns.push(ma100Low123Watchlist);
 
   const ma10060min = extractMA10060minPattern(snapshot);
   if (ma10060min) patterns.push(ma10060min);

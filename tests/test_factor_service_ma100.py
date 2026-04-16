@@ -200,7 +200,7 @@ class TestMA100Low123CombinedFactors(unittest.TestCase):
             "volume": np.full(80, 1_000_000.0),
         })
 
-    def test_confirmed_when_above_ma100_and_low123_confirmed(self):
+    def test_confirmed_when_above_ma100_and_low123_breakout_ready(self):
         group = self._make_raw_group()
         ma100_factors = {
             "above_ma100": True,
@@ -210,7 +210,9 @@ class TestMA100Low123CombinedFactors(unittest.TestCase):
         }
         pattern_123_factors = {
             "pattern_123_low_trendline": True,
-            "pattern_123_state": "confirmed",
+            "pattern_123_breakout_ready": True,
+            "pattern_123_watchlist": False,
+            "pattern_123_state": "breakout_ready",
             "pattern_123_entry_price": 98.5,
             "pattern_123_stop_loss": 92.0,
             "pattern_123_signal_strength": 0.84,
@@ -219,6 +221,7 @@ class TestMA100Low123CombinedFactors(unittest.TestCase):
             "point1": {"idx": 60, "price": 88.0},
             "point2": {"idx": 67, "price": 96.0},
             "point3": {"idx": 72, "price": 91.0},
+            "breakout_p2_bar_index": 77,
             "downtrend_line": {
                 "found": True,
                 "touch_count": 3,
@@ -240,6 +243,7 @@ class TestMA100Low123CombinedFactors(unittest.TestCase):
         )
 
         self.assertTrue(result["ma100_low123_confirmed"])
+        self.assertFalse(result["ma100_low123_watchlist"])
         self.assertTrue(result["ma100_low123_data_complete"])
         self.assertAlmostEqual(result["ma100_low123_pattern_strength"], 0.84)
         self.assertGreater(result["ma100_low123_ma_score"], 0.0)
@@ -261,7 +265,9 @@ class TestMA100Low123CombinedFactors(unittest.TestCase):
         }
         pattern_123_factors = {
             "pattern_123_low_trendline": True,
-            "pattern_123_state": "confirmed",
+            "pattern_123_breakout_ready": True,
+            "pattern_123_watchlist": False,
+            "pattern_123_state": "breakout_ready",
             "pattern_123_entry_price": 98.5,
             "pattern_123_stop_loss": 92.0,
             "pattern_123_signal_strength": 0.84,
@@ -270,6 +276,7 @@ class TestMA100Low123CombinedFactors(unittest.TestCase):
             "point1": {"idx": 60, "price": 88.0},
             "point2": {"idx": 67, "price": 96.0},
             "point3": {"idx": 72, "price": 91.0},
+            "breakout_p2_bar_index": 73,
             "downtrend_line": {
                 "found": True,
                 "touch_count": 3,
@@ -308,18 +315,15 @@ class TestMA100Low123CombinedFactors(unittest.TestCase):
         }
         pattern_123_factors = {
             "pattern_123_low_trendline": True,
-            "pattern_123_state": "confirmed",
+            "pattern_123_breakout_ready": True,
+            "pattern_123_watchlist": False,
+            "pattern_123_state": "breakout_ready",
             "pattern_123_entry_price": 98.5,
             "pattern_123_stop_loss": 92.0,
             "pattern_123_signal_strength": 0.84,
         }
         pattern_123_raw = {
-            "downtrend_line": {
-                "found": True,
-                "touch_count": 3,
-                "breakout_bar_index": 76,
-                "breakout_confirmed": True,
-            },
+            "breakout_p2_bar_index": 76,
         }
 
         result = FactorService._compute_ma100_low123_combined_factors(
@@ -341,18 +345,15 @@ class TestMA100Low123CombinedFactors(unittest.TestCase):
         }
         pattern_123_factors = {
             "pattern_123_low_trendline": True,
-            "pattern_123_state": "confirmed",
+            "pattern_123_breakout_ready": True,
+            "pattern_123_watchlist": False,
+            "pattern_123_state": "breakout_ready",
             "pattern_123_entry_price": 98.5,
             "pattern_123_stop_loss": 92.0,
             "pattern_123_signal_strength": 0.84,
         }
         pattern_123_raw = {
-            "downtrend_line": {
-                "found": True,
-                "touch_count": 3,
-                "breakout_bar_index": 75,
-                "breakout_confirmed": True,
-            },
+            "breakout_p2_bar_index": 75,
         }
 
         result = FactorService._compute_ma100_low123_combined_factors(
@@ -366,7 +367,7 @@ class TestMA100Low123CombinedFactors(unittest.TestCase):
         self.assertEqual(result["ma100_low123_validation_status"], "stale_breakout")
         self.assertEqual(result["ma100_low123_validation_reason"], "stale_breakout")
 
-    def test_rejected_when_low123_is_not_confirmed(self):
+    def test_watching_state_stays_in_watchlist_not_confirmed(self):
         group = self._make_raw_group()
         ma100_factors = {
             "above_ma100": True,
@@ -376,7 +377,9 @@ class TestMA100Low123CombinedFactors(unittest.TestCase):
         }
         pattern_123_factors = {
             "pattern_123_low_trendline": False,
-            "pattern_123_state": "structure_only",
+            "pattern_123_breakout_ready": False,
+            "pattern_123_watchlist": True,
+            "pattern_123_state": "watching",
             "pattern_123_entry_price": None,
             "pattern_123_stop_loss": None,
             "pattern_123_signal_strength": 0.41,
@@ -390,15 +393,17 @@ class TestMA100Low123CombinedFactors(unittest.TestCase):
         )
 
         self.assertFalse(result["ma100_low123_confirmed"])
+        self.assertTrue(result["ma100_low123_watchlist"])
         self.assertFalse(result["ma100_low123_data_complete"])
-        self.assertEqual(result["ma100_low123_pattern_strength"], 0.0)
-        self.assertEqual(result["ma100_low123_ma_score"], 0.0)
-        self.assertEqual(result["ma100_low123_validation_status"], "low123_not_confirmed")
-        self.assertEqual(result["ma100_low123_validation_reason"], "low123_not_confirmed")
+        self.assertGreater(result["ma100_low123_pattern_strength"], 0.0)
+        self.assertGreater(result["ma100_low123_ma_score"], 0.0)
+        self.assertEqual(result["ma100_low123_validation_status"], "watching")
+        self.assertEqual(result["ma100_low123_validation_reason"], "watching")
         self.assertEqual(result["ma100_low123_hit_reasons"], [])
+        self.assertGreaterEqual(len(result["ma100_low123_watch_hit_reasons"]), 1)
 
-    def test_state_string_alone_does_not_confirm_ma100_low123(self):
-        """Gate is driven by pattern_123_low_trendline, not state string alone."""
+    def test_breakout_ready_state_can_confirm_even_without_legacy_bool(self):
+        """Combined gate should follow the new breakout_ready semantics."""
         group = self._make_raw_group()
         ma100_factors = {
             "above_ma100": True,
@@ -408,24 +413,30 @@ class TestMA100Low123CombinedFactors(unittest.TestCase):
         }
         pattern_123_factors = {
             "pattern_123_low_trendline": False,
-            "pattern_123_state": "confirmed",
+            "pattern_123_breakout_ready": True,
+            "pattern_123_watchlist": False,
+            "pattern_123_state": "breakout_ready",
             "pattern_123_entry_price": 98.5,
             "pattern_123_stop_loss": 92.0,
             "pattern_123_signal_strength": 0.84,
+        }
+        pattern_123_raw = {
+            "breakout_p2_bar_index": 77,
+            "point1": {"idx": 60, "price": 88.0},
+            "point2": {"idx": 67, "price": 96.0},
+            "point3": {"idx": 72, "price": 91.0},
         }
 
         result = FactorService._compute_ma100_low123_combined_factors(
             ma100_factors,
             pattern_123_factors,
-            {},
+            pattern_123_raw,
             group,
         )
 
-        self.assertFalse(result["ma100_low123_confirmed"])
-        self.assertFalse(result["ma100_low123_data_complete"])
-        self.assertEqual(result["ma100_low123_validation_status"], "low123_not_confirmed")
-        self.assertEqual(result["ma100_low123_validation_reason"], "low123_not_confirmed")
-        self.assertEqual(result["ma100_low123_hit_reasons"], [])
+        self.assertTrue(result["ma100_low123_confirmed"])
+        self.assertEqual(result["ma100_low123_validation_status"], "confirmed")
+        self.assertIsNone(result["ma100_low123_validation_reason"])
 
     def test_missing_breakout_bar_index_is_tagged_for_shadow_monitoring(self):
         """Missing breakout index stays observable before fail-closed rollout."""
@@ -438,7 +449,9 @@ class TestMA100Low123CombinedFactors(unittest.TestCase):
         }
         pattern_123_factors = {
             "pattern_123_low_trendline": True,
-            "pattern_123_state": "confirmed",
+            "pattern_123_breakout_ready": True,
+            "pattern_123_watchlist": False,
+            "pattern_123_state": "breakout_ready",
             "pattern_123_entry_price": 98.5,
             "pattern_123_stop_loss": 92.0,
             "pattern_123_signal_strength": 0.84,
@@ -469,6 +482,51 @@ class TestMA100Low123CombinedFactors(unittest.TestCase):
             "missing_breakout_bar_index",
         )
         self.assertIn("缺少 breakout_bar_index", "".join(result["ma100_low123_hit_reasons"]))
+
+    def test_trendline_breakout_index_does_not_replace_missing_p2_breakout_index(self):
+        """趋势线突破时间不能替代真正的 P2 突破时间做 freshness 判定。"""
+        group = self._make_raw_group()
+        ma100_factors = {
+            "above_ma100": True,
+            "ma100_breakout_days": 2,
+            "ma100": 95.0,
+            "ma100_distance_pct": 1.8,
+        }
+        pattern_123_factors = {
+            "pattern_123_low_trendline": True,
+            "pattern_123_breakout_ready": True,
+            "pattern_123_watchlist": False,
+            "pattern_123_state": "breakout_ready",
+            "pattern_123_entry_price": 98.5,
+            "pattern_123_stop_loss": 92.0,
+            "pattern_123_signal_strength": 0.84,
+        }
+        pattern_123_raw = {
+            "downtrend_line": {
+                "found": True,
+                "touch_count": 3,
+                "breakout_bar_index": 78,
+                "breakout_confirmed": True,
+            },
+        }
+
+        result = FactorService._compute_ma100_low123_combined_factors(
+            ma100_factors,
+            pattern_123_factors,
+            pattern_123_raw,
+            group,
+        )
+
+        self.assertTrue(result["ma100_low123_confirmed"])
+        self.assertFalse(result["ma100_low123_data_complete"])
+        self.assertEqual(
+            result["ma100_low123_validation_status"],
+            "confirmed_missing_breakout_bar_index",
+        )
+        self.assertEqual(
+            result["ma100_low123_validation_reason"],
+            "missing_breakout_bar_index",
+        )
 
 
 if __name__ == "__main__":

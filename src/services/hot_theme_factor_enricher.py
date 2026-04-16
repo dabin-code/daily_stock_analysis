@@ -179,6 +179,7 @@ class HotThemeFactorEnricher:
                 above_ma100=snapshot.get("above_ma100", False),
                 gap_breakaway=snapshot.get("gap_breakaway", False),
                 pattern_123_low_trendline=snapshot.get("pattern_123_low_trendline", False),
+                pattern_123_watchlist=snapshot.get("pattern_123_watchlist", False),
                 is_limit_up=snapshot.get("is_limit_up", False),
                 bottom_divergence_double_breakout=snapshot.get("bottom_divergence_double_breakout", False),
                 theme_heat_score=best_theme_heat,

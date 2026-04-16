@@ -389,6 +389,8 @@ export interface ScreeningFactorSnapshot extends Record<string, unknown> {
 
   // Pattern 123 fields
   pattern_123_low_trendline?: boolean;
+  pattern_123_watchlist?: boolean;
+  pattern_123_breakout_ready?: boolean;
   pattern_123_state?: string;
   pattern_123_entry_price?: number;
   pattern_123_stop_loss?: number;
@@ -396,9 +398,12 @@ export interface ScreeningFactorSnapshot extends Record<string, unknown> {
 
   // MA100+Low123 combined fields
   ma100_low123_confirmed?: boolean;
+  ma100_low123_watchlist?: boolean;
+  ma100_low123_state?: string;
   ma100_low123_pattern_strength?: number;
   ma100_low123_ma_score?: number;
   ma100_low123_hit_reasons?: string[];
+  ma100_low123_watch_hit_reasons?: string[];
 
   // MA100+60min combined fields
   ma100_60min_confirmed?: boolean;

@@ -224,6 +224,7 @@ class FactorService:
                 above_ma100=s.get("above_ma100", False),
                 gap_breakaway=s.get("gap_breakaway", False),
                 pattern_123_low_trendline=s.get("pattern_123_low_trendline", False),
+                pattern_123_watchlist=s.get("pattern_123_watchlist", False),
                 is_limit_up=s.get("is_limit_up", False),
                 bottom_divergence_double_breakout=s.get(
                     "bottom_divergence_double_breakout", False,
@@ -577,6 +578,8 @@ class FactorService:
                 "pattern_123_higher_low_pct": 0.0,
                 # New joint-detector fields
                 "pattern_123_low_trendline": False,
+                "pattern_123_watchlist": False,
+                "pattern_123_breakout_ready": False,
                 "pattern_123_state": "rejected",
                 "pattern_123_entry_price": None,
                 "pattern_123_stop_loss": None,
@@ -602,14 +605,18 @@ class FactorService:
         # Joint detector
         joint = Low123TrendlineDetector.detect(group)
         state = joint.get("state", "rejected")
+        is_breakout_ready = state == "breakout_ready"
+        is_watching = state == "watching"
 
         factors = {
             # Legacy fields
             "pattern_123_bottom": found_legacy,
             "pattern_123_breakout": confirmed_legacy,
             "pattern_123_higher_low_pct": higher_low_pct,
-            # New detector fields (P2突破即confirmed，趋势线为可选加分项)
-            "pattern_123_low_trendline": state == "confirmed",
+            # New detector fields
+            "pattern_123_low_trendline": is_breakout_ready,
+            "pattern_123_watchlist": is_watching,
+            "pattern_123_breakout_ready": is_breakout_ready,
             "pattern_123_state": state,
             "pattern_123_entry_price": joint.get("entry_price"),
             "pattern_123_stop_loss": joint.get("stop_loss_price"),
@@ -742,25 +749,38 @@ class FactorService:
         relative to the latest bar in `group`.
         """
         above_ma100 = bool(ma100_factors.get("above_ma100", False))
-        p123_confirmed = bool(pattern_123_factors.get("pattern_123_low_trendline", False))
+        p123_state = str(pattern_123_factors.get("pattern_123_state", "rejected") or "rejected")
+        p123_breakout_ready = bool(
+            pattern_123_factors.get("pattern_123_breakout_ready", False)
+            or pattern_123_factors.get("pattern_123_low_trendline", False)
+            or p123_state == "breakout_ready"
+        )
+        p123_watching = bool(
+            pattern_123_factors.get("pattern_123_watchlist", False)
+            or p123_state == "watching"
+        )
 
         # bars_since_entry: how many bars since the 123 breakout confirmation
         entry_price = pattern_123_factors.get("pattern_123_entry_price")
         signal_strength = float(pattern_123_factors.get("pattern_123_signal_strength", 0.0))
         bars_since_entry = FactorService._compute_low123_confirmation_days(group, pattern_123_raw)
-        data_complete = bars_since_entry is not None
+        data_complete = p123_breakout_ready and bars_since_entry is not None
 
         # Low123 detector and MA100 gate both need to be fresh enough to stay
         # actionable. We suppress stale breakouts once the P2 breakout
-        # is more than 3 bars old.
+        # is more than 3 bars old. Watching state is routed into a dedicated
+        # watchlist channel instead of the breakout-confirmed channel.
         validation_status = "confirmed"
         validation_reason: Optional[str] = None
-        if not p123_confirmed:
-            validation_status = "low123_not_confirmed"
-            validation_reason = "low123_not_confirmed"
-        elif not above_ma100:
+        if not above_ma100:
             validation_status = "below_ma100"
             validation_reason = "below_ma100"
+        elif p123_watching:
+            validation_status = "watching"
+            validation_reason = "watching"
+        elif not p123_breakout_ready:
+            validation_status = "low123_not_ready"
+            validation_reason = "low123_not_ready"
         elif bars_since_entry is None:
             validation_status = "confirmed_missing_breakout_bar_index"
             validation_reason = "missing_breakout_bar_index"
@@ -769,10 +789,11 @@ class FactorService:
             validation_reason = "stale_breakout"
 
         confirmed = (
-            p123_confirmed
+            p123_breakout_ready
             and above_ma100
             and (bars_since_entry is None or bars_since_entry <= 3)
         )
+        watchlist = above_ma100 and p123_watching
 
         # ── MA score (breakout recency + distance) ──
         breakout_days = int(ma100_factors.get("ma100_breakout_days", 0))
@@ -794,6 +815,7 @@ class FactorService:
 
         # ── Hit reasons (Chinese 【标题】描述 format) ──
         hit_reasons: list[str] = []
+        watch_hit_reasons: list[str] = []
         if confirmed:
             hit_reasons = _build_ma100_low123_hit_reasons(
                 ma100_factors, pattern_123_factors, pattern_123_raw, group,
@@ -804,15 +826,22 @@ class FactorService:
                     0,
                     "【数据校验】缺少 breakout_bar_index，当前按观察模式保留，建议单独统计并人工复核",
                 )
+        elif watchlist:
+            watch_hit_reasons = _build_ma100_low123_watch_hit_reasons(
+                ma100_factors, pattern_123_raw, group, distance_pct, signal_strength,
+            )
 
         return {
             "ma100_low123_confirmed": confirmed,
+            "ma100_low123_watchlist": watchlist,
+            "ma100_low123_state": p123_state,
             "ma100_low123_data_complete": data_complete,
-            "ma100_low123_pattern_strength": signal_strength if confirmed else 0.0,
-            "ma100_low123_ma_score": ma_score if confirmed else 0.0,
+            "ma100_low123_pattern_strength": signal_strength if (confirmed or watchlist) else 0.0,
+            "ma100_low123_ma_score": ma_score if (confirmed or watchlist) else 0.0,
             "ma100_low123_validation_status": validation_status,
             "ma100_low123_validation_reason": validation_reason,
             "ma100_low123_hit_reasons": hit_reasons,
+            "ma100_low123_watch_hit_reasons": watch_hit_reasons,
         }
 
     @staticmethod
@@ -822,13 +851,11 @@ class FactorService:
     ) -> Optional[int]:
         """Compute bars since Low123 P2 breakout confirmation.
 
-        Primary: breakout_p2_bar_index (actual buy signal).
-        Fallback: downtrend_line.breakout_bar_index (legacy compat).
+        Only breakout_p2_bar_index is valid for freshness.
+        Trendline breakout is now only a bonus signal and cannot replace the
+        actual P2 breakout timing.
         """
         confirmation_bar = detector_result.get("breakout_p2_bar_index")
-        if confirmation_bar is None:
-            downtrend_line = detector_result.get("downtrend_line") or {}
-            confirmation_bar = downtrend_line.get("breakout_bar_index")
         if confirmation_bar is None:
             return None
         try:
@@ -1020,6 +1047,45 @@ def _build_ma100_low123_hit_reasons(
         f"入场价{entry_price}，止损价{stop_loss}"
     )
 
+    return reasons
+
+
+def _build_ma100_low123_watch_hit_reasons(
+    ma100_factors: dict,
+    raw: dict,
+    group: pd.DataFrame,
+    distance_pct: float,
+    signal_strength: float,
+) -> list[str]:
+    """Build watchlist reasons for MA100 + Low123 watching state."""
+    reasons: list[str] = []
+
+    p1 = raw.get("point1") or {}
+    p2 = raw.get("point2") or {}
+    p3 = raw.get("point3") or {}
+    if p1 and p2 and p3:
+        p1_price = p1.get("price", 0)
+        p2_price = p2.get("price", 0)
+        p3_price = p3.get("price", 0)
+        p1_date = _idx_to_date(group, p1.get("idx"))
+        p2_date = _idx_to_date(group, p2.get("idx"))
+        p3_date = _idx_to_date(group, p3.get("idx"))
+        reasons.append(
+            f"【123观察结构】P1({p1_date},价格{p1_price:.2f}) → "
+            f"P2({p2_date},价格{p2_price:.2f}) → "
+            f"P3({p3_date},价格{p3_price:.2f})，当前已重新站上P3"
+        )
+
+    reasons.append("【观察池】最新收盘价已大于P3但尚未突破P2，纳入重点观察")
+
+    ma100_val = ma100_factors.get("ma100", 0)
+    breakout_days = int(ma100_factors.get("ma100_breakout_days", 0))
+    reasons.append(
+        f"【MA100站上确认】突破{breakout_days}天，"
+        f"MA100={ma100_val:.2f}，距离{distance_pct:.1f}%"
+    )
+
+    reasons.append(f"【信号强度】观察评分{signal_strength:.2f}，等待突破P2触发成熟买点")
     return reasons
 
 

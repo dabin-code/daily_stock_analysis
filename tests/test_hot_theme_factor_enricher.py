@@ -217,6 +217,50 @@ class HotThemeFactorEnricherTestCase(unittest.TestCase):
         self.assertEqual(enriched["close"], 10.5)
         self.assertTrue(enriched["above_ma100"])
 
+    def test_watching_low123_contributes_to_watchlist_strength(self) -> None:
+        """watching low123 should add observation strength for hot themes."""
+        snapshot = {
+            "code": "000001",
+            "name": "机器人",
+            "close": 10.5,
+            "above_ma100": True,
+            "gap_breakaway": False,
+            "pattern_123_low_trendline": False,
+            "pattern_123_watchlist": True,
+            "is_limit_up": False,
+            "bottom_divergence_double_breakout": False,
+            "volume_ratio": 1.8,
+            "turnover_rate": 0.04,
+            "circ_mv": 45_000_000_000,
+            "breakout_ratio": 1.4,
+            "ma100_breakout_days": 2,
+        }
+        theme_context = OpenClawThemeContext(
+            source="openclaw",
+            trade_date="2026-03-26",
+            market="cn",
+            themes=[
+                ExternalTheme(
+                    name="机器人",
+                    heat_score=88.0,
+                    confidence=0.85,
+                    catalyst_summary="政策催化",
+                    keywords=["机器人"],
+                    evidence=[],
+                )
+            ],
+            accepted_at=datetime.now().isoformat(),
+        )
+
+        enriched = self.enricher.enrich_snapshot(
+            snapshot,
+            theme_context=theme_context,
+            boards=["机器人"],
+        )
+
+        self.assertTrue(enriched["is_hot_theme_stock"])
+        self.assertGreater(enriched["extreme_strength_score"], 60)
+
     def test_enrich_snapshot_missing_circ_mv_does_not_get_small_cap_bonus(self) -> None:
         """Missing circ_mv should be treated as unknown, not as strongest small-cap signal."""
         snapshot = {

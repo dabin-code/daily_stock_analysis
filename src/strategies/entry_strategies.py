@@ -330,10 +330,10 @@ class EntryStrategyB:
     """
     Low-position 123 Bottom Reversal with Downtrend Trendline Confirmation.
 
-    Triggered only when the joint detector returns state='confirmed':
+    Triggered only when the joint detector returns state='breakout_ready':
       - Prior downtrend context verified
       - P1 at low position
-      - Close breaks P2 AND downtrend trendline in sync (within sync_window bars)
+      - Close breaks P2 (trendline remains an optional bonus signal)
     """
 
     @classmethod
@@ -351,7 +351,7 @@ class EntryStrategyB:
 
         joint = Low123TrendlineDetector.detect(df)
         state = joint.get("state", "rejected")
-        triggered = state == "confirmed"
+        triggered = state == "breakout_ready"
 
         score = 0
         reasons: list = []

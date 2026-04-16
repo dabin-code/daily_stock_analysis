@@ -274,4 +274,24 @@ describe('CandidateDetailDrawer', () => {
     expect(screen.getByText('涨停')).toBeInTheDocument();
     expect(screen.queryAllByText(/【底背离形态】价格持平-MACD抬升/).length).toBeGreaterThan(0);
   });
+
+  it('shows low123 watchlist pattern in detail drawer', () => {
+    mockStore.selectedCandidate = {
+      ...mockCandidate,
+      factorSnapshot: {
+        ...mockCandidate.factorSnapshot,
+        ma100_low123_watchlist: true,
+        ma100_low123_pattern_strength: 0.63,
+        ma100_low123_ma_score: 0.71,
+        ma100_low123_watch_hit_reasons: [
+          '【观察池】最新收盘价已大于P3但尚未突破P2，纳入重点观察',
+        ],
+      },
+    };
+
+    render(<CandidateDetailDrawer />);
+
+    expect(screen.getByText('MA100+低位123观察池')).toBeInTheDocument();
+    expect(screen.getAllByText('【观察池】最新收盘价已大于P3但尚未突破P2，纳入重点观察').length).toBeGreaterThan(0);
+  });
 });

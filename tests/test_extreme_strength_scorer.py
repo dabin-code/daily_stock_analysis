@@ -54,6 +54,25 @@ class ExtremeStrengthScorerTestCase(unittest.TestCase):
         # 15 + 12 = 27
         self.assertEqual(score, 27)
 
+    def test_signal_bonus_watchlist_is_weaker_than_breakout_ready(self) -> None:
+        """watching 状态应加分，但弱于 breakout_ready。"""
+        watch_score = self.scorer.calculate_signal_bonus(
+            gap_breakaway=False,
+            pattern_123_low_trendline=False,
+            is_limit_up=False,
+            bottom_divergence_double_breakout=False,
+            pattern_123_watchlist=True,
+        )
+        breakout_score = self.scorer.calculate_signal_bonus(
+            gap_breakaway=False,
+            pattern_123_low_trendline=True,
+            is_limit_up=False,
+            bottom_divergence_double_breakout=False,
+            pattern_123_watchlist=False,
+        )
+        self.assertGreater(watch_score, 0)
+        self.assertLess(watch_score, breakout_score)
+
     def test_auxiliary_bonus_full(self) -> None:
         """Test auxiliary bonus at maximum."""
         score = self.scorer.calculate_auxiliary_bonus(
