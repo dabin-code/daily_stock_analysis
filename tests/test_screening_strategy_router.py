@@ -19,13 +19,24 @@ class TestStrategyRouterRegimeMapping:
         strategies = _REGIME_STRATEGIES.get("trending_up", [])
         assert "volume_breakout" in strategies
 
+    def test_trending_up_includes_shrink_pullback(self):
+        # shrink_pullback 依赖多头排列（上升趋势），只应出现在 trending_up 下。
+        strategies = _REGIME_STRATEGIES.get("trending_up", [])
+        assert "shrink_pullback" in strategies
+
     def test_trending_down_includes_bottom_volume(self):
         strategies = _REGIME_STRATEGIES.get("trending_down", [])
         assert "bottom_volume" in strategies
 
-    def test_sideways_includes_shrink_pullback(self):
+    def test_trending_down_excludes_shrink_pullback(self):
+        # shrink_pullback 需要上升趋势，不应被路由到下跌行情。
+        strategies = _REGIME_STRATEGIES.get("trending_down", [])
+        assert "shrink_pullback" not in strategies
+
+    def test_sideways_excludes_shrink_pullback(self):
+        # 横盘期 MA 不构成多头排列，shrink_pullback detector 会被 no_uptrend 拒绝。
         strategies = _REGIME_STRATEGIES.get("sideways", [])
-        assert "shrink_pullback" in strategies
+        assert "shrink_pullback" not in strategies
 
 
 # ── ScreeningTaskService regime-based selection ──────────────────────────────

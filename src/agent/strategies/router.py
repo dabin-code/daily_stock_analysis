@@ -21,10 +21,15 @@ logger = logging.getLogger(__name__)
 
 # Mapping from detected market regime → preferred strategy IDs.
 # Multiple strategies per regime to allow aggregation.
+#
+# shrink_pullback 的前置条件是 MA5/MA10/MA20 多头排列（上升趋势），
+# 详见 src/indicators/shrink_pullback_detector.py；因此只在 trending_up
+# 下出现，不再出现在 trending_down / sideways，以避免 detector 必然被
+# no_uptrend 拒单、造成无效算力消耗。
 _REGIME_STRATEGIES: Dict[str, List[str]] = {
-    "trending_up": ["bull_trend", "volume_breakout", "ma_golden_cross"],
-    "trending_down": ["shrink_pullback", "bottom_volume"],
-    "sideways": ["box_oscillation", "shrink_pullback"],
+    "trending_up": ["bull_trend", "shrink_pullback", "volume_breakout", "ma_golden_cross"],
+    "trending_down": ["bottom_volume", "bottom_divergence_double_breakout"],
+    "sideways": ["box_oscillation"],
     "volatile": ["chan_theory", "wave_theory"],
     "sector_hot": ["dragon_head", "emotion_cycle"],
 }
