@@ -208,7 +208,15 @@ class SetupResolver:
 
         if meta.name == "gap_limitup_breakout":
             snapshot = factor_snapshot or {}
-            if snapshot.get("limit_up_breakout") or snapshot.get("is_limit_up"):
+            # Prefer the new structured limit-up flag; fall back to the
+            # legacy ``limit_up_breakout`` / ``is_limit_up`` combo so that
+            # older snapshots (no sub-semantic fields) still route to
+            # LIMITUP_STRUCTURE when the bar is actually a limit-up.
+            if (
+                snapshot.get("limitup_structure_breakout")
+                or snapshot.get("is_limit_up")
+                or snapshot.get("limit_up_breakout")
+            ):
                 setup = SetupType.LIMITUP_STRUCTURE
             else:
                 setup = SetupType.GAP_BREAKOUT

@@ -21,9 +21,32 @@ class SetupFreshnessAssessor:
         "gap_breakout_days",
     )
 
+    # Setup types that should consult the new gap/limit-up
+    # ``bars_since_event`` signal before falling back to legacy keys.
+    _GAP_LIMITUP_TYPES = (SetupType.GAP_BREAKOUT, SetupType.LIMITUP_STRUCTURE)
+
     def assess(self, setup_type: SetupType, factor_snapshot: dict) -> float:
         if setup_type == SetupType.NONE:
             return 0.0
+
+        # ── Priority override for gap/limit-up setups ────────────────
+        # When the new structured detectors emit ``bars_since_event``,
+        # prefer that signal over the legacy day-counter fields so the
+        # freshness scale reflects the actual breakaway/limit-up event
+        # rather than an unrelated MA100 crossing.
+        if setup_type in self._GAP_LIMITUP_TYPES:
+            # Retest (second-entry) buy points are structurally fresher
+            # than the original breakout because the market has already
+            # validated the support level.  Score them near-maximum.
+            if factor_snapshot.get("retest_hold"):
+                return 0.95
+
+            bars_since = factor_snapshot.get("bars_since_event")
+            if isinstance(bars_since, (int, float)) and bars_since >= 0:
+                # bars_since_event=0 means the event fired on the latest
+                # bar (freshest).  Align with ``_score_from_breakout_days``
+                # which expects day=1 as the freshest.
+                return self._score_from_breakout_days(bars_since + 1)
 
         for key in self._BREAKOUT_DAY_KEYS:
             raw = factor_snapshot.get(key)

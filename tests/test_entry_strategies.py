@@ -137,6 +137,48 @@ class TestEntryStrategyC(unittest.TestCase):
         self.assertIn("score", result)
         self.assertGreater(result["score"], 0)
 
+    # ── Structured sub-semantic output ─────────────────────────────
+    def test_breakaway_gap_emits_structured_stop(self):
+        """Strict breakaway gap → sub_setup + gap_low stop + support."""
+        from src.strategies.entry_strategies import EntryStrategyC
+        df = _make_gap_breakout_df()
+        result = EntryStrategyC.evaluate(df)
+        self.assertTrue(result["triggered"])
+        # Priority ordering: on this fixture the bar is also a structural
+        # limit-up breakout when the close pct_chg clears the threshold,
+        # so accept either the limitup or breakaway classification here.
+        self.assertIn(
+            result["sub_setup_type"],
+            ("breakaway_gap_strict", "limitup_structure"),
+        )
+        self.assertIsNotNone(result["entry_price"])
+        self.assertIsNotNone(result["stop_loss_price"])
+        self.assertGreater(result["entry_price"], result["stop_loss_price"])
+        self.assertIn(
+            result["stop_loss_basis"],
+            ("gap_low", "limitup_day_open"),
+        )
+
+    def test_limit_breakout_emits_limitup_structure(self):
+        """Limit-up breakout with key-level → sub_setup=limitup_structure."""
+        from src.strategies.entry_strategies import EntryStrategyC
+        df = _make_limit_breakout_df()
+        result = EntryStrategyC.evaluate(df)
+        self.assertTrue(result["triggered"])
+        self.assertEqual(result["sub_setup_type"], "limitup_structure")
+        self.assertEqual(result["stop_loss_basis"], "limitup_day_open")
+        self.assertGreater(result["entry_price"], result["stop_loss_price"])
+
+    def test_normal_uptrend_emits_sub_setup_none(self):
+        """Noise-only random walk must not produce any buy sub-setup."""
+        from src.strategies.entry_strategies import EntryStrategyC
+        df = _make_uptrend_df(n=120)
+        result = EntryStrategyC.evaluate(df)
+        self.assertFalse(result["triggered"])
+        self.assertEqual(result["sub_setup_type"], "none")
+        self.assertIsNone(result["entry_price"])
+        self.assertIsNone(result["stop_loss_price"])
+
 
 # ─────────────────────────────────────────────────────────────
 # EntryStrategyD (daily version)

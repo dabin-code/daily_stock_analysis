@@ -19,14 +19,28 @@ setup_type: gap_breakout
 
 screening:
   filters:
+    # ── 硬前提：趋势方向与高位风险闸门 ──
     - field: above_ma100
       op: "=="
       value: true
+    - field: limitup_high_acceleration_risk
+      op: "=="
+      value: false
+    - field: near_recent_rally_peak
+      op: "=="
+      value: false
+    # ── 四选一子语义：突破性缺口 / 持续性缺口 / 结构性涨停 / 二买回踩 ──
     - any:
-        - field: gap_breakaway
+        - field: breakaway_gap_strict
           op: "=="
           value: true
-        - field: limit_up_breakout
+        - field: continuation_gap
+          op: "=="
+          value: true
+        - field: limitup_structure_breakout
+          op: "=="
+          value: true
+        - field: retest_hold
           op: "=="
           value: true
   scoring:
@@ -44,22 +58,34 @@ screening:
       weight: 10
 
 instructions: |
-  **跳空涨停突破（Strategy C）**
+  **跳空涨停突破（Strategy C）— 结构化子语义版**
 
-  信号判定标准：
+  买点分四类，命中任一即可入选（需同时满足趋势与风险前提）：
 
-  1. **跳空突破性缺口**：
-     - 当日最低价 > 前日最高价（跳空缺口）。
-     - 成交量 >= 5日均量的 1.5 倍（量能确认）。
+  1. **突破性缺口（breakaway_gap_strict）**
+     - 关键位（下降趋势线 / 震荡区间上沿 / 平台箱体）被缺口一跳打破。
+     - 缺口幅度 >= 2%、量能 >= 5 日均量 1.5 倍。
+     - 非衰竭缺口（MA20 距离、20 日累计涨幅、量能双日加速均未触发预警）。
 
-  2. **涨停突破前高**：
-     - 当日涨停（主板 >= 9.8%，科创/创业板 >= 19.5%）。
-     - 收盘价突破近 20 日最高价。
+  2. **持续性缺口（continuation_gap）**
+     - 处于已确立的中期上升趋势中出现的向上跳空。
+     - 幅度和量能与 breakaway 一致，但不再要求关键位突破。
+     - 已通过衰竭门控。
 
-  3. **MA100 前提条件**：
-     - 个股价格需在 MA100 之上，避免弱势反弹中的虚假信号。
+  3. **结构性涨停突破（limitup_structure_breakout）**
+     - 当日收盘涨停 + 突破 20 日高（legacy）+ 打破关键位。
+     - 未命中 `limitup_high_acceleration_risk`（3 连板以上 / 20 日涨幅 >50% /
+       量能双日加速 / MA20 距离 >12% 等高位加速陷阱）。
 
-  评分调整：
-  - 量比越高得分越高（上限 5 倍）。
-  - 突破前高幅度越大额外加分。
-  - 趋势评分和流动性作为辅助确认。
+  4. **回踩二买（retest_hold）**
+     - 近 N 根内出现过突破性缺口或结构性涨停。
+     - 当日回踩至缺口上沿或涨停日开盘附近，并缩量守住该支撑。
+
+  共同前提：
+  - 必须在 MA100 之上。
+  - 当前收盘不得贴近近 20 日新高（`near_recent_rally_peak`）。
+  - 结构性涨停若同时命中高位加速风险，直接拒绝。
+
+  止损表达由 `EntryStrategyC.evaluate()` 结构化输出
+  （`stop_loss_price` + `stop_loss_basis`）：缺口下沿、涨停日开盘、
+  或回踩支撑下方 1% 三选一，由具体子语义决定。

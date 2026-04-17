@@ -43,50 +43,167 @@ from src.indicators.bottom_divergence_breakout_detector import BottomDivergenceB
 
 
 class EntryStrategyC:
-    """Gap/Limit-Up Breakout strategy."""
+    """Gap/Limit-Up Breakout strategy — structured sub-semantic output.
+
+    The legacy ``triggered`` / ``score`` / ``reason`` / ``gap`` / ``limit_up``
+    keys are preserved so that existing callers
+    (five-layer pipeline, leader score, bot commands …) continue to work.
+    New structured keys expose the concrete buy-point classification so
+    downstream services (setup_resolver, entry_maturity_assessor, report
+    renderer) can route stop-loss and commentary consistently:
+
+    - ``sub_setup_type``: one of ``breakaway_gap_strict``, ``continuation_gap``,
+      ``limitup_structure``, ``retest_second_entry``, ``none``
+    - ``entry_price`` / ``support_price``
+    - ``stop_loss_price`` / ``stop_loss_basis``
+
+    Priority (highest first) when multiple sub-semantics co-exist on the
+    same bar: retest_second_entry > limitup_structure >
+    breakaway_gap_strict > continuation_gap.
+    """
+
+    _STOP_LOSS_BUFFER = 0.99  # 1% cushion below retest support
+    _FALLBACK_STOP_PCT = 0.97  # 3% stop when no structural anchor is known
 
     @classmethod
     def evaluate(cls, df: pd.DataFrame, board: str = "main") -> Dict[str, Any]:
+        empty: Dict[str, Any] = {
+            "triggered": False,
+            "sub_setup_type": "none",
+            "entry_price": None,
+            "stop_loss_price": None,
+            "stop_loss_basis": "",
+            "support_price": 0.0,
+            "reason": "insufficient data",
+            "score": 0,
+        }
         if df is None or len(df) < 10:
-            return {"triggered": False, "reason": "insufficient data", "score": 0}
+            return empty
 
         gap_result = GapDetector.detect_breakaway_gap(df)
+        cont_result = GapDetector.detect_continuation_gap(df)
+        gap_retest = GapDetector.detect_gap_retest_hold(df)
         limit_result = LimitUpDetector.is_breakout_limit_up(df, board=board)
+        limit_retest = LimitUpDetector.detect_limitup_retest_hold(df, board=board)
 
-        gap_triggered = gap_result.get("is_breakaway", False)
-        limit_triggered = (
-            limit_result.get("is_limit_up", False)
-            and limit_result.get("is_breakout_high", False)
-        )
+        latest = df.iloc[-1]
+        close_px = float(latest["close"])
+        open_px = float(latest.get("open", close_px))
 
-        triggered = gap_triggered or limit_triggered
+        sub_setup = "none"
+        entry_price: Optional[float] = None
+        stop_loss_price: Optional[float] = None
+        stop_loss_basis = ""
+        support_price = 0.0
+        reasons: list[str] = []
+
+        # ── Priority 1: retest second entry (gap or limit-up) ─────────
+        if gap_retest.get("retest_hold") or limit_retest.get("retest_hold"):
+            sub_setup = "retest_second_entry"
+            entry_price = close_px
+            if gap_retest.get("retest_hold"):
+                support_price = float(gap_retest.get("gap_high", 0.0))
+                gap_low = float(gap_retest.get("gap_low", 0.0))
+                stop_loss_price = gap_low if gap_low > 0 else support_price * cls._STOP_LOSS_BUFFER
+                stop_loss_basis = "retest_gap_low" if gap_low > 0 else "retest_support_buffer"
+                reasons.append("retest-hold on breakaway gap")
+            else:
+                support_price = float(limit_retest.get("support_price", 0.0))
+                stop_loss_price = (
+                    support_price * cls._STOP_LOSS_BUFFER
+                    if support_price > 0
+                    else close_px * cls._FALLBACK_STOP_PCT
+                )
+                stop_loss_basis = "retest_support_buffer"
+                reasons.append("retest-hold on limit-up support")
+
+        # ── Priority 2: structural limit-up breakout ─────────────────
+        elif limit_result.get("is_structural_breakout"):
+            sub_setup = "limitup_structure"
+            entry_price = close_px
+            key_px = float(limit_result.get("key_level_price", 0.0))
+            # Stop-loss = min(open-of-day, key-level) to protect against
+            # an open-high-close-low failure on the limit-up day.
+            candidates = [p for p in (open_px, key_px) if p > 0]
+            stop_loss_price = min(candidates) if candidates else close_px * cls._FALLBACK_STOP_PCT
+            stop_loss_basis = "limitup_day_open"
+            support_price = key_px
+            reasons.append(
+                "limit-up structural breakout"
+                + (f" ({limit_result.get('key_level_type', '')})" if key_px > 0 else "")
+            )
+
+        # ── Priority 3: strict breakaway gap ─────────────────────────
+        elif gap_result.get("is_breakaway_strict"):
+            sub_setup = "breakaway_gap_strict"
+            entry_price = close_px
+            gap_low = float(gap_result.get("gap_low", 0.0))
+            stop_loss_price = gap_low if gap_low > 0 else close_px * cls._FALLBACK_STOP_PCT
+            stop_loss_basis = "gap_low"
+            support_price = float(gap_result.get("gap_high", 0.0))
+            reasons.append(
+                f"breakaway gap (+{gap_result.get('gap_pct', 0):.1f}%) broke "
+                f"{gap_result.get('key_level_type', 'key level')}"
+            )
+
+        # ── Priority 4: continuation gap inside an established trend ──
+        elif cont_result.get("is_continuation_gap"):
+            sub_setup = "continuation_gap"
+            entry_price = close_px
+            gap_low = float(cont_result.get("gap_low", 0.0))
+            stop_loss_price = gap_low if gap_low > 0 else close_px * cls._FALLBACK_STOP_PCT
+            stop_loss_basis = "continuation_gap_low"
+            support_price = float(cont_result.get("gap_high", 0.0))
+            reasons.append(
+                f"continuation gap (+{cont_result.get('gap_pct', 0):.1f}%) in uptrend"
+            )
+
+        triggered = sub_setup != "none"
+
+        # ── Scoring ────────────────────────────────────────────────
+        vol_avg = float(df["volume"].iloc[-6:-1].mean()) if len(df) >= 6 else 0.0
+        vol_curr = float(df["volume"].iloc[-1])
+        vol_ratio = vol_curr / vol_avg if vol_avg > 0 else 0.0
 
         score = 0
-        reasons = []
+        if sub_setup == "retest_second_entry":
+            score = 65
+            # Retest quality favours shrinking volume; reward contraction.
+            if vol_ratio and vol_ratio < 0.8:
+                score = min(100, score + 15)
+            elif vol_ratio and vol_ratio < 1.0:
+                score = min(100, score + 8)
+        elif sub_setup == "limitup_structure":
+            score = 60
+        elif sub_setup == "breakaway_gap_strict":
+            score = 55
+        elif sub_setup == "continuation_gap":
+            score = 45
 
-        if gap_triggered:
-            score += 50
-            reasons.append(f"breakaway gap (+{gap_result.get('gap_pct', 0):.1f}%)")
-        if limit_triggered:
-            score += 50
-            reasons.append(f"limit-up breakout (pct={limit_result.get('pct_chg', 0):.1f}%)")
-
-        # Volume bonus
-        vol_avg = float(df["volume"].iloc[-6:-1].mean()) if len(df) >= 6 else 0
-        vol_curr = float(df["volume"].iloc[-1])
-        vol_ratio = vol_curr / vol_avg if vol_avg > 0 else 0
-        if vol_ratio >= 2.0:
-            score = min(100, score + 20)
-        elif vol_ratio >= 1.5:
-            score = min(100, score + 10)
+        # Volume surge bonus for breakout-style setups only.
+        if sub_setup in ("limitup_structure", "breakaway_gap_strict", "continuation_gap"):
+            if vol_ratio >= 2.0:
+                score = min(100, score + 20)
+            elif vol_ratio >= 1.5:
+                score = min(100, score + 10)
 
         return {
+            # ── Legacy keys (preserved) ──
             "triggered": triggered,
             "reason": " + ".join(reasons) if reasons else "no signal",
             "score": score,
             "gap": gap_result,
             "limit_up": limit_result,
             "volume_ratio": vol_ratio,
+            # ── New structured keys ──
+            "sub_setup_type": sub_setup,
+            "entry_price": entry_price,
+            "stop_loss_price": stop_loss_price,
+            "stop_loss_basis": stop_loss_basis,
+            "support_price": support_price,
+            "continuation_gap": cont_result,
+            "gap_retest": gap_retest,
+            "limit_retest": limit_retest,
         }
 
 

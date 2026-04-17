@@ -60,13 +60,44 @@ def _assess_trend_breakout(fs: dict) -> EntryMaturity:
 
 
 def _assess_trend_pullback(fs: dict) -> EntryMaturity:
-    pullback_ma20 = fs.get("pullback_ma20", False)
-    if pullback_ma20:
+    """MA5/MA10 缩量回踩企稳 → 成熟度评估。
+
+    优先消费 ShrinkPullbackDetector 产出的 ``shrink_pullback_state`` 和
+    ``shrink_pullback_support_ma``；当新字段缺失时回退到旧 ``pullback_ma20``
+    字段以兼容历史 snapshot。
+    """
+    state = fs.get("shrink_pullback_state")
+    support = fs.get("shrink_pullback_support_ma")
+    if state == "confirmed":
+        return EntryMaturity.HIGH if support == "MA5" else EntryMaturity.MEDIUM
+    if state == "stabilizing":
+        return EntryMaturity.MEDIUM
+    if state in ("touch_only", "rejected"):
+        return EntryMaturity.LOW
+    if fs.get("pullback_ma20", False):
         return EntryMaturity.MEDIUM
     return EntryMaturity.LOW
 
 
 def _assess_gap_breakout(fs: dict) -> EntryMaturity:
+    """Map gap-style buy points to EntryMaturity.
+
+    Routing priority (new sub-semantics first, legacy fallback last):
+    1. ``retest_hold`` — highest maturity (second entry on validated support).
+    2. ``breakaway_gap_strict`` — high maturity when the breakout is clean
+       and exhaustion risk is absent, otherwise medium.
+    3. ``continuation_gap`` — medium maturity (trend-follow, lower edge).
+    4. Legacy ``gap_breakaway`` + optional ``is_limit_up`` combo — medium/high.
+    """
+    if fs.get("retest_hold"):
+        return EntryMaturity.HIGH
+
+    exhaustion = fs.get("gap_exhaustion_risk_level", "none")
+    if fs.get("breakaway_gap_strict"):
+        return EntryMaturity.HIGH if exhaustion == "none" else EntryMaturity.MEDIUM
+    if fs.get("continuation_gap"):
+        return EntryMaturity.MEDIUM
+
     gap = fs.get("gap_breakaway", False)
     limit_up = fs.get("is_limit_up", False)
     if gap and limit_up:
@@ -77,10 +108,24 @@ def _assess_gap_breakout(fs: dict) -> EntryMaturity:
 
 
 def _assess_limitup_structure(fs: dict) -> EntryMaturity:
-    limit_up = fs.get("is_limit_up", False)
-    if limit_up:
+    """Map limit-up structural breakouts to EntryMaturity.
+
+    Routing priority:
+    1. ``retest_hold`` — highest maturity (post-limit-up support retest).
+    2. ``limitup_structure_breakout`` + no high-acceleration risk — high.
+    3. Legacy ``is_limit_up`` without structure — medium.
+    """
+    if fs.get("retest_hold"):
         return EntryMaturity.HIGH
-    return EntryMaturity.MEDIUM
+    if fs.get("limitup_structure_breakout") and not fs.get(
+        "limitup_high_acceleration_risk", False
+    ):
+        return EntryMaturity.HIGH
+    if fs.get("is_limit_up"):
+        # Limit-up without a structural break is still actionable but less
+        # mature — downgrade relative to the clean structural case.
+        return EntryMaturity.MEDIUM
+    return EntryMaturity.LOW
 
 
 def _default_assess(fs: dict) -> EntryMaturity:
