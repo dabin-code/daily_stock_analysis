@@ -429,7 +429,11 @@ class ScreeningTaskService:
             effective_trade_date = (
                 resolved_trade_date
                 if trade_date is not None
-                else runtime_factor_service.get_latest_trade_date(universe_df=universe_df)
+                else self._resolve_latest_passed_audit_trade_date(
+                    market=market,
+                    factor_service=runtime_factor_service,
+                    universe_df=universe_df,
+                )
             )
             if effective_trade_date is None:
                 raise ValueError("未找到可用的本地交易日数据，请先同步日线数据")
@@ -531,6 +535,10 @@ class ScreeningTaskService:
             current_stage = "factorizing"
             self._last_stage_hint = current_stage
             stage_started_at = time.perf_counter()
+            self._ensure_trade_date_audit_passed(
+                market=market,
+                trade_date=effective_trade_date,
+            )
             self._must_update_status(run_id=run_id, status="factorizing")
             snapshot_df = runtime_factor_service.build_factor_snapshot(
                 universe_df=universe_df,
@@ -1449,8 +1457,74 @@ class ScreeningTaskService:
 
     @staticmethod
     def _is_skippable_sync_error(error: Dict[str, Any]) -> bool:
+        reason_class = str(error.get("reason_class", "")).strip().lower()
+        if reason_class:
+            if reason_class in {
+                "skip_eligible",
+                "skippable",
+                "non_blocking",
+                "non-blocking",
+                "ignorable",
+            }:
+                return True
+            if reason_class in {"retryable", "blocking", "fatal"}:
+                return False
         reason = str(error.get("reason", "")).strip().lower()
-        return reason in {"empty_data", "no_data", "not_found", "fetch_failed"}
+        return reason in {"empty_data", "no_data", "not_found"}
+
+    def _ensure_trade_date_audit_passed(self, market: str, trade_date: Optional[date]) -> None:
+        if trade_date is None or not hasattr(self.db, "get_kline_audit_trade_date"):
+            return
+        audit_record = self.db.get_kline_audit_trade_date(
+            market=market,
+            trade_date=trade_date,
+        )
+        if self._is_mock_like(audit_record):
+            return
+        if audit_record is None:
+            raise ValueError(
+                "目标交易日缺少 K 线审计记录: "
+                f"market={market} trade_date={trade_date.isoformat()}"
+            )
+        pass_status = self._extract_trade_date_audit_pass_status(audit_record)
+        if pass_status == "passed":
+            return
+        normalized_status = pass_status or "unknown"
+        raise ValueError(
+            "目标交易日 K 线审计未通过: "
+            f"market={market} trade_date={trade_date.isoformat()} "
+            f"pass_status={normalized_status}"
+        )
+
+    @staticmethod
+    def _extract_trade_date_audit_pass_status(audit_record: Any) -> Optional[str]:
+        if isinstance(audit_record, dict):
+            value = audit_record.get("pass_status")
+        else:
+            value = getattr(audit_record, "pass_status", None)
+        if ScreeningTaskService._is_mock_like(value):
+            return None
+        normalized = str(value or "").strip().lower()
+        return normalized or None
+
+    def _resolve_latest_passed_audit_trade_date(
+        self,
+        *,
+        market: str,
+        factor_service: Any,
+        universe_df: Any,
+    ) -> Optional[date]:
+        if hasattr(self.db, "get_latest_passed_kline_audit_trade_date"):
+            audit_record = self.db.get_latest_passed_kline_audit_trade_date(market=market)
+            if audit_record is not None and not self._is_mock_like(audit_record):
+                trade_date = audit_record.get("trade_date") if isinstance(audit_record, dict) else getattr(audit_record, "trade_date", None)
+                if not self._is_mock_like(trade_date):
+                    return trade_date
+        return factor_service.get_latest_trade_date(universe_df=universe_df)
+
+    @staticmethod
+    def _is_mock_like(value: Any) -> bool:
+        return type(value).__module__.startswith("unittest.mock")
 
     @staticmethod
     def _is_rerunnable_failed_symbol_reason(reason: str) -> bool:

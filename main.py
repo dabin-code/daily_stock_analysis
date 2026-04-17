@@ -24,6 +24,7 @@ A股自选股智能分析系统 - 主调度程序
 import os
 from src.config import setup_env
 import argparse
+from functools import partial
 import logging
 import sys
 import time
@@ -495,6 +496,60 @@ def run_board_sync_workflow(config: Config, args: argparse.Namespace) -> None:
     )
 
 
+def run_kline_governance_workflow(config: Config, args: argparse.Namespace) -> dict:
+    """执行一次 K 线日常治理工作流。"""
+    from src.services.kline_governance_schedule_service import KlineGovernanceScheduleService
+
+    _ = args
+    service = KlineGovernanceScheduleService(config=config)
+    result = service.run_daily_governance(market="cn")
+    log_level = logger.info if result.get("pass_status") == "passed" else logger.warning
+    log_level(
+        "K 线治理完成: trade_date=%s run_result=%s pass_status=%s",
+        result.get("trade_date"),
+        result.get("run_result"),
+        result.get("pass_status"),
+    )
+    if result.get("run_result") == "skipped":
+        return result
+    if result.get("run_result") != "succeeded" or result.get("pass_status") != "passed":
+        raise RuntimeError(
+            "K-line governance failed: "
+            f"trade_date={result.get('trade_date')} "
+            f"run_result={result.get('run_result')} "
+            f"pass_status={result.get('pass_status')}"
+        )
+    return result
+
+
+def run_kline_deep_audit_workflow(config: Config, args: argparse.Namespace) -> dict:
+    """执行一次 K 线低频深度审计工作流。"""
+    from src.services.kline_governance_schedule_service import KlineGovernanceScheduleService
+
+    _ = args
+    service = KlineGovernanceScheduleService(config=config)
+    result = service.run_deep_audit(market="cn")
+    log_level = logger.info if result.get("pass_status") == "passed" else logger.warning
+    log_level(
+        "K 线深度审计完成: trade_date=%s run_result=%s pass_status=%s candidate_skip_rechecked=%s recovered=%s",
+        result.get("trade_date"),
+        result.get("run_result"),
+        result.get("pass_status"),
+        result.get("candidate_skip_rechecked"),
+        result.get("candidate_skip_recovered_count"),
+    )
+    if result.get("run_result") == "skipped":
+        return result
+    if result.get("run_result") != "succeeded" or result.get("pass_status") != "passed":
+        raise RuntimeError(
+            "K-line deep audit failed: "
+            f"trade_date={result.get('trade_date')} "
+            f"run_result={result.get('run_result')} "
+            f"pass_status={result.get('pass_status')}"
+        )
+    return result
+
+
 def start_api_server(host: str, port: int, config: Config) -> None:
     """
     在后台线程启动 FastAPI 服务
@@ -758,9 +813,25 @@ def main() -> int:
             if getattr(config, "board_sync_schedule_enabled", False):
                 scheduler.add_daily_task(
                     name="board_sync",
-                    task=lambda: run_board_sync_workflow(config=config, args=args),
+                    task=partial(run_board_sync_workflow, config=config, args=args),
                     schedule_time=getattr(config, "board_sync_schedule_time", "15:05"),
                     run_immediately=bool(getattr(config, "board_sync_run_immediately", False)),
+                )
+
+            if getattr(config, "kline_governance_enabled", False):
+                scheduler.add_daily_task(
+                    name="kline_governance",
+                    task=partial(run_kline_governance_workflow, config=config, args=args),
+                    schedule_time=getattr(config, "kline_governance_schedule_time", "17:00"),
+                    run_immediately=bool(getattr(config, "kline_governance_run_immediately", False)),
+                )
+
+            if getattr(config, "kline_deep_audit_schedule_enabled", False):
+                scheduler.add_daily_task(
+                    name="kline_deep_audit",
+                    task=partial(run_kline_deep_audit_workflow, config=config, args=args),
+                    schedule_time=getattr(config, "kline_deep_audit_schedule_time", "17:00"),
+                    run_immediately=False,
                 )
 
             scheduler.run()

@@ -137,13 +137,60 @@ def test_screening_task_service_executes_full_pipeline_and_limits_ai_top_k():
         market_data_sync_service=market_data_sync_service,
     )
     service.config.screening_market_guard_enabled = False
+    pipeline_candidates = [
+        SimpleNamespace(
+            code="600519",
+            name="贵州茅台",
+            rank=1,
+            rule_score=91.0,
+            rule_hits=["trend_aligned", "volume_expanding"],
+            factor_snapshot={"close": 1500.0},
+            matched_strategies=["trend_aligned"],
+            strategy_scores={"trend_aligned": 91.0},
+            setup_type="trend_breakout",
+            entry_maturity="high",
+            trade_stage="focus",
+            market_regime="balanced",
+            risk_level="medium",
+            theme_position="main_theme",
+            candidate_pool_level="focus_list",
+        ),
+        SimpleNamespace(
+            code="000001",
+            name="平安银行",
+            rank=2,
+            rule_score=80.0,
+            rule_hits=["trend_aligned"],
+            factor_snapshot={"close": 12.0},
+            matched_strategies=["trend_aligned"],
+            strategy_scores={"trend_aligned": 80.0},
+            setup_type="trend_pullback",
+            entry_maturity="medium",
+            trade_stage="watch",
+            market_regime="balanced",
+            risk_level="medium",
+            theme_position="secondary_theme",
+            candidate_pool_level="watchlist",
+        ),
+    ]
 
-    result = service.execute_run(
-        trade_date=date(2026, 3, 13),
-        stock_codes=None,
-        candidate_limit=30,
-        ai_top_k=1,
-    )
+    with patch("src.services.five_layer_pipeline.FiveLayerPipeline") as pipeline_cls:
+        pipeline_cls.return_value.run.return_value = SimpleNamespace(
+            candidates=pipeline_candidates,
+            decision_context=None,
+            pipeline_stats={
+                "selected_after_limit": 2,
+                "matched_before_limit": 2,
+                "rejected_before_l345": 0,
+            },
+        )
+
+        result = service.execute_run(
+            trade_date=date(2026, 3, 13),
+            stock_codes=None,
+            candidate_limit=30,
+            ai_top_k=1,
+        )
 
     assert result["run_id"] == "run-001"
     assert result["status"] == "completed"
@@ -404,12 +451,43 @@ def test_screening_task_service_completes_with_ai_degraded_when_ai_analysis_fail
         candidate_analysis_service=candidate_analysis_service,
         market_data_sync_service=market_data_sync_service,
     )
+    service.config.screening_market_guard_enabled = False
+    pipeline_candidates = [
+        SimpleNamespace(
+            code="600519",
+            name="贵州茅台",
+            rank=1,
+            rule_score=91.0,
+            rule_hits=["trend_aligned"],
+            factor_snapshot={"close": 1500.0},
+            matched_strategies=["trend_aligned"],
+            strategy_scores={"trend_aligned": 91.0},
+            setup_type="trend_breakout",
+            entry_maturity="high",
+            trade_stage="focus",
+            market_regime="balanced",
+            risk_level="medium",
+            theme_position="main_theme",
+            candidate_pool_level="focus_list",
+        )
+    ]
 
-    result = service.execute_run(
-        trade_date=date(2026, 3, 13),
-        candidate_limit=10,
-        ai_top_k=1,
-    )
+    with patch("src.services.five_layer_pipeline.FiveLayerPipeline") as pipeline_cls:
+        pipeline_cls.return_value.run.return_value = SimpleNamespace(
+            candidates=pipeline_candidates,
+            decision_context=None,
+            pipeline_stats={
+                "selected_after_limit": 1,
+                "matched_before_limit": 1,
+                "rejected_before_l345": 0,
+            },
+        )
+
+        result = service.execute_run(
+            trade_date=date(2026, 3, 13),
+            candidate_limit=10,
+            ai_top_k=1,
+        )
 
     assert result["status"] == "completed_with_ai_degraded"
     completed_call = db.update_screening_run_status.call_args_list[-1]
@@ -540,9 +618,39 @@ def test_screening_task_service_logs_stage_durations_and_health_report(caplog):
         candidate_analysis_service=MagicMock(),
         market_data_sync_service=market_data_sync_service,
     )
+    service.config.screening_market_guard_enabled = False
+    pipeline_candidates = [
+        SimpleNamespace(
+            code="600519",
+            name="贵州茅台",
+            rank=1,
+            rule_score=91.0,
+            rule_hits=["trend_aligned"],
+            factor_snapshot={},
+            matched_strategies=["trend_aligned"],
+            strategy_scores={"trend_aligned": 91.0},
+            setup_type="trend_breakout",
+            entry_maturity="high",
+            trade_stage="focus",
+            market_regime="balanced",
+            risk_level="medium",
+            theme_position="main_theme",
+            candidate_pool_level="focus_list",
+        )
+    ]
 
-    with caplog.at_level(logging.INFO, logger="src.services.screening_task_service"):
-        service.execute_run(trade_date=date(2026, 3, 13), candidate_limit=10, ai_top_k=0)
+    with patch("src.services.five_layer_pipeline.FiveLayerPipeline") as pipeline_cls:
+        pipeline_cls.return_value.run.return_value = SimpleNamespace(
+            candidates=pipeline_candidates,
+            decision_context=None,
+            pipeline_stats={
+                "selected_after_limit": 1,
+                "matched_before_limit": 2,
+                "rejected_before_l345": 1,
+            },
+        )
+        with caplog.at_level(logging.INFO, logger="src.services.screening_task_service"):
+            service.execute_run(trade_date=date(2026, 3, 13), candidate_limit=10, ai_top_k=0)
 
     assert "screening_run_id=run-observe" in caplog.text
     assert "stage=ingesting" in caplog.text
@@ -839,13 +947,44 @@ def test_screening_task_service_uses_config_defaults_when_limits_omitted(get_con
         candidate_analysis_service=candidate_analysis_service,
         market_data_sync_service=market_data_sync_service,
     )
+    service.config.screening_market_guard_enabled = False
+    pipeline_candidates = [
+        SimpleNamespace(
+            code="600519",
+            name="贵州茅台",
+            rank=1,
+            rule_score=91.0,
+            rule_hits=["trend_aligned"],
+            factor_snapshot={},
+            matched_strategies=["trend_aligned"],
+            strategy_scores={"trend_aligned": 91.0},
+            setup_type="trend_breakout",
+            entry_maturity="high",
+            trade_stage="focus",
+            market_regime="balanced",
+            risk_level="medium",
+            theme_position="main_theme",
+            candidate_pool_level="focus_list",
+        )
+    ]
 
-    service.execute_run(
-        trade_date=date(2026, 3, 13),
-        stock_codes=None,
-        candidate_limit=None,
-        ai_top_k=None,
-    )
+    with patch("src.services.five_layer_pipeline.FiveLayerPipeline") as pipeline_cls:
+        pipeline_cls.return_value.run.return_value = SimpleNamespace(
+            candidates=pipeline_candidates,
+            decision_context=None,
+            pipeline_stats={
+                "selected_after_limit": 1,
+                "matched_before_limit": 1,
+                "rejected_before_l345": 0,
+            },
+        )
+
+        service.execute_run(
+            trade_date=date(2026, 3, 13),
+            stock_codes=None,
+            candidate_limit=None,
+            ai_top_k=None,
+        )
 
     create_call = db.create_screening_run.call_args
     assert create_call.kwargs["config_snapshot"]["mode"] == "balanced"
@@ -975,6 +1114,70 @@ def test_screening_task_service_creates_new_run_without_explicit_trade_date_when
 
     assert result["run_id"] == "run-new-latest-trading-day"
     db.create_screening_run.assert_called_once()
+
+
+def test_screening_task_service_uses_latest_passed_audit_trade_date_before_factor_window_fallback():
+    db = MagicMock()
+    db.create_screening_run.return_value = "run-latest-audit-truth"
+    db.get_screening_run.return_value = {
+        "run_id": "run-latest-audit-truth",
+        "mode": "balanced",
+        "status": "completed",
+        "candidate_count": 0,
+    }
+    db.get_latest_passed_kline_audit_trade_date.return_value = SimpleNamespace(
+        market="cn",
+        trade_date=date(2026, 3, 13),
+        pass_status="passed",
+    )
+    db.get_kline_audit_trade_date.return_value = SimpleNamespace(
+        market="cn",
+        trade_date=date(2026, 3, 13),
+        pass_status="passed",
+    )
+
+    universe_service = MagicMock()
+    universe_service.resolve_universe.return_value = pd.DataFrame([{"code": "600519", "name": "贵州茅台"}])
+
+    factor_service = MagicMock()
+    factor_service.get_latest_trade_date.return_value = None
+    factor_service.build_factor_snapshot.return_value = pd.DataFrame([{"code": "600519", "name": "贵州茅台"}])
+
+    market_data_sync_service = MagicMock()
+    market_data_sync_service.sync_trade_date.return_value = {
+        "trade_date": "2026-03-13",
+        "total": 1,
+        "synced": 1,
+        "skipped": 0,
+        "errors": [],
+    }
+
+    service = ScreeningTaskService(
+        db_manager=db,
+        universe_service=universe_service,
+        factor_service=factor_service,
+        screener_service=MagicMock(),
+        candidate_analysis_service=MagicMock(),
+        market_data_sync_service=market_data_sync_service,
+    )
+    service.config.screening_market_guard_enabled = False
+
+    with patch("src.services.five_layer_pipeline.FiveLayerPipeline") as pipeline_cls:
+        pipeline_cls.return_value.run.return_value = SimpleNamespace(
+            candidates=[],
+            decision_context=None,
+            pipeline_stats={
+                "selected_after_limit": 0,
+                "matched_before_limit": 0,
+                "rejected_before_l345": 0,
+            },
+        )
+        result = service.execute_run(trade_date=None, candidate_limit=30, ai_top_k=0)
+
+    assert result["status"] == "completed"
+    factor_service.get_latest_trade_date.assert_not_called()
+    factor_service.build_factor_snapshot.assert_called_once()
+    assert factor_service.build_factor_snapshot.call_args.kwargs["trade_date"] == date(2026, 3, 13)
 
 
 def test_screening_task_service_treats_different_effective_config_as_new_run():
@@ -1941,7 +2144,14 @@ def test_screening_task_service_continues_with_skippable_sync_failures_below_thr
         "total": 4,
         "synced": 3,
         "skipped": 0,
-        "errors": [{"code": "000002", "reason": "fetch_failed", "detail": "all providers failed"}],
+        "errors": [
+            {
+                "code": "000002",
+                "reason": "fetch_failed",
+                "reason_class": "skip_eligible",
+                "detail": "all providers failed",
+            }
+        ],
     }
 
     service = ScreeningTaskService(
@@ -2004,7 +2214,12 @@ def test_screening_task_service_fails_when_skippable_sync_failure_ratio_exceeds_
         "synced": 2,
         "skipped": 0,
         "errors": [
-            {"code": "000002", "reason": "fetch_failed", "detail": "all providers failed"},
+            {
+                "code": "000002",
+                "reason": "fetch_failed",
+                "reason_class": "skip_eligible",
+                "detail": "all providers failed",
+            },
             {"code": "000003", "reason": "empty_data", "detail": "no data"},
         ],
     }
@@ -2030,6 +2245,187 @@ def test_screening_task_service_fails_when_skippable_sync_failure_ratio_exceeds_
     factor_service.build_factor_snapshot.assert_not_called()
     failed_call = db.update_screening_run_status.call_args_list[-1]
     assert "同步失败比例" in failed_call.kwargs["error_summary"]
+
+
+def test_screening_ingest_does_not_silently_accept_fetch_failed_as_success():
+    db = MagicMock()
+    db.create_screening_run.return_value = "run-fetch-failed-blocking"
+    db.get_screening_run.return_value = {
+        "run_id": "run-fetch-failed-blocking",
+        "mode": "balanced",
+        "status": "failed",
+        "candidate_count": 0,
+    }
+
+    universe_service = MagicMock()
+    universe_service.resolve_universe.return_value = pd.DataFrame(
+        [
+            {"code": "600519", "name": "贵州茅台", "listing_status": "active"},
+            {"code": "000001", "name": "平安银行", "listing_status": "active"},
+        ]
+    )
+
+    factor_service = MagicMock()
+    factor_service.get_latest_trade_date.return_value = date(2026, 3, 13)
+
+    market_data_sync_service = MagicMock()
+    market_data_sync_service.sync_trade_date.return_value = {
+        "trade_date": "2026-03-13",
+        "total": 2,
+        "synced": 1,
+        "skipped": 0,
+        "errors": [
+            {
+                "code": "000001",
+                "reason": "fetch_failed",
+                "reason_class": "blocking",
+                "detail": "all providers failed",
+            }
+        ],
+    }
+
+    service = ScreeningTaskService(
+        db_manager=db,
+        universe_service=universe_service,
+        factor_service=factor_service,
+        screener_service=MagicMock(),
+        candidate_analysis_service=MagicMock(),
+        market_data_sync_service=market_data_sync_service,
+    )
+    service.config.screening_ingest_failure_threshold = 0.8
+    service.config.screening_market_guard_enabled = False
+
+    result = service.execute_run(
+        trade_date=date(2026, 3, 13),
+        stock_codes=None,
+        candidate_limit=30,
+        ai_top_k=0,
+    )
+
+    assert result["status"] == "failed"
+    factor_service.build_factor_snapshot.assert_not_called()
+    failed_call = db.update_screening_run_status.call_args_list[-1]
+    assert "000001: all providers failed" in failed_call.kwargs["error_summary"]
+
+
+def test_screening_task_service_fails_when_trade_date_audit_not_passed():
+    db = MagicMock()
+    db.create_screening_run.return_value = "run-trade-date-audit-blocked"
+    db.get_screening_run.return_value = {
+        "run_id": "run-trade-date-audit-blocked",
+        "mode": "balanced",
+        "status": "failed",
+        "candidate_count": 0,
+    }
+    db.get_kline_audit_trade_date.return_value = SimpleNamespace(
+        market="cn",
+        trade_date=date(2026, 3, 13),
+        pass_status="degraded",
+    )
+
+    universe_service = MagicMock()
+    universe_service.resolve_universe.return_value = pd.DataFrame(
+        [{"code": "600519", "name": "贵州茅台", "listing_status": "active"}]
+    )
+
+    factor_service = MagicMock()
+    factor_service.get_latest_trade_date.return_value = date(2026, 3, 13)
+    factor_service.build_factor_snapshot.return_value = pd.DataFrame(
+        [{"code": "600519", "name": "贵州茅台"}]
+    )
+
+    market_data_sync_service = MagicMock()
+    market_data_sync_service.sync_trade_date.return_value = {
+        "trade_date": "2026-03-13",
+        "total": 1,
+        "synced": 1,
+        "skipped": 0,
+        "errors": [],
+    }
+
+    service = ScreeningTaskService(
+        db_manager=db,
+        universe_service=universe_service,
+        factor_service=factor_service,
+        screener_service=MagicMock(),
+        candidate_analysis_service=MagicMock(),
+        market_data_sync_service=market_data_sync_service,
+    )
+    service.config.screening_market_guard_enabled = False
+
+    result = service.execute_run(
+        trade_date=date(2026, 3, 13),
+        stock_codes=None,
+        candidate_limit=30,
+        ai_top_k=0,
+    )
+
+    assert result["status"] == "failed"
+    db.get_kline_audit_trade_date.assert_called_once_with(
+        market="cn",
+        trade_date=date(2026, 3, 13),
+    )
+    factor_service.build_factor_snapshot.assert_not_called()
+    failed_call = db.update_screening_run_status.call_args_list[-1]
+    assert "pass_status=degraded" in failed_call.kwargs["error_summary"]
+
+
+def test_screening_task_service_fails_when_trade_date_audit_record_is_missing():
+    db = MagicMock()
+    db.create_screening_run.return_value = "run-trade-date-audit-missing"
+    db.get_screening_run.return_value = {
+        "run_id": "run-trade-date-audit-missing",
+        "mode": "balanced",
+        "status": "failed",
+        "candidate_count": 0,
+    }
+    db.get_kline_audit_trade_date.return_value = None
+
+    universe_service = MagicMock()
+    universe_service.resolve_universe.return_value = pd.DataFrame(
+        [{"code": "600519", "name": "贵州茅台", "listing_status": "active"}]
+    )
+
+    factor_service = MagicMock()
+    factor_service.get_latest_trade_date.return_value = date(2026, 3, 13)
+    factor_service.build_factor_snapshot.return_value = pd.DataFrame(
+        [{"code": "600519", "name": "贵州茅台"}]
+    )
+
+    market_data_sync_service = MagicMock()
+    market_data_sync_service.sync_trade_date.return_value = {
+        "trade_date": "2026-03-13",
+        "total": 1,
+        "synced": 1,
+        "skipped": 0,
+        "errors": [],
+    }
+
+    service = ScreeningTaskService(
+        db_manager=db,
+        universe_service=universe_service,
+        factor_service=factor_service,
+        screener_service=MagicMock(),
+        candidate_analysis_service=MagicMock(),
+        market_data_sync_service=market_data_sync_service,
+    )
+    service.config.screening_market_guard_enabled = False
+
+    result = service.execute_run(
+        trade_date=date(2026, 3, 13),
+        stock_codes=None,
+        candidate_limit=30,
+        ai_top_k=0,
+    )
+
+    assert result["status"] == "failed"
+    db.get_kline_audit_trade_date.assert_called_once_with(
+        market="cn",
+        trade_date=date(2026, 3, 13),
+    )
+    factor_service.build_factor_snapshot.assert_not_called()
+    failed_call = db.update_screening_run_status.call_args_list[-1]
+    assert "缺少 K 线审计记录" in failed_call.kwargs["error_summary"]
 
 
 def test_screening_task_service_rerun_failed_skips_known_failed_symbols_before_sync():
@@ -2581,6 +2977,28 @@ def test_screening_task_service_persists_effective_trade_date_on_failed_run():
 
         try:
             db = DatabaseManager.get_instance()
+            db.create_kline_audit_run(
+                run_id="audit-run-failed-trade-date",
+                market="cn",
+                trade_date=date(2026, 3, 12),
+                run_type="daily",
+                trigger_type="manual",
+                run_result="succeeded",
+                pass_status="passed",
+                rule_version="test-v1",
+                window_start=date(2025, 12, 20),
+                window_end=date(2026, 3, 12),
+            )
+            db.upsert_kline_audit_trade_date(
+                market="cn",
+                trade_date=date(2026, 3, 12),
+                pass_status="passed",
+                window_start=date(2025, 12, 20),
+                window_end=date(2026, 3, 12),
+                rule_version="test-v1",
+                source_run_id="audit-run-failed-trade-date",
+                passed_at=None,
+            )
             factor_service = MagicMock()
             factor_service.get_latest_trade_date.return_value = date(2026, 3, 12)
             factor_service.build_factor_snapshot.side_effect = ValueError("factor build failed")
@@ -2630,6 +3048,28 @@ def test_screening_task_service_updates_trade_date_in_real_database():
 
         try:
             db = DatabaseManager.get_instance()
+            db.create_kline_audit_run(
+                run_id="audit-run-success-trade-date",
+                market="cn",
+                trade_date=date(2026, 3, 13),
+                run_type="daily",
+                trigger_type="manual",
+                run_result="succeeded",
+                pass_status="passed",
+                rule_version="test-v1",
+                window_start=date(2025, 12, 20),
+                window_end=date(2026, 3, 13),
+            )
+            db.upsert_kline_audit_trade_date(
+                market="cn",
+                trade_date=date(2026, 3, 13),
+                pass_status="passed",
+                window_start=date(2025, 12, 20),
+                window_end=date(2026, 3, 13),
+                rule_version="test-v1",
+                source_run_id="audit-run-success-trade-date",
+                passed_at=None,
+            )
             factor_service = MagicMock()
             factor_service.get_latest_trade_date.return_value = date(2026, 3, 13)
             factor_service.build_factor_snapshot.return_value = pd.DataFrame(

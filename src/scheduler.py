@@ -94,12 +94,16 @@ class Scheduler:
         task_name = str(name or "task").strip() or "task"
         daily_time = schedule_time or self.schedule_time
         self._task_callbacks[task_name] = task
-        self.schedule.every().day.at(daily_time).do(lambda: self._safe_run_named_task(task_name))
+        job = self.schedule.every().day.at(daily_time).do(
+            lambda: self._safe_run_named_task(task_name)
+        )
         logger.info(f"已设置每日定时任务[{task_name}]，执行时间: {daily_time}")
 
         if run_immediately:
             logger.info(f"立即执行一次任务[{task_name}]...")
             self._safe_run_named_task(task_name)
+
+        return job
 
     def set_daily_task(self, task: Callable, run_immediately: bool = True):
         """
@@ -149,6 +153,7 @@ class Scheduler:
             logger.info(f"定时任务[{name}]执行完成 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         except Exception as e:
             logger.exception(f"定时任务[{name}]执行失败: {e}")
+            raise
     
     def run(self):
         """

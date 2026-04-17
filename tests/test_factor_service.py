@@ -8,6 +8,7 @@ import pandas as pd
 
 from src.config import Config
 from src.services.factor_service import FactorService
+from src.services.kline_audit_service import KlineAuditService
 from src.services.theme_context_ingest_service import ExternalTheme, OpenClawThemeContext
 from src.storage import DatabaseManager
 
@@ -71,36 +72,135 @@ class FactorServiceTestCase(unittest.TestCase):
         self.assertEqual(row["days_since_listed"], (rows[-1]["date"] - date(2020, 1, 1)).days)
 
     def test_get_latest_trade_date_returns_latest_available_date(self) -> None:
-        df = pd.DataFrame(
-            [
-                {
-                    "date": date(2026, 3, 10),
-                    "open": 10.0,
-                    "high": 10.2,
-                    "low": 9.8,
-                    "close": 10.1,
-                    "volume": 1000,
-                    "amount": 10_100,
-                    "pct_chg": 1.0,
-                },
-                {
-                    "date": date(2026, 3, 11),
-                    "open": 10.2,
-                    "high": 10.4,
-                    "low": 10.0,
-                    "close": 10.3,
-                    "volume": 1100,
-                    "amount": 11_330,
-                    "pct_chg": 1.2,
-                },
-            ]
-        )
-        self.db.save_daily_data(df, "000001", data_source="test")
-
         universe_df = pd.DataFrame([{"code": "000001", "name": "Ping An Bank", "is_st": False, "list_date": None}])
+        self.db.create_kline_audit_run(
+            run_id="audit-run-passed-20260311",
+            market="cn",
+            trade_date=date(2026, 3, 11),
+            run_type="daily",
+            trigger_type="manual",
+            run_result="succeeded",
+            pass_status="passed",
+            rule_version="test-v1",
+            window_start=date(2025, 12, 20),
+            window_end=date(2026, 3, 11),
+        )
+        self.db.upsert_kline_audit_trade_date(
+            market="cn",
+            trade_date=date(2026, 3, 11),
+            pass_status="passed",
+            window_start=date(2025, 12, 20),
+            window_end=date(2026, 3, 11),
+            rule_version="test-v1",
+            source_run_id="audit-run-passed-20260311",
+            passed_at=None,
+        )
+        self.db.create_kline_audit_run(
+            run_id="audit-run-not-passed-20260312",
+            market="cn",
+            trade_date=date(2026, 3, 12),
+            run_type="daily",
+            trigger_type="manual",
+            run_result="degraded",
+            pass_status="not_passed",
+            rule_version="test-v1",
+            window_start=date(2026, 1, 2),
+            window_end=date(2026, 3, 12),
+        )
+        self.db.upsert_kline_audit_trade_date(
+            market="cn",
+            trade_date=date(2026, 3, 12),
+            pass_status="not_passed",
+            window_start=date(2026, 1, 2),
+            window_end=date(2026, 3, 12),
+            rule_version="test-v1",
+            source_run_id="audit-run-not-passed-20260312",
+            passed_at=None,
+        )
+
         latest_date = self.service.get_latest_trade_date(universe_df)
 
         self.assertEqual(latest_date, date(2026, 3, 11))
+
+    def test_get_latest_trade_date_returns_none_when_passed_window_does_not_cover_lookback(self) -> None:
+        universe_df = pd.DataFrame([{"code": "000001", "name": "Ping An Bank", "is_st": False, "list_date": None}])
+        self.db.create_kline_audit_run(
+            run_id="audit-run-short-window-20260311",
+            market="cn",
+            trade_date=date(2026, 3, 11),
+            run_type="daily",
+            trigger_type="manual",
+            run_result="succeeded",
+            pass_status="passed",
+            rule_version="test-v1",
+            window_start=date(2026, 1, 30),
+            window_end=date(2026, 3, 11),
+        )
+        self.db.upsert_kline_audit_trade_date(
+            market="cn",
+            trade_date=date(2026, 3, 11),
+            pass_status="passed",
+            window_start=date(2026, 1, 30),
+            window_end=date(2026, 3, 11),
+            rule_version="test-v1",
+            source_run_id="audit-run-short-window-20260311",
+            passed_at=None,
+        )
+
+        with self.assertLogs("src.services.factor_service", level="WARNING") as captured:
+            latest_date = self.service.get_latest_trade_date(universe_df)
+
+        self.assertIsNone(latest_date)
+        self.assertTrue(any("factor window" in message for message in captured.output))
+
+    def test_get_latest_trade_date_uses_market_from_universe(self) -> None:
+        universe_df = pd.DataFrame(
+            [{"code": "00700", "name": "Tencent", "is_st": False, "list_date": None}]
+        )
+        self.db.create_kline_audit_run(
+            run_id="audit-run-passed-hk-20260311",
+            market="hk",
+            trade_date=date(2026, 3, 11),
+            run_type="daily",
+            trigger_type="manual",
+            run_result="succeeded",
+            pass_status="passed",
+            rule_version="test-v1",
+            window_start=date(2025, 12, 20),
+            window_end=date(2026, 3, 11),
+        )
+        self.db.upsert_kline_audit_trade_date(
+            market="hk",
+            trade_date=date(2026, 3, 11),
+            pass_status="passed",
+            window_start=date(2025, 12, 20),
+            window_end=date(2026, 3, 11),
+            rule_version="test-v1",
+            source_run_id="audit-run-passed-hk-20260311",
+            passed_at=None,
+        )
+
+        latest_date = self.service.get_latest_trade_date(universe_df)
+
+        self.assertEqual(latest_date, date(2026, 3, 11))
+
+    def test_get_latest_trade_date_ignores_fail_closed_empty_universe_audit(self) -> None:
+        audit_service = KlineAuditService(self.db)
+        audit_service.audit_trade_date(
+            market="cn",
+            trade_date=date(2026, 3, 11),
+            window_start=date(2025, 12, 20),
+            window_end=date(2026, 3, 11),
+        )
+        universe_df = pd.DataFrame(
+            [{"code": "000001", "name": "Ping An Bank", "is_st": False, "list_date": None}]
+        )
+
+        with self.assertLogs("src.services.factor_service", level="WARNING") as captured:
+            latest_date = self.service.get_latest_trade_date(universe_df)
+
+        self.assertIsNone(latest_date)
+        self.assertTrue(any("No passed kline audit trade date found" in message for message in captured.output))
 
     def test_build_factor_snapshot_can_persist_snapshots(self) -> None:
         start_date = date(2026, 3, 1)

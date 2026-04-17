@@ -6,9 +6,10 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from src.config import get_config
+from src.core.trading_calendar import get_market_for_stock
 from src.storage import DatabaseManager, StockDaily
 from src.indicators.ma_breakout_detector import MABreakoutDetector
 from src.indicators.gap_detector import GapDetector
@@ -340,17 +341,7 @@ class FactorService:
         universe_df: pd.DataFrame,
         min_coverage_ratio: float = 0.5,
     ) -> Optional[date]:
-        """
-        返回本地日线表中覆盖率足够的最新交易日。
-
-        避免被少量"毒数据"（如部分同步导致的零星未来日期记录）污染：
-        只有当某个日期拥有 >= universe 数量 * min_coverage_ratio 条记录时，
-        才认定该日期为可用交易日。
-
-        Args:
-            universe_df: 股票池 DataFrame，需含 code 列
-            min_coverage_ratio: 覆盖率下限，默认 0.5（至少覆盖一半股票池）
-        """
+        """返回最近一个通过 K 线审计且覆盖因子 lookback 的交易日。"""
         if universe_df is None or universe_df.empty:
             return None
 
@@ -358,20 +349,42 @@ class FactorService:
         if not codes:
             return None
 
-        min_count = max(1, int(len(codes) * min_coverage_ratio))
+        _ = min_coverage_ratio  # backward-compatible arg; trade-date truth source no longer uses coverage ratio
+        market = "cn"
+        if "market" in universe_df.columns:
+            market_values = [
+                str(value).strip().lower()
+                for value in universe_df["market"].dropna().tolist()
+                if str(value).strip()
+            ]
+            if market_values:
+                market = market_values[0]
+        elif codes:
+            inferred_market = get_market_for_stock(codes[0])
+            if inferred_market:
+                market = inferred_market
 
-        with self.db.get_session() as session:
-            # 按日期倒序查找，取第一个覆盖率达标的日期
-            from sqlalchemy import desc
-            row = session.execute(
-                select(StockDaily.date, func.count(StockDaily.code.distinct()).label("cnt"))
-                .where(StockDaily.code.in_(codes))
-                .group_by(StockDaily.date)
-                .having(func.count(StockDaily.code.distinct()) >= min_count)
-                .order_by(desc(StockDaily.date))
-                .limit(1)
-            ).first()
-        return row[0] if row else None
+        latest_passed = self.db.get_latest_passed_kline_audit_trade_date(market=market)
+        if latest_passed is None:
+            logger.warning(
+                "No passed kline audit trade date found for market=%s; FactorService will return None.",
+                market,
+            )
+            return None
+
+        required_window_start = latest_passed.trade_date - timedelta(days=self.lookback_days * 2)
+        if latest_passed.window_start > required_window_start or latest_passed.window_end < latest_passed.trade_date:
+            logger.warning(
+                "Latest passed kline audit trade date %s does not cover factor window=%s "
+                "(window_start=%s window_end=%s).",
+                latest_passed.trade_date,
+                self.lookback_days * 2,
+                latest_passed.window_start,
+                latest_passed.window_end,
+            )
+            return None
+
+        return latest_passed.trade_date
 
     @staticmethod
     def _compute_trend_score(close: float, ma5: float, ma10: float, ma20: float, breakout_ratio: float) -> float:

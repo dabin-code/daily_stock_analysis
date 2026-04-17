@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from src.config import Config
+from src.core.config_registry import get_field_definition
 
 
 class ConfigEnvCompatibilityTestCase(unittest.TestCase):
@@ -112,6 +113,65 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
 
         self.assertFalse(config.schedule_run_immediately)
         self.assertTrue(config.run_immediately)
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_kline_governance_config_uses_safe_defaults(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            config = Config._load_from_env()
+
+        self.assertFalse(config.kline_governance_enabled)
+        self.assertEqual(config.kline_governance_schedule_time, "17:00")
+        self.assertFalse(config.kline_governance_run_immediately)
+        self.assertEqual(config.kline_audit_lookback_days, 30)
+        self.assertEqual(config.kline_deep_audit_lookback_days, 365)
+        self.assertFalse(config.kline_deep_audit_schedule_enabled)
+        self.assertEqual(config.kline_deep_audit_schedule_time, "17:00")
+        self.assertEqual(config.kline_retry_max_attempts, 3)
+        self.assertEqual(config.kline_skip_candidate_failure_threshold, 3)
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_kline_governance_config_reads_env_values_and_registers_fields(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ) -> None:
+        env = {
+            "KLINE_GOVERNANCE_ENABLED": "true",
+            "KLINE_GOVERNANCE_SCHEDULE_TIME": "17:05",
+            "KLINE_GOVERNANCE_RUN_IMMEDIATELY": "true",
+            "KLINE_AUDIT_LOOKBACK_DAYS": "45",
+            "KLINE_DEEP_AUDIT_LOOKBACK_DAYS": "540",
+            "KLINE_DEEP_AUDIT_SCHEDULE_ENABLED": "true",
+            "KLINE_DEEP_AUDIT_SCHEDULE_TIME": "18:30",
+            "KLINE_RETRY_MAX_ATTEMPTS": "4",
+            "KLINE_SKIP_CANDIDATE_FAILURE_THRESHOLD": "5",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            config = Config._load_from_env()
+
+        self.assertTrue(config.kline_governance_enabled)
+        self.assertEqual(config.kline_governance_schedule_time, "17:05")
+        self.assertTrue(config.kline_governance_run_immediately)
+        self.assertEqual(config.kline_audit_lookback_days, 45)
+        self.assertEqual(config.kline_deep_audit_lookback_days, 540)
+        self.assertTrue(config.kline_deep_audit_schedule_enabled)
+        self.assertEqual(config.kline_deep_audit_schedule_time, "18:30")
+        self.assertEqual(config.kline_retry_max_attempts, 4)
+        self.assertEqual(config.kline_skip_candidate_failure_threshold, 5)
+
+        governance_field = get_field_definition("KLINE_GOVERNANCE_ENABLED")
+        deep_audit_time_field = get_field_definition("KLINE_DEEP_AUDIT_SCHEDULE_TIME")
+
+        self.assertEqual(governance_field["category"], "system")
+        self.assertEqual(governance_field["data_type"], "boolean")
+        self.assertEqual(deep_audit_time_field["data_type"], "time")
 
 
 if __name__ == "__main__":

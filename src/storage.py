@@ -894,6 +894,164 @@ class ScreeningCandidate(Base):
         return fallback_payload
 
 
+class KlineAuditRun(Base):
+    """K 线审计执行记录。"""
+
+    __tablename__ = "kline_audit_runs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(64), nullable=False, unique=True, index=True)
+    market = Column(String(16), nullable=False, default="cn", index=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    run_type = Column(String(32), nullable=False, default="daily")
+    trigger_type = Column(String(32), nullable=False, default="manual")
+    run_result = Column(String(32), nullable=False, default="pending", index=True)
+    pass_status = Column(String(32), nullable=False, default="pending", index=True)
+    rule_version = Column(String(64), nullable=False)
+    window_start = Column(Date, nullable=False)
+    window_end = Column(Date, nullable=False)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    completed_at = Column(DateTime, nullable=True, index=True)
+
+    __table_args__ = (
+        Index("ix_kline_audit_runs_market_trade_date", "market", "trade_date"),
+    )
+
+
+class KlineAuditTradeDate(Base):
+    """交易日级审计真相源。"""
+
+    __tablename__ = "kline_audit_trade_dates"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    market = Column(String(16), nullable=False, default="cn", index=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    pass_status = Column(String(32), nullable=False, default="pending", index=True)
+    window_start = Column(Date, nullable=False)
+    window_end = Column(Date, nullable=False)
+    rule_version = Column(String(64), nullable=False)
+    source_run_id = Column(String(64), ForeignKey("kline_audit_runs.run_id"), nullable=False, index=True)
+    checked_at = Column(DateTime, nullable=False, default=datetime.now)
+    passed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("market", "trade_date", name="uix_kline_audit_trade_date_market_date"),
+        Index("ix_kline_audit_trade_dates_market_status", "market", "pass_status"),
+    )
+
+
+class KlineAuditGap(Base):
+    """K 线缺口真相源。"""
+
+    __tablename__ = "kline_audit_gaps"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    gap_key = Column(String(255), nullable=False, unique=True, index=True)
+    source_run_id = Column(String(64), ForeignKey("kline_audit_runs.run_id"), nullable=False, index=True)
+    market = Column(String(16), nullable=False, default="cn", index=True)
+    gap_scope = Column(String(32), nullable=False, index=True)
+    code = Column(String(16), nullable=True, index=True)
+    trade_date = Column(Date, nullable=True, index=True)
+    missing_date_from = Column(Date, nullable=True)
+    missing_date_to = Column(Date, nullable=True)
+    status = Column(String(32), nullable=False, default="open", index=True)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        Index("ix_kline_audit_gaps_market_scope_status", "market", "gap_scope", "status"),
+    )
+
+    @staticmethod
+    def build_gap_key(
+        *,
+        market: str,
+        gap_scope: str,
+        trade_date: Optional[date] = None,
+        code: Optional[str] = None,
+        missing_date_from: Optional[date] = None,
+        missing_date_to: Optional[date] = None,
+    ) -> str:
+        if gap_scope == "market_day_gap":
+            if trade_date is None:
+                raise ValueError("market_day_gap requires trade_date")
+            return f"{market}|{trade_date.isoformat()}|{gap_scope}"
+        if gap_scope == "symbol_range_gap":
+            if not code or missing_date_from is None or missing_date_to is None:
+                raise ValueError("symbol_range_gap requires code, missing_date_from, and missing_date_to")
+            return (
+                f"{market}|{code}|{missing_date_from.isoformat()}|"
+                f"{missing_date_to.isoformat()}|{gap_scope}"
+            )
+        raise ValueError(f"Unsupported gap_scope: {gap_scope}")
+
+
+class KlineAuditEvent(Base):
+    """K 线审计事件流水。"""
+
+    __tablename__ = "kline_audit_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    source_run_id = Column(String(64), ForeignKey("kline_audit_runs.run_id"), nullable=True, index=True)
+    gap_key = Column(String(255), nullable=True, index=True)
+    event_type = Column(String(64), nullable=False, index=True)
+    event_status = Column(String(32), nullable=True)
+    payload_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now, index=True)
+
+
+class KlineSkipRegistry(Base):
+    """K 线豁免登记真相源。"""
+
+    __tablename__ = "kline_skip_registry"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    skip_key = Column(String(255), nullable=False, unique=True, index=True)
+    market = Column(String(16), nullable=False, default="cn", index=True)
+    gap_scope = Column(String(32), nullable=False, index=True)
+    code = Column(String(16), nullable=True, index=True)
+    trade_date = Column(Date, nullable=True, index=True)
+    missing_date_from = Column(Date, nullable=True)
+    missing_date_to = Column(Date, nullable=True)
+    status = Column(String(32), nullable=False, default="candidate_skip", index=True)
+    reason_type = Column(String(64), nullable=True)
+    notes = Column(Text, nullable=True)
+    approved_by = Column(String(64), nullable=True)
+    approved_at = Column(DateTime, nullable=True)
+    success_streak = Column(Integer, nullable=False, default=0)
+    last_success_at = Column(DateTime, nullable=True)
+    last_recovered_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now, index=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        Index("ix_kline_skip_registry_market_scope_status", "market", "gap_scope", "status"),
+    )
+
+    @staticmethod
+    def build_skip_key(
+        *,
+        market: str,
+        gap_scope: str,
+        trade_date: Optional[date] = None,
+        code: Optional[str] = None,
+        missing_date_from: Optional[date] = None,
+        missing_date_to: Optional[date] = None,
+    ) -> str:
+        if gap_scope == "market_day_gap":
+            if trade_date is None:
+                raise ValueError("market_day_gap requires trade_date")
+            return f"{market}|{trade_date.isoformat()}|{gap_scope}"
+        if gap_scope == "symbol_range_gap":
+            if not code or missing_date_from is None or missing_date_to is None:
+                raise ValueError("symbol_range_gap requires code, missing_date_from, and missing_date_to")
+            return (
+                f"{market}|{code}|{missing_date_from.isoformat()}|"
+                f"{missing_date_to.isoformat()}|{gap_scope}"
+            )
+        raise ValueError(f"Unsupported gap_scope: {gap_scope}")
+
+
 class DailySectorHeat(Base):
     """板块每日热度快照——SectorHeatEngine 的持久化输出。"""
 
@@ -1316,6 +1474,523 @@ class DatabaseManager:
             raise
         finally:
             session.close()
+
+    def _create_kline_audit_run_in_session(
+        self,
+        session: Session,
+        *,
+        run_id: str,
+        market: str,
+        trade_date: date,
+        run_type: str,
+        trigger_type: str,
+        run_result: str,
+        pass_status: str,
+        rule_version: str,
+        window_start: date,
+        window_end: date,
+    ) -> KlineAuditRun:
+        run = session.execute(
+            select(KlineAuditRun).where(KlineAuditRun.run_id == run_id)
+        ).scalar_one_or_none()
+        if run is None:
+            run = KlineAuditRun(run_id=run_id)
+            session.add(run)
+
+        run.market = market
+        run.trade_date = trade_date
+        run.run_type = run_type
+        run.trigger_type = trigger_type
+        run.run_result = run_result
+        run.pass_status = pass_status
+        run.rule_version = rule_version
+        run.window_start = window_start
+        run.window_end = window_end
+        session.flush()
+        session.refresh(run)
+        session.expunge(run)
+        return run
+
+    def create_kline_audit_run(
+        self,
+        *,
+        run_id: str,
+        market: str,
+        trade_date: date,
+        run_type: str,
+        trigger_type: str,
+        run_result: str,
+        pass_status: str,
+        rule_version: str,
+        window_start: date,
+        window_end: date,
+    ) -> KlineAuditRun:
+        with self.session_scope() as session:
+            return self._create_kline_audit_run_in_session(
+                session,
+                run_id=run_id,
+                market=market,
+                trade_date=trade_date,
+                run_type=run_type,
+                trigger_type=trigger_type,
+                run_result=run_result,
+                pass_status=pass_status,
+                rule_version=rule_version,
+                window_start=window_start,
+                window_end=window_end,
+            )
+
+    def list_kline_audit_runs(
+        self,
+        *,
+        market: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[KlineAuditRun]:
+        with self.session_scope() as session:
+            stmt = select(KlineAuditRun).order_by(desc(KlineAuditRun.created_at)).limit(limit)
+            if market:
+                stmt = stmt.where(KlineAuditRun.market == market)
+            runs = list(session.execute(stmt).scalars().all())
+            for run in runs:
+                session.expunge(run)
+            return runs
+
+    def _upsert_kline_audit_trade_date_in_session(
+        self,
+        session: Session,
+        *,
+        market: str,
+        trade_date: date,
+        pass_status: str,
+        window_start: date,
+        window_end: date,
+        rule_version: str,
+        source_run_id: str,
+        passed_at: Optional[datetime],
+    ) -> KlineAuditTradeDate:
+        record = session.execute(
+            select(KlineAuditTradeDate).where(
+                and_(
+                    KlineAuditTradeDate.market == market,
+                    KlineAuditTradeDate.trade_date == trade_date,
+                )
+            )
+        ).scalar_one_or_none()
+        if record is None:
+            record = KlineAuditTradeDate(
+                market=market,
+                trade_date=trade_date,
+            )
+            session.add(record)
+
+        record.pass_status = pass_status
+        record.window_start = window_start
+        record.window_end = window_end
+        record.rule_version = rule_version
+        record.source_run_id = source_run_id
+        record.checked_at = datetime.now()
+        record.passed_at = passed_at
+        session.flush()
+        session.refresh(record)
+        session.expunge(record)
+        return record
+
+    def upsert_kline_audit_trade_date(
+        self,
+        *,
+        market: str,
+        trade_date: date,
+        pass_status: str,
+        window_start: date,
+        window_end: date,
+        rule_version: str,
+        source_run_id: str,
+        passed_at: Optional[datetime],
+    ) -> KlineAuditTradeDate:
+        with self.session_scope() as session:
+            return self._upsert_kline_audit_trade_date_in_session(
+                session,
+                market=market,
+                trade_date=trade_date,
+                pass_status=pass_status,
+                window_start=window_start,
+                window_end=window_end,
+                rule_version=rule_version,
+                source_run_id=source_run_id,
+                passed_at=passed_at,
+            )
+
+    def get_kline_audit_trade_date(
+        self,
+        *,
+        market: str,
+        trade_date: date,
+    ) -> Optional[KlineAuditTradeDate]:
+        with self.session_scope() as session:
+            record = session.execute(
+                select(KlineAuditTradeDate).where(
+                    and_(
+                        KlineAuditTradeDate.market == market,
+                        KlineAuditTradeDate.trade_date == trade_date,
+                    )
+                )
+            ).scalar_one_or_none()
+            if record is None:
+                return None
+            session.expunge(record)
+            return record
+
+    def get_latest_passed_kline_audit_trade_date(
+        self,
+        *,
+        market: str,
+    ) -> Optional[KlineAuditTradeDate]:
+        with self.session_scope() as session:
+            record = session.execute(
+                select(KlineAuditTradeDate)
+                .where(
+                    and_(
+                        KlineAuditTradeDate.market == market,
+                        KlineAuditTradeDate.pass_status == "passed",
+                    )
+                )
+                .order_by(desc(KlineAuditTradeDate.trade_date))
+                .limit(1)
+            ).scalar_one_or_none()
+            if record is None:
+                return None
+            session.expunge(record)
+            return record
+
+    def _upsert_kline_audit_gap_in_session(
+        self,
+        session: Session,
+        *,
+        market: str,
+        gap_scope: str,
+        source_run_id: str,
+        status: str,
+        trade_date: Optional[date] = None,
+        code: Optional[str] = None,
+        missing_date_from: Optional[date] = None,
+        missing_date_to: Optional[date] = None,
+    ) -> KlineAuditGap:
+        gap_key = KlineAuditGap.build_gap_key(
+            market=market,
+            gap_scope=gap_scope,
+            trade_date=trade_date,
+            code=code,
+            missing_date_from=missing_date_from,
+            missing_date_to=missing_date_to,
+        )
+        record = session.execute(
+            select(KlineAuditGap).where(KlineAuditGap.gap_key == gap_key)
+        ).scalar_one_or_none()
+        if record is None:
+            record = KlineAuditGap(gap_key=gap_key)
+            session.add(record)
+
+        record.source_run_id = source_run_id
+        record.market = market
+        record.gap_scope = gap_scope
+        record.code = code
+        record.trade_date = trade_date
+        record.missing_date_from = missing_date_from
+        record.missing_date_to = missing_date_to
+        record.status = status
+        session.flush()
+        session.refresh(record)
+        session.expunge(record)
+        return record
+
+    def upsert_kline_audit_gap(
+        self,
+        *,
+        market: str,
+        gap_scope: str,
+        source_run_id: str,
+        status: str,
+        trade_date: Optional[date] = None,
+        code: Optional[str] = None,
+        missing_date_from: Optional[date] = None,
+        missing_date_to: Optional[date] = None,
+    ) -> KlineAuditGap:
+        with self.session_scope() as session:
+            return self._upsert_kline_audit_gap_in_session(
+                session,
+                market=market,
+                gap_scope=gap_scope,
+                source_run_id=source_run_id,
+                status=status,
+                trade_date=trade_date,
+                code=code,
+                missing_date_from=missing_date_from,
+                missing_date_to=missing_date_to,
+            )
+
+    def list_kline_audit_gaps(
+        self,
+        *,
+        market: Optional[str] = None,
+        gap_scope: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[KlineAuditGap]:
+        with self.session_scope() as session:
+            stmt = select(KlineAuditGap).order_by(KlineAuditGap.created_at.asc())
+            if market:
+                stmt = stmt.where(KlineAuditGap.market == market)
+            if gap_scope:
+                stmt = stmt.where(KlineAuditGap.gap_scope == gap_scope)
+            if status:
+                stmt = stmt.where(KlineAuditGap.status == status)
+            rows = list(session.execute(stmt).scalars().all())
+            for row in rows:
+                session.expunge(row)
+            return rows
+
+    @staticmethod
+    def _validate_kline_skip_scope(
+        *,
+        gap_scope: str,
+        trade_date: Optional[date],
+        code: Optional[str],
+        missing_date_from: Optional[date],
+        missing_date_to: Optional[date],
+    ) -> None:
+        if gap_scope == "market_day_gap":
+            if trade_date is None:
+                raise ValueError("market_day_gap requires trade_date")
+            return
+        if gap_scope == "symbol_range_gap":
+            if not code or missing_date_from is None or missing_date_to is None:
+                raise ValueError("symbol_range_gap requires code, missing_date_from, and missing_date_to")
+            return
+        raise ValueError(f"Unsupported gap_scope: {gap_scope}")
+
+    def _append_kline_audit_event_in_session(
+        self,
+        session: Session,
+        *,
+        event_type: str,
+        source_run_id: Optional[str] = None,
+        gap_key: Optional[str] = None,
+        event_status: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> KlineAuditEvent:
+        event_row = KlineAuditEvent(
+            source_run_id=source_run_id,
+            gap_key=gap_key,
+            event_type=event_type,
+            event_status=event_status,
+            payload_json=json.dumps(payload, ensure_ascii=False) if payload is not None else None,
+        )
+        session.add(event_row)
+        session.flush()
+        session.refresh(event_row)
+        session.expunge(event_row)
+        return event_row
+
+    def append_kline_audit_event(
+        self,
+        *,
+        event_type: str,
+        source_run_id: Optional[str] = None,
+        gap_key: Optional[str] = None,
+        event_status: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> KlineAuditEvent:
+        with self.session_scope() as session:
+            return self._append_kline_audit_event_in_session(
+                session,
+                event_type=event_type,
+                source_run_id=source_run_id,
+                gap_key=gap_key,
+                event_status=event_status,
+                payload=payload,
+            )
+
+    def list_kline_audit_events(
+        self,
+        *,
+        gap_key: Optional[str] = None,
+        event_type: Optional[str] = None,
+    ) -> List[KlineAuditEvent]:
+        with self.session_scope() as session:
+            stmt = select(KlineAuditEvent).order_by(KlineAuditEvent.created_at.asc(), KlineAuditEvent.id.asc())
+            if gap_key:
+                stmt = stmt.where(KlineAuditEvent.gap_key == gap_key)
+            if event_type:
+                stmt = stmt.where(KlineAuditEvent.event_type == event_type)
+            rows = list(session.execute(stmt).scalars().all())
+            for row in rows:
+                session.expunge(row)
+            return rows
+
+    def persist_kline_audit_result(
+        self,
+        *,
+        run_payload: Dict[str, Any],
+        trade_date_payload: Dict[str, Any],
+        gap_payloads: List[Dict[str, Any]],
+        event_payloads: List[Dict[str, Any]],
+    ) -> None:
+        with self.session_scope() as session:
+            self._create_kline_audit_run_in_session(session, **run_payload)
+            self._upsert_kline_audit_trade_date_in_session(session, **trade_date_payload)
+            for gap_payload in gap_payloads:
+                self._upsert_kline_audit_gap_in_session(session, **gap_payload)
+            for event_payload in event_payloads:
+                self._append_kline_audit_event_in_session(session, **event_payload)
+
+    def upsert_kline_skip_registry(
+        self,
+        *,
+        market: str,
+        gap_scope: str,
+        status: str,
+        code: Optional[str] = None,
+        trade_date: Optional[date] = None,
+        missing_date_from: Optional[date] = None,
+        missing_date_to: Optional[date] = None,
+        reason_type: Optional[str] = None,
+        notes: Optional[str] = None,
+        approved_by: Optional[str] = None,
+        approved_at: Optional[datetime] = None,
+        success_streak: Optional[int] = None,
+        last_success_at: Optional[datetime] = None,
+        last_recovered_at: Optional[datetime] = None,
+    ) -> KlineSkipRegistry:
+        self._validate_kline_skip_scope(
+            gap_scope=gap_scope,
+            trade_date=trade_date,
+            code=code,
+            missing_date_from=missing_date_from,
+            missing_date_to=missing_date_to,
+        )
+        skip_key = KlineSkipRegistry.build_skip_key(
+            market=market,
+            gap_scope=gap_scope,
+            trade_date=trade_date,
+            code=code,
+            missing_date_from=missing_date_from,
+            missing_date_to=missing_date_to,
+        )
+        with self.session_scope() as session:
+            record = session.execute(
+                select(KlineSkipRegistry).where(KlineSkipRegistry.skip_key == skip_key)
+            ).scalar_one_or_none()
+            if record is None:
+                record = KlineSkipRegistry(skip_key=skip_key)
+                session.add(record)
+
+            record.skip_key = skip_key
+            record.market = market
+            record.gap_scope = gap_scope
+            record.code = code
+            record.trade_date = trade_date
+            record.missing_date_from = missing_date_from
+            record.missing_date_to = missing_date_to
+            record.status = status
+            if reason_type is not None:
+                record.reason_type = reason_type
+            if notes is not None:
+                record.notes = notes
+            if approved_by is not None:
+                record.approved_by = approved_by
+            if approved_at is not None:
+                record.approved_at = approved_at
+            record.success_streak = success_streak if success_streak is not None else (record.success_streak or 0)
+            if last_success_at is not None:
+                record.last_success_at = last_success_at
+            if last_recovered_at is not None:
+                record.last_recovered_at = last_recovered_at
+            try:
+                session.flush()
+            except IntegrityError:
+                session.rollback()
+                record = session.execute(
+                    select(KlineSkipRegistry).where(KlineSkipRegistry.skip_key == skip_key)
+                ).scalar_one()
+                record.market = market
+                record.gap_scope = gap_scope
+                record.code = code
+                record.trade_date = trade_date
+                record.missing_date_from = missing_date_from
+                record.missing_date_to = missing_date_to
+                record.status = status
+                if reason_type is not None:
+                    record.reason_type = reason_type
+                if notes is not None:
+                    record.notes = notes
+                if approved_by is not None:
+                    record.approved_by = approved_by
+                if approved_at is not None:
+                    record.approved_at = approved_at
+                record.success_streak = (
+                    success_streak if success_streak is not None else (record.success_streak or 0)
+                )
+                if last_success_at is not None:
+                    record.last_success_at = last_success_at
+                if last_recovered_at is not None:
+                    record.last_recovered_at = last_recovered_at
+                session.flush()
+            session.refresh(record)
+            session.expunge(record)
+            return record
+
+    def get_kline_skip_registry(
+        self,
+        *,
+        market: str,
+        gap_scope: str,
+        code: Optional[str] = None,
+        trade_date: Optional[date] = None,
+        missing_date_from: Optional[date] = None,
+        missing_date_to: Optional[date] = None,
+    ) -> Optional[KlineSkipRegistry]:
+        self._validate_kline_skip_scope(
+            gap_scope=gap_scope,
+            trade_date=trade_date,
+            code=code,
+            missing_date_from=missing_date_from,
+            missing_date_to=missing_date_to,
+        )
+        skip_key = KlineSkipRegistry.build_skip_key(
+            market=market,
+            gap_scope=gap_scope,
+            trade_date=trade_date,
+            code=code,
+            missing_date_from=missing_date_from,
+            missing_date_to=missing_date_to,
+        )
+        with self.session_scope() as session:
+            record = session.execute(
+                select(KlineSkipRegistry).where(KlineSkipRegistry.skip_key == skip_key)
+            ).scalar_one_or_none()
+            if record is None:
+                return None
+            session.expunge(record)
+            return record
+
+    def list_kline_skip_registry(
+        self,
+        *,
+        market: Optional[str] = None,
+        gap_scope: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[KlineSkipRegistry]:
+        with self.session_scope() as session:
+            stmt = select(KlineSkipRegistry).order_by(KlineSkipRegistry.created_at.asc())
+            if market:
+                stmt = stmt.where(KlineSkipRegistry.market == market)
+            if gap_scope:
+                stmt = stmt.where(KlineSkipRegistry.gap_scope == gap_scope)
+            if status:
+                stmt = stmt.where(KlineSkipRegistry.status == status)
+            rows = list(session.execute(stmt).scalars().all())
+            for row in rows:
+                session.expunge(row)
+            return rows
     
     def has_today_data(self, code: str, target_date: Optional[date] = None) -> bool:
         """

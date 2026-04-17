@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import date
@@ -22,6 +23,9 @@ _BULK_FETCH_TIMEOUT: int = 60
 _HEARTBEAT_INTERVAL: int = 10
 # 逐只同步数量上限，超出部分直接标记为无数据跳过
 _MAX_INDIVIDUAL_SYNC: int = 200
+_SOURCE_ATTEMPT_PATTERN = re.compile(
+    r"^\[(?P<source>[^\]]+)\]\s*(?:\((?P<error_type>[^)]+)\))?\s*(?P<detail>.*)$"
+)
 
 
 class MarketDataSyncService:
@@ -50,11 +54,12 @@ class MarketDataSyncService:
         同步指定交易日的日线数据。
 
         四层防御策略：
-        1. 数据库已有 ≥ min_available_ratio → 跳过整个同步
-        2. bulk sync 后达标 → 跳过逐只同步
+        1. 数据库已有目标交易日数据 → 跳过该股票（非按覆盖率短路）
+        2. 先尝试 bulk sync，仍缺失的股票继续进入后续流程
         3. 逐只同步有上限 _MAX_INDIVIDUAL_SYNC
         4. 每次 API 调用有 _PER_STOCK_FETCH_TIMEOUT 超时
         """
+        _ = min_available_ratio  # 保留现有方法签名兼容性，不再参与健康判定或短路逻辑。
         if stock_codes:
             codes = [str(code).strip().upper() for code in stock_codes if str(code).strip()]
         else:
@@ -66,7 +71,7 @@ class MarketDataSyncService:
 
         synced = 0
         skipped = 0
-        errors: List[Dict[str, str]] = []
+        errors: List[Dict[str, object]] = []
 
         # 批量查询已有数据的股票
         if not force:
@@ -76,18 +81,6 @@ class MarketDataSyncService:
         codes_needing_sync = [c for c in codes if c not in existing_codes]
         skipped = len(codes) - len(codes_needing_sync)
 
-        # ── 第一层防御：数据可用率已达标 → 跳过整个同步 ──
-        if not force and codes_needing_sync:
-            available_ratio = len(existing_codes) / len(codes)
-            if available_ratio >= min_available_ratio:
-                logger.info(
-                    f"[SyncTradeDate] 已有数据率 {available_ratio:.1%} >= {min_available_ratio:.0%}，"
-                    f"跳过同步（缺失 {len(codes_needing_sync)} 只）"
-                )
-                # 缺失股票记为 empty_data，供上层统计
-                errors.extend({"code": c, "reason": "empty_data"} for c in codes_needing_sync)
-                return self._build_sync_result(trade_date, codes, synced, skipped, errors)
-
         # ── bulk sync 阶段 ──
         if codes_needing_sync:
             bulk_synced = self._try_bulk_sync(trade_date, set(codes_needing_sync))
@@ -96,18 +89,6 @@ class MarketDataSyncService:
                 # 批量复查哪些已被 bulk sync 覆盖
                 still_existing = self.db.batch_has_today_data(codes_needing_sync, target_date=trade_date)
                 codes_needing_sync = [c for c in codes_needing_sync if c not in still_existing]
-
-            # ── 第二层防御：bulk sync 后达标 → 跳过逐只同步 ──
-            if not force and codes_needing_sync:
-                total_available = len(existing_codes) + (bulk_synced or 0)
-                post_bulk_ratio = total_available / len(codes) if codes else 0.0
-                if post_bulk_ratio >= min_available_ratio:
-                    logger.info(
-                        f"[SyncTradeDate] bulk sync 后数据率 {post_bulk_ratio:.1%} >= {min_available_ratio:.0%}，"
-                        f"跳过逐只同步（剩余 {len(codes_needing_sync)} 只）"
-                    )
-                    errors.extend({"code": c, "reason": "empty_data"} for c in codes_needing_sync)
-                    codes_needing_sync = []
 
         # ── 第三层防御：缺失数量超过100只时，改用批量同步 ──
         if len(codes_needing_sync) > 100:
@@ -124,9 +105,19 @@ class MarketDataSyncService:
             # 批量同步后仍有缺失，标记为无数据
             if codes_needing_sync:
                 logger.warning(
-                    f"[SyncTradeDate] 批量同步后仍缺失 {len(codes_needing_sync)} 只，标记为无数据"
+                    f"[SyncTradeDate] 批量同步后仍缺失 {len(codes_needing_sync)} 只，标记为可重试未完成"
                 )
-                errors.extend({"code": c, "reason": "empty_data"} for c in codes_needing_sync)
+                errors.extend(
+                    self._build_service_failure_record(
+                        code=c,
+                        trade_date=trade_date,
+                        reason="bulk_sync_incomplete",
+                        detail="bulk sync completed but target trade date is still missing",
+                        reason_class="retryable",
+                        source="bulk_sync_guardrail",
+                    )
+                    for c in codes_needing_sync
+                )
                 codes_needing_sync = []
 
         # ── 第四层防御：逐只同步数量上限 ──
@@ -136,7 +127,17 @@ class MarketDataSyncService:
                 f"[SyncTradeDate] 需逐只同步 {len(codes_needing_sync)} 只，"
                 f"超出上限 {_MAX_INDIVIDUAL_SYNC}，截断 {len(overflow)} 只"
             )
-            errors.extend({"code": c, "reason": "empty_data"} for c in overflow)
+            errors.extend(
+                self._build_service_failure_record(
+                    code=c,
+                    trade_date=trade_date,
+                    reason="individual_sync_overflow",
+                    detail=f"individual sync limit reached: {_MAX_INDIVIDUAL_SYNC}",
+                    reason_class="retryable",
+                    source="individual_sync_guardrail",
+                )
+                for c in overflow
+            )
             codes_needing_sync = codes_needing_sync[:_MAX_INDIVIDUAL_SYNC]
 
         # ── 第四层防御：逐只同步，每只有超时保护 ──
@@ -147,19 +148,53 @@ class MarketDataSyncService:
                     try:
                         result = self._fetch_single_with_timeout(code, trade_date, executor=executor)
                         if result is None:
-                            errors.append({"code": code, "reason": "empty_data"})
+                            errors.append(
+                                self._build_service_failure_record(
+                                    code=code,
+                                    trade_date=trade_date,
+                                    reason="empty_data",
+                                    detail="fetch returned empty data for target trade date",
+                                    reason_class="skip_eligible",
+                                    source="unknown_fetcher",
+                                )
+                            )
                             continue
                         df, source_name = result
                         saved = self.db.save_daily_data(df, code, data_source=source_name)
                         if saved > 0 or self.db.has_today_data(code, target_date=trade_date):
                             synced += 1
                         else:
-                            errors.append({"code": code, "reason": "save_failed"})
+                            errors.append(
+                                self._build_service_failure_record(
+                                    code=code,
+                                    trade_date=trade_date,
+                                    reason="save_failed",
+                                    detail="save_daily_data returned 0 and target trade date is still missing",
+                                    reason_class="blocking",
+                                    source="database",
+                                )
+                            )
                     except Exception as exc:
                         if isinstance(exc, DataFetchError):
-                            errors.append(self._build_fetch_error_record(code=code, detail=str(exc)))
+                            errors.append(
+                                self._build_fetch_error_record(
+                                    code=code,
+                                    trade_date=trade_date,
+                                    detail=str(exc),
+                                )
+                            )
                         else:
-                            errors.append({"code": code, "reason": str(exc)})
+                            detail = str(exc) or exc.__class__.__name__
+                            errors.append(
+                                self._build_service_failure_record(
+                                    code=code,
+                                    trade_date=trade_date,
+                                    reason="unexpected_error",
+                                    detail=detail,
+                                    reason_class="blocking",
+                                    source="market_data_sync_service",
+                                )
+                            )
 
                     # 心跳回调
                     if progress_callback and (idx + 1) % _HEARTBEAT_INTERVAL == 0:
@@ -385,7 +420,7 @@ class MarketDataSyncService:
         codes: List[str],
         synced: int,
         skipped: int,
-        errors: List[Dict[str, str]],
+        errors: List[Dict[str, object]],
     ) -> Dict[str, object]:
         """统一构建同步返回结果，确保所有路径结构一致。"""
         # 批量查询最终已有数据的股票
@@ -394,13 +429,26 @@ class MarketDataSyncService:
         available_count = len(codes) - len(missing_codes)
         success_rate = round((available_count / len(codes)), 4) if codes else 0.0
         refresh_success_rate = round((synced / len(codes)), 4) if codes else 0.0
+        reason_class_counts = {
+            "blocking": 0,
+            "retryable": 0,
+            "skip_eligible": 0,
+        }
+        for error in errors:
+            reason_class = str(error.get("reason_class", "blocking"))
+            if reason_class not in reason_class_counts:
+                reason_class_counts[reason_class] = 0
+            reason_class_counts[reason_class] += 1
+        is_healthy = available_count == len(codes) and len(errors) == 0
         return {
             "trade_date": trade_date.isoformat(),
+            "target_trade_date": trade_date.isoformat(),
             "total": len(codes),
             "synced": synced,
             "skipped": skipped,
             "errors": errors,
             "health_report": {
+                "target_trade_date": trade_date.isoformat(),
                 "expected_count": len(codes),
                 "available_count": available_count,
                 "missing_count": len(missing_codes),
@@ -409,31 +457,145 @@ class MarketDataSyncService:
                 "success_rate": success_rate,
                 "refresh_success_count": synced,
                 "refresh_success_rate": refresh_success_rate,
+                "reason_class_counts": reason_class_counts,
+                "is_healthy": is_healthy,
+                "status": "healthy" if is_healthy else "degraded",
                 "summary": (
-                    f"{trade_date.isoformat()} sync health: available={available_count}/{len(codes)}, "
-                    f"refreshed={synced}/{len(codes)}, missing={len(missing_codes)}, errors={len(errors)}"
+                    f"{trade_date.isoformat()} sync health: status={'healthy' if is_healthy else 'degraded'}, "
+                    f"available={available_count}/{len(codes)}, refreshed={synced}/{len(codes)}, "
+                    f"missing={len(missing_codes)}, errors={len(errors)}"
                 ),
             },
         }
 
     @classmethod
-    def _build_fetch_error_record(cls, code: str, detail: str) -> Dict[str, str]:
+    def _build_fetch_error_record(
+        cls,
+        code: str,
+        trade_date: date,
+        detail: str,
+    ) -> Dict[str, object]:
+        source_attempts = cls._parse_source_attempts(detail)
+        reason_class = cls._summarize_reason_class(source_attempts)
         return {
             "code": code,
-            "reason": "empty_data" if cls._looks_like_data_unavailable(detail) else "fetch_failed",
+            "target_trade_date": trade_date.isoformat(),
+            "reason": "empty_data" if reason_class == "skip_eligible" else "fetch_failed",
+            "reason_class": reason_class,
             "detail": detail,
+            "source_attempts": source_attempts,
+            "candidate_skip": cls._build_candidate_skip_info(source_attempts),
         }
 
     @staticmethod
-    def _looks_like_data_unavailable(detail: str) -> bool:
+    def _classify_reason_class(detail: str) -> str:
         normalized = str(detail or "").strip().lower()
         if not normalized:
-            return False
-        blocking_markers = [
-            "timeout", "timed out", "connect failed", "connection",
+            return "blocking"
+        retryable_markers = [
+            "timeout", "timed out", "超时", "connect failed", "connection",
             "ssl", "proxy", "network", "503", "502", "429",
+            "temporarily unavailable", "rate limit", "reset by peer",
         ]
-        if any(marker in normalized for marker in blocking_markers):
-            return False
-        empty_markers = ["未获取到", "未找到", "no data", "not found", "empty", "查无"]
-        return any(marker in normalized for marker in empty_markers)
+        if any(marker in normalized for marker in retryable_markers):
+            return "retryable"
+        skip_markers = [
+            "未获取到", "未找到", "no data", "not found", "empty", "查无",
+            "停牌", "suspend", "suspended", "delist", "退市", "未上市",
+        ]
+        if any(marker in normalized for marker in skip_markers):
+            return "skip_eligible"
+        return "blocking"
+
+    @classmethod
+    def _build_service_failure_record(
+        cls,
+        code: str,
+        trade_date: date,
+        reason: str,
+        detail: str,
+        reason_class: str,
+        source: str,
+    ) -> Dict[str, object]:
+        source_attempts = [
+            {
+                "source": source,
+                "detail": detail,
+                "reason_class": reason_class,
+                "candidate_skip_signal": reason_class == "skip_eligible",
+            }
+        ]
+        return {
+            "code": code,
+            "target_trade_date": trade_date.isoformat(),
+            "reason": reason,
+            "reason_class": reason_class,
+            "detail": detail,
+            "source_attempts": source_attempts,
+            "candidate_skip": cls._build_candidate_skip_info(source_attempts),
+        }
+
+    @classmethod
+    def _parse_source_attempts(cls, detail: str) -> List[Dict[str, object]]:
+        attempts: List[Dict[str, object]] = []
+        for raw_line in str(detail or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            match = _SOURCE_ATTEMPT_PATTERN.match(line)
+            if not match:
+                continue
+            error_type = (match.group("error_type") or "").strip()
+            attempt_detail = (match.group("detail") or "").strip()
+            reason_class = cls._classify_reason_class(f"{error_type} {attempt_detail}".strip())
+            attempts.append(
+                {
+                    "source": match.group("source").strip(),
+                    "error_type": error_type,
+                    "detail": attempt_detail or error_type or line,
+                    "reason_class": reason_class,
+                    "candidate_skip_signal": reason_class == "skip_eligible",
+                }
+            )
+        if attempts:
+            return attempts
+        fallback_reason_class = cls._classify_reason_class(detail)
+        return [
+            {
+                "source": "market_data_sync_service",
+                "detail": detail,
+                "reason_class": fallback_reason_class,
+                "candidate_skip_signal": fallback_reason_class == "skip_eligible",
+            }
+        ]
+
+    @staticmethod
+    def _summarize_reason_class(source_attempts: List[Dict[str, object]]) -> str:
+        attempt_classes = {str(item.get("reason_class", "blocking")) for item in source_attempts}
+        if attempt_classes == {"skip_eligible"}:
+            return "skip_eligible"
+        if attempt_classes == {"retryable"}:
+            return "retryable"
+        return "blocking"
+
+    @staticmethod
+    def _build_candidate_skip_info(source_attempts: List[Dict[str, object]]) -> Dict[str, object]:
+        total_attempts = len(source_attempts)
+        skip_eligible_attempts = sum(
+            1 for item in source_attempts if item.get("reason_class") == "skip_eligible"
+        )
+        retryable_attempts = sum(
+            1 for item in source_attempts if item.get("reason_class") == "retryable"
+        )
+        blocking_attempts = sum(
+            1 for item in source_attempts if item.get("reason_class") == "blocking"
+        )
+        eligible = total_attempts > 0 and skip_eligible_attempts == total_attempts
+        return {
+            "eligible": eligible,
+            "signal": "all_attempts_skip_eligible" if eligible else "needs_manual_review",
+            "total_attempts": total_attempts,
+            "skip_eligible_attempts": skip_eligible_attempts,
+            "retryable_attempts": retryable_attempts,
+            "blocking_attempts": blocking_attempts,
+        }

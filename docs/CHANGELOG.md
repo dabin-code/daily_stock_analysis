@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `ExtremeStrengthScorer.calculate_layered_scores` 新增 `leader_double_count` / `deduplicated_total_score` 两个只读字段，用来显式估算 `leader_score` 与其它桶（`small_circ_mv / turnover / breakout_strength / trend_strength` 的 `above_ma100` 下界）之间可观测的重复加权。`total_score` / `calculate_extreme_strength_score` 数值语义保持不变，所有 `>=50 / >=60 / >=80` 阈值契约均不受影响；snapshot 同步新增 `leader_double_count` 与 `extreme_strength_score_deduplicated` 字段，默认值为 0
 - Web 候选详情面板新增分层评分、`stage_label` 徽章、`primary_signal + signal_kind` 徽章及 `timing_penalty` 红色提示区；阶段 3 描述优先取 `primary_signal`，回退到 `core_signal`；阶段 5 止损描述会在价格后追加 `（<basis>）` 提示依据来源；L2 题材地位 + 候选详情抽屉均新增 `· 去重净分` 行，以琥珀色展示 `extreme_strength_score_deduplicated` 及扣除的 `leader_double_count`
 
+### K-line completeness governance
+
+- Added K-line governance truth-source tables, audit service, repair service, and skip-registry workflow so daily data completeness is tracked explicitly instead of inferred from loose sync heuristics
+- Screening ingest now consumes audit-derived truth: blocking/retryable sync failures are no longer silently downgraded, and non-`passed` trade dates fail closed before factor building
+- Added scheduled K-line governance wiring with opt-in `17:00` post-close execution, independent deep-audit registration, and explicit failure bubbling through the scheduler
+- Added manual governance scripts for auditing/repairing completeness and approving `candidate_skip -> approved_skip` transitions
+- Documented `pass_status` semantics, the daily `sync -> audit -> repair -> re-audit` flow, and the manual recovery/approval commands in `README.md` / `.env.example`
+
 ### Backtest experience
 
 - Reworked the five-layer backtest page into four layers: system scorecard, strategy comparison, judgment validation, and per-stock drill-down

@@ -71,6 +71,39 @@ Optional scheduled prewarm after the A-share close:
 
 The scheduled prewarm is now best treated as an optional fallback. The primary low-cost path is incremental board sync when `instrument_master` gains new stocks.
 
+## K线完整性治理
+
+项目现在支持独立的 K 线完整性治理链路，用于在日线同步后自动校验缺口并执行补偿：
+
+- 日常治理任务默认建议在 A 股收盘后 `17:00` 执行，顺序固定为 `sync -> audit -> repair -> re-audit`
+- 下游只应消费 `pass_status=passed` 的交易日；`not_passed` 表示该交易日仍存在非豁免缺口，筛选链路会 fail-close
+- 无法稳定拉取的股票缺口会先进入 `candidate_skip`，只有经过人工确认后才会升级为 `approved_skip`
+- 深度审计任务是独立 job，用于长窗口复核历史缺口与 `candidate_skip` 恢复情况，不会替代日常治理
+
+推荐环境变量：
+
+- `KLINE_GOVERNANCE_ENABLED=true`
+- `KLINE_GOVERNANCE_SCHEDULE_TIME=17:00`
+- `KLINE_GOVERNANCE_RUN_IMMEDIATELY=false`
+- `KLINE_DEEP_AUDIT_SCHEDULE_ENABLED=false`
+- `KLINE_DEEP_AUDIT_SCHEDULE_TIME=17:00`
+
+手工治理命令：
+
+```bash
+python scripts/audit_kline_completeness.py --trade-date 2026-04-17
+python scripts/audit_kline_completeness.py --trade-date 2026-04-17 --repair
+python scripts/audit_kline_completeness.py --trade-date 2026-04-17 --dry-run
+python scripts/approve_kline_skip.py --market cn --trade-date 2026-04-17 --approved-by ops-user --reason-type manual_review
+python scripts/approve_kline_skip.py --market cn --code 000001 --from-date 2026-04-10 --to-date 2026-04-17 --approved-by ops-user --reason-type manual_review
+```
+
+其中：
+
+- `audit_kline_completeness.py` 用于手工触发单次审计或完整补偿
+- `approve_kline_skip.py` 用于把人工确认无法拉取的 `candidate_skip` 升级为 `approved_skip`
+- 一旦 `approved_skip` 对应缺口在后续治理中连续恢复成功，系统会自动把它回收为健康状态
+
 > 🤖 基于 AI 大模型的 A股/港股/美股自选股智能分析系统，每日自动分析并推送「决策仪表盘」到企业微信/飞书/Telegram/Discord/邮箱
 
 [**功能特性**](#-功能特性) · [**快速开始**](#-快速开始) · [**推送效果**](#-推送效果) · [**完整指南**](docs/full-guide.md) · [**常见问题**](docs/FAQ.md) · [**更新日志**](docs/CHANGELOG.md) · [**选股模块差距分析**](docs/dsa-screening-module-gap-analysis-2026-04-10.md) · [**选股五层 Debug 手册**](docs/screening-five-layer-debug-guide.md)

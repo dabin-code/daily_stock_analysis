@@ -570,6 +570,15 @@ class Config:
     screening_ingest_failure_threshold: float = 0.20
     screening_market_guard_enabled: bool = True
     screening_market_guard_index: str = "sh000001"
+    kline_governance_enabled: bool = False
+    kline_governance_schedule_time: str = "17:00"
+    kline_governance_run_immediately: bool = False
+    kline_audit_lookback_days: int = 30
+    kline_deep_audit_lookback_days: int = 365
+    kline_deep_audit_schedule_enabled: bool = False
+    kline_deep_audit_schedule_time: str = "17:00"
+    kline_retry_max_attempts: int = 3
+    kline_skip_candidate_failure_threshold: int = 3
     # Discord 机器人状态
     discord_bot_status: str = "A股智能分析 | /help"
 
@@ -1146,6 +1155,24 @@ class Config:
             screening_ingest_failure_threshold=float(os.getenv('SCREENING_INGEST_FAILURE_THRESHOLD', '0.20')),
             screening_market_guard_enabled=parse_env_bool(os.getenv('SCREENING_MARKET_GUARD_ENABLED'), default=True),
             screening_market_guard_index=os.getenv('SCREENING_MARKET_GUARD_INDEX', 'sh000001'),
+            kline_governance_enabled=parse_env_bool(os.getenv('KLINE_GOVERNANCE_ENABLED'), default=False),
+            kline_governance_schedule_time=os.getenv('KLINE_GOVERNANCE_SCHEDULE_TIME', '17:00'),
+            kline_governance_run_immediately=parse_env_bool(
+                os.getenv('KLINE_GOVERNANCE_RUN_IMMEDIATELY'),
+                default=False,
+            ),
+            kline_audit_lookback_days=max(1, int(os.getenv('KLINE_AUDIT_LOOKBACK_DAYS', '30'))),
+            kline_deep_audit_lookback_days=max(1, int(os.getenv('KLINE_DEEP_AUDIT_LOOKBACK_DAYS', '365'))),
+            kline_deep_audit_schedule_enabled=parse_env_bool(
+                os.getenv('KLINE_DEEP_AUDIT_SCHEDULE_ENABLED'),
+                default=False,
+            ),
+            kline_deep_audit_schedule_time=os.getenv('KLINE_DEEP_AUDIT_SCHEDULE_TIME', '17:00'),
+            kline_retry_max_attempts=max(1, int(os.getenv('KLINE_RETRY_MAX_ATTEMPTS', '3'))),
+            kline_skip_candidate_failure_threshold=max(
+                1,
+                int(os.getenv('KLINE_SKIP_CANDIDATE_FAILURE_THRESHOLD', '3')),
+            ),
         )
     
     @classmethod

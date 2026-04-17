@@ -63,6 +63,17 @@ class SchedulerTestCase(unittest.TestCase):
         self.assertEqual(len(fake_schedule.registered), 1)
         self.assertEqual(fake_schedule.registered[0]["time"], "18:00")
 
+    def test_safe_run_named_task_reraises_callback_error(self) -> None:
+        fake_schedule = _FakeSchedule()
+
+        with patch("src.scheduler.schedule", fake_schedule, create=True):
+            scheduler = Scheduler(schedule_time="18:00")
+            scheduler.schedule = fake_schedule
+            scheduler.add_daily_task("failing_task", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                scheduler._safe_run_named_task("failing_task")
+
 
 if __name__ == "__main__":
     unittest.main()
