@@ -11,6 +11,10 @@ class SetupFreshnessAssessor:
         "ma100_60min_freshness_score",
         "breakout_freshness_score",
         "entry_freshness_score",
+        # New real-crossing field — interpreted as "bars since breakout",
+        # placed before the legacy consecutive-days counter so fresh real
+        # crossings take precedence when both fields are present.
+        "ma100_bars_since_breakout",
         "ma100_breakout_days",
         "breakout_days",
         "days_since_breakout",
@@ -31,6 +35,16 @@ class SetupFreshnessAssessor:
                 continue
             if "freshness" in key:
                 return max(0.0, min(value, 1.0))
+            # ma100_bars_since_breakout uses -1 sentinel for "no real
+            # crossing detected" — skip and fall through to other keys
+            # instead of mis-scoring.
+            if key == "ma100_bars_since_breakout":
+                if value < 0:
+                    continue
+                # bars_since_breakout=0 means crossed on the latest bar
+                # (freshest).  _score_from_breakout_days expects "days"
+                # where 1 is the freshest → shift by +1 for alignment.
+                return self._score_from_breakout_days(value + 1)
             return self._score_from_breakout_days(value)
 
         if setup_type == SetupType.GAP_BREAKOUT and factor_snapshot.get("gap_breakaway"):

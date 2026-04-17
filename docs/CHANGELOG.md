@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - 首筛公共过滤已移除 `avg_amount < min_avg_amount` 的硬拒绝逻辑，当前会先放行可用股票进入策略匹配，再交给后续五层链路继续收敛
 - L2 本地热点板块已改为排名驱动识别：`hot/warm` 不再由固定阈值切分，而是基于 `board_strength_score / board_strength_rank / percentile` 进行分桶；`stage` 与 `quality_flags` 改为解释性字段，并同步落库到 `daily_sector_heat`
+- `ma100_60min_combined` 策略的 MA100 突破语义修正：门控从“最近连续站上 MA100 的天数 ≤ 5”改为“最近一次真实上穿（前一日收盘 ≤ MA100、当日收盘 > MA100）发生在近 5 根 K 线内”，并新增 (1) 突破前背景过滤 `pre_breakout_below_ratio ≥ 0.6` 或 `pre_breakout_consecutive_below_bars ≥ 3`，(2) `|ma100_distance_pct| ≤ 6.0%` 硬距离门控。原 `ma100_breakout_days` 字段以“连续站上”语义保留在 factor 快照中供 `leader_score`、`stock_analyzer` 报告等按既有语义继续复用；新增 `ma100_bars_since_breakout` / `ma100_breakout_bar_index` / `ma100_pre_breakout_below_ratio` / `ma100_pre_breakout_consecutive_below_bars` 精准字段用于新门控
 
 ### Screening architecture consolidation
 

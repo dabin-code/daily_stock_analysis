@@ -24,6 +24,23 @@ from src.indicators.bottom_divergence_breakout_detector import (
 logger = logging.getLogger(__name__)
 
 
+# ─── ma100_60min_combined gating constants ────────────────────────────
+# Maximum bars since the most recent *real* upward crossing of MA100 that
+# still counts as a fresh breakout (inclusive; 0 = crossed on latest bar).
+_MA100_60MIN_FRESH_BARS_MAX = 5
+# Upper bound on distance from MA100 at selection time (percent).  Beyond
+# this the stock is considered to have already left the best-buy zone.
+_MA100_60MIN_DISTANCE_PCT_MAX = 6.0
+# Minimum ratio of pre-breakout bars (within the detector's pre-breakout
+# window) whose close was at-or-below MA100.  Guards against labelling
+# noise flips on an already-elevated stock as a fresh breakout.
+_MA100_60MIN_PRE_BELOW_RATIO_MIN = 0.6
+# Fallback signal: minimum number of bars *immediately* before the
+# crossing that closed at-or-below MA100.  Either ratio OR consecutive
+# count satisfies the pre-breakout background condition.
+_MA100_60MIN_PRE_CONSECUTIVE_BELOW_MIN = 3
+
+
 class FactorService:
     """从本地日线数据构建筛选输入。
 
@@ -486,6 +503,12 @@ class FactorService:
 
         ma100_breakout = MABreakoutDetector.detect_breakout(group, ma_period=100) if n >= 100 else {}
         breakout_days = ma100_breakout.get("breakout_days", 0)
+        bars_since_breakout_raw = ma100_breakout.get("bars_since_breakout")
+        breakout_bar_index_raw = ma100_breakout.get("breakout_bar_index")
+        pre_breakout_below_ratio = float(ma100_breakout.get("pre_breakout_below_ratio", 0.0))
+        pre_breakout_consecutive_below_bars = int(
+            ma100_breakout.get("pre_breakout_consecutive_below_bars", 0)
+        )
 
         pullback_ma100 = MABreakoutDetector.detect_pullback_support(group, ma_period=100) if n >= 100 else {}
         pullback_ma20 = MABreakoutDetector.detect_pullback_support(group, ma_period=20) if n >= 20 else {}
@@ -501,11 +524,26 @@ class FactorService:
             stop_loss_price = round(ma100, 4)
             stop_loss_ma = "MA100"
 
+        # Use -1 sentinel when no real crossing was found — keeps the snapshot
+        # schema JSON/DB friendly and lets downstream consumers explicitly
+        # detect "no breakout" without None-handling.
+        bars_since_breakout = (
+            int(bars_since_breakout_raw) if bars_since_breakout_raw is not None else -1
+        )
+        breakout_bar_index = (
+            int(breakout_bar_index_raw) if breakout_bar_index_raw is not None else -1
+        )
+
         return {
             "ma100": round(ma100, 4),
             "above_ma100": above_ma100,
             "ma100_distance_pct": ma100_distance_pct,
             "ma100_breakout_days": breakout_days,
+            # ── New: real-crossing semantics (see MABreakoutDetector docstring) ──
+            "ma100_breakout_bar_index": breakout_bar_index,
+            "ma100_bars_since_breakout": bars_since_breakout,
+            "ma100_pre_breakout_below_ratio": round(pre_breakout_below_ratio, 4),
+            "ma100_pre_breakout_consecutive_below_bars": pre_breakout_consecutive_below_bars,
             "pullback_ma100": pullback_ma100.get("is_pullback_support", False),
             "pullback_ma20": pullback_ma20.get("is_pullback_support", False),
             "stop_loss_price": stop_loss_price,
@@ -868,31 +906,66 @@ class FactorService:
     def _compute_ma100_60min_combined_factors(ma100_factors: dict) -> dict:
         """MA100+60分钟线联合策略因子（Strategy 3）。
 
-        选股门控：above_ma100 AND breakout_days ≤ 5（日线刚站稳MA100）。
-        60分钟线不参与选股，仅在 hit_reasons 中提示次日入场关注点。
+        选股门控（全部满足才算入选）：
+
+        1. ``above_ma100``：当前收盘位于 MA100 上方。
+        2. ``ma100_bars_since_breakout`` 在 ``[0, _MA100_60MIN_FRESH_BARS_MAX]``：
+           最近一次真实上穿 MA100（前一日收盘 ≤ MA100、当日收盘 > MA100）
+           发生在最近 ``_MA100_60MIN_FRESH_BARS_MAX`` 根 K 线内。
+        3. 突破前背景过滤：``pre_breakout_below_ratio`` ≥ 0.6
+           或 ``pre_breakout_consecutive_below_bars`` ≥ 3，避免把已在 MA100
+           上方运行的普通波动误认为新的趋势突破。
+        4. ``ma100_distance_pct`` 绝对值 ≤ ``_MA100_60MIN_DISTANCE_PCT_MAX``：
+           防止已经明显脱离最佳买点区间的滞后股票入选。
+
+        注意：不再使用 ``ma100_breakout_days``（连续站上天数）作为门控依据，
+        该旧字段仍保留在 ma100_factors 中供其它模块（leader_score、stock_analyzer
+        报告等）按其连续站上语义复用。
         """
         above_ma100 = bool(ma100_factors.get("above_ma100", False))
-        breakout_days = int(ma100_factors.get("ma100_breakout_days", 0))
+        bars_since_breakout = int(ma100_factors.get("ma100_bars_since_breakout", -1))
+        pre_below_ratio = float(ma100_factors.get("ma100_pre_breakout_below_ratio", 0.0))
+        pre_consecutive_below = int(
+            ma100_factors.get("ma100_pre_breakout_consecutive_below_bars", 0)
+        )
+        distance_pct_signed = float(ma100_factors.get("ma100_distance_pct", 0.0))
+        distance_pct = abs(distance_pct_signed)
         ma100_val = float(ma100_factors.get("ma100", 0.0))
-        distance_pct = abs(float(ma100_factors.get("ma100_distance_pct", 0.0)))
 
-        confirmed = above_ma100 and 1 <= breakout_days <= 5
+        has_fresh_crossing = (
+            bars_since_breakout is not None
+            and bars_since_breakout >= 0
+            and bars_since_breakout <= _MA100_60MIN_FRESH_BARS_MAX
+        )
+        pre_breakout_ok = (
+            pre_below_ratio >= _MA100_60MIN_PRE_BELOW_RATIO_MIN
+            or pre_consecutive_below >= _MA100_60MIN_PRE_CONSECUTIVE_BELOW_MIN
+        )
+        distance_ok = distance_pct <= _MA100_60MIN_DISTANCE_PCT_MAX
 
-        # ── Freshness score: 1d=1.0, 2d=0.9, 3d=0.8, 4d=0.7, 5d=0.6 ──
-        freshness_score = max(1.0 - (breakout_days - 1) * 0.1, 0.0) if confirmed else 0.0
+        confirmed = bool(
+            above_ma100 and has_fresh_crossing and pre_breakout_ok and distance_ok
+        )
+
+        # ── Freshness score: b=0→1.0, b=1→0.9, … b=5→0.5 ──
+        freshness_score = (
+            max(1.0 - max(bars_since_breakout, 0) * 0.1, 0.0) if confirmed else 0.0
+        )
 
         # ── MA score (recency × distance) ──
-        if distance_pct <= 5.0:
-            dist_score = 1.0 - (distance_pct / 5.0) * 0.7
+        if distance_pct <= _MA100_60MIN_DISTANCE_PCT_MAX:
+            dist_score = 1.0 - (distance_pct / _MA100_60MIN_DISTANCE_PCT_MAX) * 0.7
         else:
             dist_score = 0.3
-        ma_score = round(freshness_score * 0.6 + dist_score * 0.4, 4) if confirmed else 0.0
+        ma_score = (
+            round(freshness_score * 0.6 + dist_score * 0.4, 4) if confirmed else 0.0
+        )
 
         # ── Hit reasons with 60-min operational guidance ──
         hit_reasons: list[str] = []
         if confirmed:
             hit_reasons.append(
-                f"【MA100站稳确认】突破{breakout_days}天，"
+                f"【MA100站稳确认】{bars_since_breakout}根K线前真实上穿，"
                 f"MA100={ma100_val:.2f}，距离{distance_pct:.1f}%"
             )
             hit_reasons.append(

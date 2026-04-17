@@ -117,6 +117,65 @@ class TestMABreakoutDetector(unittest.TestCase):
         result = MABreakoutDetector.detect_breakout(df, ma_period=20)
         self.assertFalse(result["is_breakout"])
 
+    def test_output_includes_real_crossing_fields(self):
+        """detect_breakout must expose the new real-crossing semantic fields."""
+        from src.indicators.ma_breakout_detector import MABreakoutDetector
+        df = _make_df(n=120)
+        result = MABreakoutDetector.detect_breakout(df, ma_period=100)
+        self.assertIn("breakout_bar_index", result)
+        self.assertIn("bars_since_breakout", result)
+        self.assertIn("pre_breakout_below_ratio", result)
+        self.assertIn("pre_breakout_consecutive_below_bars", result)
+
+    def test_real_crossing_after_long_below_is_detected(self):
+        """Build a tape that sits below MA20 for 20 bars then crosses up on
+        the latest bar; detector must report bars_since_breakout=0 and a
+        pre-breakout context that clearly flags the below-MA regime."""
+        from src.indicators.ma_breakout_detector import MABreakoutDetector
+        n = 40
+        close = np.concatenate([
+            np.linspace(10.0, 9.0, n - 1),  # long downtrend / below-MA regime
+            [11.0],  # sharp cross-up on latest bar
+        ])
+        dates = pd.date_range(start="2025-01-01", periods=n, freq="D")
+        df = pd.DataFrame({
+            "date": dates,
+            "open": close,
+            "high": close * 1.01,
+            "low": close * 0.99,
+            "close": close,
+            "volume": np.full(n, 1_000_000),
+            "pct_chg": np.concatenate([[0], np.diff(close) / close[:-1] * 100]),
+        })
+        result = MABreakoutDetector.detect_breakout(df, ma_period=20)
+        self.assertTrue(result["is_breakout"])
+        self.assertEqual(result["bars_since_breakout"], 0)
+        self.assertEqual(result["breakout_bar_index"], n - 1)
+        self.assertGreaterEqual(result["pre_breakout_below_ratio"], 0.6)
+        self.assertGreaterEqual(result["pre_breakout_consecutive_below_bars"], 3)
+
+    def test_no_real_crossing_when_always_above_ma(self):
+        """Uptrend that never dips below MA: breakout_days is large but
+        no real upward crossing exists → bars_since_breakout is None."""
+        from src.indicators.ma_breakout_detector import MABreakoutDetector
+        n = 60
+        close = np.linspace(10.0, 20.0, n)  # strictly monotonic, always above any MA20
+        dates = pd.date_range(start="2025-01-01", periods=n, freq="D")
+        df = pd.DataFrame({
+            "date": dates,
+            "open": close,
+            "high": close * 1.005,
+            "low": close * 0.995,
+            "close": close,
+            "volume": np.full(n, 1_000_000),
+            "pct_chg": np.concatenate([[0], np.diff(close) / close[:-1] * 100]),
+        })
+        result = MABreakoutDetector.detect_breakout(df, ma_period=20)
+        self.assertTrue(result["is_breakout"])
+        self.assertGreater(result["breakout_days"], 0)
+        self.assertIsNone(result["bars_since_breakout"])
+        self.assertIsNone(result["breakout_bar_index"])
+
 
 # ─────────────────────────────────────────────────────────────
 # GapDetector

@@ -107,83 +107,174 @@ class TestExtendedFactorsIntegration(unittest.TestCase):
 
 
 class TestMA10060minCombinedFactors(unittest.TestCase):
+    """Gate semantics use the new real-crossing fields:
+    ``ma100_bars_since_breakout`` + pre-breakout context + distance pct.
+    """
 
-    def test_confirmed_when_fresh_breakout(self):
-        ma100_factors = {
+    @staticmethod
+    def _fresh_factors(**overrides) -> dict:
+        """Default snapshot representing a textbook fresh MA100 breakout."""
+        base = {
             "above_ma100": True,
             "ma100_breakout_days": 3,
+            "ma100_bars_since_breakout": 2,
+            "ma100_breakout_bar_index": 97,
+            "ma100_pre_breakout_below_ratio": 0.8,
+            "ma100_pre_breakout_consecutive_below_bars": 5,
             "ma100": 50.0,
             "ma100_distance_pct": 2.0,
         }
-        result = FactorService._compute_ma100_60min_combined_factors(ma100_factors)
+        base.update(overrides)
+        return base
+
+    def test_confirmed_when_fresh_real_breakout(self):
+        result = FactorService._compute_ma100_60min_combined_factors(self._fresh_factors())
         self.assertTrue(result["ma100_60min_confirmed"])
         self.assertGreater(result["ma100_60min_freshness_score"], 0)
         self.assertGreater(result["ma100_60min_ma_score"], 0)
 
     def test_rejected_when_stale_breakout(self):
-        ma100_factors = {
-            "above_ma100": True,
-            "ma100_breakout_days": 8,
-            "ma100": 50.0,
-            "ma100_distance_pct": 2.0,
-        }
-        result = FactorService._compute_ma100_60min_combined_factors(ma100_factors)
+        result = FactorService._compute_ma100_60min_combined_factors(
+            self._fresh_factors(ma100_bars_since_breakout=8)
+        )
         self.assertFalse(result["ma100_60min_confirmed"])
         self.assertEqual(result["ma100_60min_freshness_score"], 0.0)
 
     def test_rejected_when_below_ma100(self):
-        ma100_factors = {
-            "above_ma100": False,
-            "ma100_breakout_days": 2,
-            "ma100": 50.0,
-            "ma100_distance_pct": -3.0,
-        }
-        result = FactorService._compute_ma100_60min_combined_factors(ma100_factors)
+        result = FactorService._compute_ma100_60min_combined_factors(
+            self._fresh_factors(above_ma100=False, ma100_distance_pct=-3.0)
+        )
         self.assertFalse(result["ma100_60min_confirmed"])
 
-    def test_rejected_when_breakout_days_zero(self):
-        """breakout_days=0 means not yet broken out — should reject."""
-        ma100_factors = {
-            "above_ma100": True,
-            "ma100_breakout_days": 0,
-            "ma100": 50.0,
-            "ma100_distance_pct": 1.0,
-        }
-        result = FactorService._compute_ma100_60min_combined_factors(ma100_factors)
+    def test_rejected_when_no_real_crossing_found(self):
+        """bars_since_breakout=-1 means the detector found no real upward
+        crossing — even if the stock is nominally above MA100, we must not
+        label it a fresh breakout."""
+        result = FactorService._compute_ma100_60min_combined_factors(
+            self._fresh_factors(ma100_bars_since_breakout=-1)
+        )
         self.assertFalse(result["ma100_60min_confirmed"])
+
+    def test_rejected_when_price_too_far_from_ma100(self):
+        """Hard distance gate: already left the best-buy zone → reject."""
+        result = FactorService._compute_ma100_60min_combined_factors(
+            self._fresh_factors(ma100_distance_pct=9.5)
+        )
+        self.assertFalse(result["ma100_60min_confirmed"])
+
+    def test_rejected_when_pre_breakout_background_missing(self):
+        """Without enough pre-breakout 'below MA100' context, the crossing
+        is more likely a noise flip of an already-elevated name — reject."""
+        result = FactorService._compute_ma100_60min_combined_factors(
+            self._fresh_factors(
+                ma100_pre_breakout_below_ratio=0.2,
+                ma100_pre_breakout_consecutive_below_bars=1,
+            )
+        )
+        self.assertFalse(result["ma100_60min_confirmed"])
+
+    def test_confirmed_when_consecutive_below_satisfied_even_with_low_ratio(self):
+        """Either ratio OR consecutive-below signal should suffice."""
+        result = FactorService._compute_ma100_60min_combined_factors(
+            self._fresh_factors(
+                ma100_pre_breakout_below_ratio=0.3,
+                ma100_pre_breakout_consecutive_below_bars=4,
+            )
+        )
+        self.assertTrue(result["ma100_60min_confirmed"])
 
     def test_hit_reasons_include_60min_guidance(self):
-        ma100_factors = {
-            "above_ma100": True,
-            "ma100_breakout_days": 2,
-            "ma100": 48.50,
-            "ma100_distance_pct": 3.1,
-        }
-        result = FactorService._compute_ma100_60min_combined_factors(ma100_factors)
+        result = FactorService._compute_ma100_60min_combined_factors(
+            self._fresh_factors(
+                ma100_bars_since_breakout=1,
+                ma100=48.50,
+                ma100_distance_pct=3.1,
+            )
+        )
         reasons = result["ma100_60min_hit_reasons"]
         self.assertEqual(len(reasons), 2)
         self.assertIn("MA100站稳确认", reasons[0])
         self.assertIn("60分钟入场提示", reasons[1])
         self.assertIn("48.50", reasons[1])
 
-    def test_freshness_score_decreases_with_days(self):
+    def test_freshness_score_decreases_with_bars_since(self):
         scores = []
-        for days in [1, 3, 5]:
-            ma100_factors = {
-                "above_ma100": True,
-                "ma100_breakout_days": days,
-                "ma100": 50.0,
-                "ma100_distance_pct": 2.0,
-            }
-            result = FactorService._compute_ma100_60min_combined_factors(ma100_factors)
+        for bars in [0, 2, 4]:
+            result = FactorService._compute_ma100_60min_combined_factors(
+                self._fresh_factors(ma100_bars_since_breakout=bars)
+            )
             scores.append(result["ma100_60min_freshness_score"])
-        # 1d > 3d > 5d
         self.assertGreater(scores[0], scores[1])
         self.assertGreater(scores[1], scores[2])
-        # exact values: 1d=1.0, 3d=0.8, 5d=0.6
+        # b=0 → 1.0, b=2 → 0.8, b=4 → 0.6
         self.assertAlmostEqual(scores[0], 1.0)
         self.assertAlmostEqual(scores[1], 0.8)
         self.assertAlmostEqual(scores[2], 0.6)
+
+
+class TestMA10060minCombinedScenarios(unittest.TestCase):
+    """四类真实场景（首次突破 / 回踩收复 / 长期上方 / 远离均线）的行为区分。"""
+
+    def test_first_real_breakout_after_long_downside(self):
+        """长期在 MA100 下方后今日首次上穿 → 入选。"""
+        factors = {
+            "above_ma100": True,
+            "ma100_breakout_days": 1,
+            "ma100_bars_since_breakout": 0,
+            "ma100_breakout_bar_index": 99,
+            "ma100_pre_breakout_below_ratio": 0.95,
+            "ma100_pre_breakout_consecutive_below_bars": 18,
+            "ma100": 20.0,
+            "ma100_distance_pct": 1.2,
+        }
+        result = FactorService._compute_ma100_60min_combined_factors(factors)
+        self.assertTrue(result["ma100_60min_confirmed"])
+        self.assertAlmostEqual(result["ma100_60min_freshness_score"], 1.0)
+
+    def test_recently_recovered_after_brief_dip_is_a_fresh_breakout(self):
+        """长期在上方后短暂跌破再收回，若检测到真实上穿、前置条件满足则入选。"""
+        factors = {
+            "above_ma100": True,
+            "ma100_breakout_days": 2,
+            "ma100_bars_since_breakout": 1,
+            "ma100_breakout_bar_index": 98,
+            "ma100_pre_breakout_below_ratio": 0.65,
+            "ma100_pre_breakout_consecutive_below_bars": 4,
+            "ma100": 30.0,
+            "ma100_distance_pct": 1.8,
+        }
+        result = FactorService._compute_ma100_60min_combined_factors(factors)
+        self.assertTrue(result["ma100_60min_confirmed"])
+
+    def test_long_above_ma100_without_real_crossing_is_rejected(self):
+        """连续站上 MA100 已久，未发现近 5 根内的真实上穿 → 不入选（原语义偏差场景）。"""
+        factors = {
+            "above_ma100": True,
+            "ma100_breakout_days": 40,
+            "ma100_bars_since_breakout": 35,
+            "ma100_breakout_bar_index": 64,
+            "ma100_pre_breakout_below_ratio": 0.9,
+            "ma100_pre_breakout_consecutive_below_bars": 10,
+            "ma100": 30.0,
+            "ma100_distance_pct": 1.5,
+        }
+        result = FactorService._compute_ma100_60min_combined_factors(factors)
+        self.assertFalse(result["ma100_60min_confirmed"])
+
+    def test_far_from_ma100_is_rejected_even_with_fresh_crossing(self):
+        """虽然真实上穿发生在近 5 根内，但价格已明显远离 MA100 → 不入选。"""
+        factors = {
+            "above_ma100": True,
+            "ma100_breakout_days": 3,
+            "ma100_bars_since_breakout": 2,
+            "ma100_breakout_bar_index": 97,
+            "ma100_pre_breakout_below_ratio": 0.9,
+            "ma100_pre_breakout_consecutive_below_bars": 6,
+            "ma100": 30.0,
+            "ma100_distance_pct": 12.0,
+        }
+        result = FactorService._compute_ma100_60min_combined_factors(factors)
+        self.assertFalse(result["ma100_60min_confirmed"])
 
 
 class TestMA100Low123CombinedFactors(unittest.TestCase):

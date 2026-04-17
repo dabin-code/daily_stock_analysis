@@ -40,6 +40,17 @@ def _assess_low123(fs: dict) -> EntryMaturity:
 
 
 def _assess_trend_breakout(fs: dict) -> EntryMaturity:
+    # Prefer the new "bars since real MA100 crossing" field.  -1 (or missing)
+    # means no clean crossing was detected → fall back to the legacy
+    # consecutive-above counter which is still informative for older snapshots.
+    bars_since = fs.get("ma100_bars_since_breakout")
+    if isinstance(bars_since, (int, float)) and bars_since >= 0:
+        if bars_since <= 4:
+            return EntryMaturity.HIGH
+        if bars_since <= 9:
+            return EntryMaturity.MEDIUM
+        return EntryMaturity.LOW
+
     days = fs.get("ma100_breakout_days", 999)
     if days <= 5:
         return EntryMaturity.HIGH
