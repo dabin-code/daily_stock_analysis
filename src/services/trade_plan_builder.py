@@ -84,6 +84,42 @@ _ADD_ON_POSITION: Dict[RiskLevel, str] = {
 _INVALIDATION_RULE = "买入后3个交易日未启动则离场"
 
 
+def _build_divergence_add_rule(buy_points: list) -> Optional[str]:
+    """根据底背离检测器的三级 buy_points 构造动态 add_rule。
+
+    规则：
+    - 先找第一个未触发（triggered=False）且 level>=2 的买点，描述"如何触发→加仓"
+    - 若三级都已触发，则描述最高级别已完成 + 跟踪止损
+    - 若 level2/3 都触发但 level3 信息不完整（没有价格），回退到 None
+    """
+    tiered = [bp for bp in buy_points if isinstance(bp, dict) and bp.get("level", 0) >= 2]
+    if not tiered:
+        return None
+
+    tiered_sorted = sorted(tiered, key=lambda bp: bp.get("level", 0))
+    next_bp = next((bp for bp in tiered_sorted if not bp.get("triggered")), None)
+
+    def _fmt(bp: dict) -> str:
+        label = str(bp.get("label") or f"Level{bp.get('level')}")
+        price = bp.get("trigger_price")
+        ratio = bp.get("position_ratio") or "1/3仓"
+        stop = bp.get("stop_loss_price")
+        parts = [f"{label}"]
+        if isinstance(price, (int, float)) and price > 0:
+            parts.append(f"触发价{float(price):.2f}")
+        parts.append(f"加仓{ratio}")
+        if isinstance(stop, (int, float)) and stop > 0:
+            parts.append(f"止损{float(stop):.2f}")
+        return "·".join(parts)
+
+    if next_bp is not None:
+        prefix = "下一级买点："
+        return f"{prefix}{_fmt(next_bp)}；跌破止损价即取消加仓"
+
+    highest = tiered_sorted[-1]
+    return f"三级买点已触发；维持{_fmt(highest)}，改用自然止损法跟踪"
+
+
 def _format_anchor_value(label: str, value: object) -> Optional[str]:
     try:
         if label == "现价":
@@ -142,6 +178,19 @@ class TradePlanBuilder:
             else _PROBE_POSITION.get(risk_level, "1/5仓")
         )
 
+        if setup_type == SetupType.TREND_PULLBACK:
+            support_ma = factor_snapshot.get("shrink_pullback_support_ma")
+            sl_price = factor_snapshot.get("shrink_pullback_stop_loss_price")
+            sl_basis = factor_snapshot.get("shrink_pullback_stop_loss_basis")
+            if sl_price and support_ma and support_ma != "none":
+                basis_label = "MA20" if sl_basis == "MA20" else "回踩低点×0.98"
+                stop_loss_rule = (
+                    f"入场锚点={support_ma}；止损价{float(sl_price):.2f}"
+                    f"（{basis_label}）；跌破即离场"
+                )
+
+        dynamic_add_rule: Optional[str] = None
+
         if setup_type == SetupType.BOTTOM_DIVERGENCE_BREAKOUT:
             exit_plan = factor_snapshot.get("bottom_divergence_exit_plan") or {}
             buy_points = factor_snapshot.get("bottom_divergence_buy_points") or []
@@ -165,10 +214,16 @@ class TradePlanBuilder:
                 latest_bp = max(triggered_bps, key=lambda x: x.get("level", 0))
                 initial_position = latest_bp.get("position_ratio", initial_position)
 
+            # ADD_ON 阶段：按"趋势线 → 阻力线 → 回踩支撑"递进阶梯，
+            # 从 detector 的 buy_points 里挑下一个未触发的层级生成
+            # add_rule，携带真实价格/仓位，替代静态模板。
+            if is_add_on and buy_points:
+                dynamic_add_rule = _build_divergence_add_rule(buy_points)
+
         return TradePlan(
             initial_position=initial_position,
             add_rule=(
-                _ADD_RULE_TEMPLATES.get(setup_type, _DEFAULT_ADD_RULE)
+                (dynamic_add_rule or _ADD_RULE_TEMPLATES.get(setup_type, _DEFAULT_ADD_RULE))
                 if is_add_on
                 else None
             ),

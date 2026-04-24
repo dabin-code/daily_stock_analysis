@@ -262,6 +262,15 @@ def setup_env(override: bool = False):
         env_path = Path(__file__).parent.parent / '.env'
     load_dotenv(dotenv_path=env_path, override=override)
 
+    # 代理开关：USE_PROXY=false（或未显式开启）时，显式清除继承自系统的
+    # HTTP_PROXY/HTTPS_PROXY，避免 Windows/操作系统层面残留的代理端口
+    # （如 v2rayN 默认的 10808）把国内数据源请求带偏。
+    # GitHub Actions 环境同样强制清除，保持 CI 行为不受宿主机代理影响。
+    use_proxy = parse_env_bool(os.getenv("USE_PROXY"), default=False)
+    if os.getenv("GITHUB_ACTIONS") == "true" or not use_proxy:
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
+            os.environ.pop(key, None)
+
 
 @dataclass
 class Config:
@@ -678,7 +687,8 @@ class Config:
                 'eastmoney.com',   # 东方财富 (Efinance/Akshare)
                 'sina.com.cn',     # 新浪财经 (Akshare)
                 '163.com',         # 网易财经 (Akshare)
-                'tushare.pro',     # Tushare
+                'tushare.pro',     # Tushare 官网
+                'waditu.com',      # Tushare 实际 API (api.waditu.com)
                 'baostock.com',    # Baostock
                 'sse.com.cn',      # 上交所
                 'szse.cn',         # 深交所

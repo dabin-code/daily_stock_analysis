@@ -230,6 +230,95 @@ class TestTradePlanBuilder(unittest.TestCase):
         )
         self.assertEqual(result.initial_position, "1/5仓")
 
+    # ── 底背离双突破：递进三级买点 add_rule ─────────────────────────
+    # Notion《各形态买卖点识别手册》要求底背离双突破按"趋势线突破→阻力线
+    # 突破→回踩支撑"三级递进加仓。下列三条断言验证 ADD_ON 阶段的 add_rule
+    # 能吃到 detector 产出的 buy_points 细节价格，而不是沿用静态模板。
+
+    def test_add_on_bottom_divergence_add_rule_uses_buy_points(self) -> None:
+        fs = {
+            "bottom_divergence_state": "confirmed",
+            "bottom_divergence_exit_plan": {"initial_stop_loss": 9.5},
+            "bottom_divergence_buy_points": [
+                {
+                    "level": 1,
+                    "label": "趋势线突破",
+                    "trigger_price": 10.2,
+                    "triggered": True,
+                    "position_ratio": "1/5仓",
+                    "stop_loss_price": 9.5,
+                },
+                {
+                    "level": 2,
+                    "label": "阻力线突破",
+                    "trigger_price": 11.0,
+                    "triggered": False,
+                    "position_ratio": "1/3仓",
+                    "stop_loss_price": 10.5,
+                },
+                {
+                    "level": 3,
+                    "label": "回踩支撑",
+                    "trigger_price": 11.0,
+                    "triggered": False,
+                    "position_ratio": "1/3仓",
+                    "stop_loss_price": 10.7,
+                },
+            ],
+        }
+        result = self.builder.build(
+            trade_stage=TradeStage.ADD_ON_STRENGTH,
+            setup_type=SetupType.BOTTOM_DIVERGENCE_BREAKOUT,
+            entry_maturity=EntryMaturity.HIGH,
+            risk_level=RiskLevel.MEDIUM,
+            pool_level=CandidatePoolLevel.LEADER_POOL,
+            factor_snapshot=fs,
+        )
+        self.assertIsNotNone(result.add_rule)
+        self.assertIn("阻力线突破", result.add_rule)
+        self.assertIn("11.00", result.add_rule)
+        self.assertIn("1/3仓", result.add_rule)
+
+    def test_add_on_bottom_divergence_after_level2_points_to_pullback(self) -> None:
+        """Level 1 + Level 2 都已触发 → add_rule 描述下一级（回踩）。"""
+        fs = {
+            "bottom_divergence_state": "confirmed",
+            "bottom_divergence_buy_points": [
+                {"level": 1, "label": "趋势线突破", "trigger_price": 10.2,
+                 "triggered": True, "position_ratio": "1/5仓",
+                 "stop_loss_price": 9.5},
+                {"level": 2, "label": "阻力线突破", "trigger_price": 11.0,
+                 "triggered": True, "position_ratio": "1/3仓",
+                 "stop_loss_price": 10.5},
+                {"level": 3, "label": "回踩支撑", "trigger_price": 11.0,
+                 "triggered": False, "position_ratio": "1/3仓",
+                 "stop_loss_price": 10.7},
+            ],
+        }
+        result = self.builder.build(
+            trade_stage=TradeStage.ADD_ON_STRENGTH,
+            setup_type=SetupType.BOTTOM_DIVERGENCE_BREAKOUT,
+            entry_maturity=EntryMaturity.HIGH,
+            risk_level=RiskLevel.MEDIUM,
+            pool_level=CandidatePoolLevel.LEADER_POOL,
+            factor_snapshot=fs,
+        )
+        self.assertIsNotNone(result.add_rule)
+        self.assertIn("回踩支撑", result.add_rule)
+
+    def test_add_on_bottom_divergence_falls_back_when_no_buy_points(self) -> None:
+        """buy_points 缺失 → 沿用静态模板以向后兼容。"""
+        result = self.builder.build(
+            trade_stage=TradeStage.ADD_ON_STRENGTH,
+            setup_type=SetupType.BOTTOM_DIVERGENCE_BREAKOUT,
+            entry_maturity=EntryMaturity.MEDIUM,
+            risk_level=RiskLevel.MEDIUM,
+            pool_level=CandidatePoolLevel.LEADER_POOL,
+            factor_snapshot=self.base_fs,
+        )
+        self.assertIsNotNone(result.add_rule)
+        self.assertIn("加仓", result.add_rule)
+
     # ── 每种 setup_type 的止损模板覆盖 ─────────────────────────────
 
     def test_each_setup_type_has_stop_loss_template(self) -> None:

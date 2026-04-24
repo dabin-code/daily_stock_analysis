@@ -1,9 +1,16 @@
 # Shrink Volume Pullback Strategy / 缩量回踩
-# Volume shrinks during pullback to MA5/MA10, then price bounces.
+# Volume shrinks during pullback to MA5/MA10, then price stabilizes/bounces.
+#
+# 2026-04-17 重构：硬门槛改由 ShrinkPullbackDetector 的状态机驱动
+#   - shrink_pullback_close_back == true   （收盘站回 MA5 或 MA10 之上）
+#   - shrink_pullback_volume_shrink == true（回踩阶段量能相对上涨阶段明显收缩）
+# 多头排列仍保留作为前置过滤，避免在 detector 降级时放宽趋势要求。
+# 成熟度（MA5 = HIGH / MA10 = MEDIUM）由 EntryMaturityAssessor 基于
+# ``shrink_pullback_state`` + ``shrink_pullback_support_ma`` 判定。
 
 name: shrink_pullback
 display_name: 缩量回踩
-description: 检测缩量回踩均线支撑信号，趋势延续的理想入场点。
+description: 检测缩量回踩 MA5/MA10 支撑并企稳的信号，趋势延续的理想入场点。
 category: trend
 core_rules: [1, 2, 4]
 required_tools:
@@ -20,38 +27,40 @@ setup_type: trend_pullback
 
 screening:
   filters:
+    # 前置：多头排列（detector 内部也会复核一次）
     - field: ma5
       op: ">="
       value_ref: ma10
     - field: ma10
       op: ">="
       value_ref: ma20
-    - field: volume_ratio
-      op: "<="
-      value: 0.7
-    - field: ma5_distance_pct
-      op: "<="
-      value: 2.0
-    # 当日收阳确认企稳（过滤仍在下跌的假回踩）
-    - field: pct_chg
-      op: ">"
-      value: 0
-    - field: pullback_touched_ma
+    # 状态机门槛：回踩阶段缩量
+    - field: shrink_pullback_volume_shrink
+      op: "=="
+      value: true
+    # 状态机门槛：当日收盘站回支撑均线（过滤仅 low 触碰但继续下跌的假回踩）
+    - field: shrink_pullback_close_back
       op: "=="
       value: true
   scoring:
     - field: trend_score
-      weight: 40
-    - field: volume_ratio
-      weight: 30
+      weight: 35
+    # 回踩均量 / 上涨均量 —— 越小越"真缩量"
+    - field: shrink_pullback_volume_shrink_ratio
+      weight: 25
       invert: true
       cap: 1.0
-    - field: ma5_distance_pct
+    # 真正出现企稳反弹 → 直接加分
+    - field: shrink_pullback_rebound_confirmed
       weight: 20
-      invert: true
-      cap: 5.0
+      cap: 1.0
     - field: liquidity_score
       weight: 10
+    # 离 MA5 越近越好，但不再作为硬门槛；MA10 回踩也能保留合理分数
+    - field: ma5_distance_pct
+      weight: 10
+      invert: true
+      cap: 5.0
 
 instructions: |
   **缩量回踩（Shrink Volume Pullback Strategy）**
@@ -59,26 +68,26 @@ instructions: |
   入场判定标准：
 
   1. **前提条件**（关联理念2：趋势交易）：
-     - 股票必须处于上升趋势（MA5 > MA10 > MA20）。
+     - 股票处于上升趋势（MA5 > MA10 > MA20）且均线整体向上。
      - 使用 `analyze_trend` 确认多头排列。
 
   2. **回踩检测**（关联理念4：买点偏好）：
      - 使用 `get_daily_history` 和 `get_realtime_quote`。
-     - 价格回踩至 MA5 附近（误差 1% 以内）或 MA10 附近（误差 2% 以内）。
-     - 回调期间成交量 < 5 日均量的 70%（缩量特征）。
-     - `analyze_trend` → volume_status 应显示缩量。
+     - 回踩窗口内价格触及 MA5（1% 容差）或 MA10（2% 容差）。
+     - 回踩幅度控制在 1%–15%，且最低点不应显著跌破 MA20。
+     - 回踩阶段均量相对此前上涨阶段均量 ≤ 0.7（detector 自动计算）。
 
-  3. **反弹信号**（关联理念1：严进策略）：
-     - 当前价格守住均线支撑位。
-     - MA5 乖离率 < 2% — 最佳买入区间。
+  3. **企稳信号**（关联理念1：严进策略）：
+     - 当日收盘重新站回支撑均线之上。
+     - 出现阳线（收盘强度 ≥ 0.5）或当日突破前一日高点 → rebound_confirmed。
 
   4. **确认条件**（关联理念5：风险排查）：
      - `search_stock_news` 无利空消息。
      - 筹码分布健康（获利比例 50-80%）。
 
   买点结构确认：
-  - 缩量回踩 MA5 → 高成熟度买点
-  - 缩量回踩 MA10 且量能 < 0.6 倍均量 → 中成熟度买点
-  - 理想买点设在 MA5 水平，次优买点设在 MA10。
-  - 止损设在 MA20 水平。
-  - 在 `buy_reason` 中注明"缩量回踩"。
+  - state = confirmed 且 support = MA5 → 高成熟度买点（EntryMaturity.HIGH）
+  - state = confirmed 且 support = MA10 → 中成熟度买点（EntryMaturity.MEDIUM）
+  - state = stabilizing → 中成熟度观察位（不建议重仓）
+  - 止损优先结构化取值 `shrink_pullback_stop_loss_price`（默认 MA20，退化则取 pullback_low × 0.98）。
+  - 在 `buy_reason` 中注明"缩量回踩"及支撑均线档位。

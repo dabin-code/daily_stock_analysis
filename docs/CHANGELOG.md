@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Extreme strength stock-pool semantics
+
+- `extreme_strength_combo` 策略明确收敛为 **热点题材股票池 / 排序器（`system_role: stock_pool`）**，不再承担精确买点语义。`setup_resolver` 回归测试锁定 `extreme_strength_combo` 永远不会被解析为 `setup_type` 或 `primary_strategy`
+- `extreme_strength_scorer` 新增 `calculate_layered_scores` 和 `LayeredExtremeStrengthScores` 数据类，把总分拆为 `theme_pool_score / leadership_score / entry_signal_score / timing_penalty` 四桶；原 `calculate_extreme_strength_score` 继续返回同一个总分，向后兼容所有既有消费方
+- 新增 `ExtremeStrengthTimingAssessor` 和 `StageLabel` 枚举（`pool_only / watch_only / breakout_day / retest_entry / extended_do_not_chase`），用 `bars_since_primary_event` 和 `extended_pct` 对"强势但已走远"的候选给出 `timing_penalty`；当 snapshot 包含 `stage_label == extended_do_not_chase` 时，`CandidatePoolClassifier` 会把 `LEADER_POOL` 档位 opt-in 降级为 `FOCUS_LIST`，snapshot 未填该字段时完全保留旧行为
+- `CoreSignalIdentifier` 新增 `classify_signals` 统一入口和 `SignalKind` 枚举（`structure_low_entry / momentum_breakout / momentum_chase / none`）；原先"涨停 / 缺口 默认压过 低位123 / 底背离双突破"的硬优先级被移除，`primary_signal` 改由 `SignalKind` 优先级（结构入场 > 动量突破 > 动量追涨）选出；旧 `core_signal / bonus_signals` 字段继续保留以向后兼容
+- `hot_theme_factor_enricher` 的 snapshot 现在会写入 `theme_pool_score / leadership_score / entry_signal_score / timing_penalty / extreme_strength_breakdown / stage_label / timing_reasons / timing_bars_since_event / timing_extended_pct / primary_signal / signal_kind / all_signals` 新字段；没有热点匹配或无信号的场景会填入零值/`none` 默认值，保持 schema 稳定
+- `entry_reason` 改由 `stage_label` 中文标签（`仅观察 / 突破当日 / 回踩确认 / 已走远·勿追`）主导，旧描述词（`开盘半小时内涨停 / 刚突破MA100`）降级为可选上下文后缀，例如 `"突破当日 · 开盘半小时内涨停"`；非热点分支仍返回 `None` 以保留旧 schema
+- `phase4_entry_readiness` 改为以 `stage_label` 为硬闸：`extended_do_not_chase` 阶段即使 `extreme_strength_score >= 60` 也不会被勾选为"入场准备就绪"，避免扎堆追高
+- `risk_params` 按 `primary_signal` 引用真实子信号的止损依据：低位 123 → `pattern_123_stop_loss / pattern_123_pullback_support_price`、底背离双突破 → `bottom_divergence_stop_loss`、缺口突破 MA100 → `breakaway_gap_low`、涨停/跳空涨停 → `limitup_key_level_price`（回退 `breakaway_gap_low`）；均未命中才回退到旧 `MA100 × 0.95` 模板。新增 `stop_loss_basis` 字段透明标注止损依据来源（如 `"123结构低点" / "缺口下沿" / "涨停前trendline" / "MA100×0.95"`）；`stage_label == extended_do_not_chase` 时 `position_size` 强制为 `不建议入场`、`take_profit_ratio=0`
+- `ExtremeStrengthScorer.calculate_layered_scores` 新增 `leader_double_count` / `deduplicated_total_score` 两个只读字段，用来显式估算 `leader_score` 与其它桶（`small_circ_mv / turnover / breakout_strength / trend_strength` 的 `above_ma100` 下界）之间可观测的重复加权。`total_score` / `calculate_extreme_strength_score` 数值语义保持不变，所有 `>=50 / >=60 / >=80` 阈值契约均不受影响；snapshot 同步新增 `leader_double_count` 与 `extreme_strength_score_deduplicated` 字段，默认值为 0
+- Web 候选详情面板新增分层评分、`stage_label` 徽章、`primary_signal + signal_kind` 徽章及 `timing_penalty` 红色提示区；阶段 3 描述优先取 `primary_signal`，回退到 `core_signal`；阶段 5 止损描述会在价格后追加 `（<basis>）` 提示依据来源；L2 题材地位 + 候选详情抽屉均新增 `· 去重净分` 行，以琥珀色展示 `extreme_strength_score_deduplicated` 及扣除的 `leader_double_count`
+
 ### Backtest experience
 
 - Reworked the five-layer backtest page into four layers: system scorecard, strategy comparison, judgment validation, and per-stock drill-down

@@ -25,6 +25,10 @@ import type {
 import {
   TRADE_STAGE_LABELS,
   TRADE_STAGE_COLORS,
+  STAGE_LABEL_LABELS,
+  STAGE_LABEL_COLORS,
+  SIGNAL_KIND_LABELS,
+  SIGNAL_KIND_COLORS,
 } from '../../types/screening';
 
 const EMPTY_VALUE = '--';
@@ -115,9 +119,14 @@ function getPhaseDescription(label: string, isHit: boolean, snapshot: ScreeningF
   if (!isHit) return '未命中';
   if (label === '阶段1: 市场与题材') return '已确认热点题材匹配';
   if (label === '阶段2: 龙头筛选') return `龙头评分: ${snapshot.leader_score ?? EMPTY_VALUE}`;
-  if (label === '阶段3: 核心信号') return snapshot.core_signal ?? '已命中强势信号';
+  // A4：阶段 3 优先展示 primary_signal，其次回退到 core_signal
+  if (label === '阶段3: 核心信号') return snapshot.primary_signal ?? snapshot.core_signal ?? '已命中强势信号';
   if (label === '阶段4: 入场准备') return snapshot.entry_reason ?? '已形成入场方案';
-  return `止损: ${snapshot.risk_params?.stop_loss?.toFixed(2) ?? EMPTY_VALUE} | 仓位: ${snapshot.risk_params?.position_size ?? EMPTY_VALUE}`;
+  // A6：止损描述附加 stop_loss_basis 依据（如 "缺口下沿" / "123结构低点"）。
+  const stopLoss = snapshot.risk_params?.stop_loss?.toFixed(2) ?? EMPTY_VALUE;
+  const basis = snapshot.risk_params?.stop_loss_basis;
+  const stopLossDisplay = basis && basis !== 'none' ? `${stopLoss}（${basis}）` : stopLoss;
+  return `止损: ${stopLossDisplay} | 仓位: ${snapshot.risk_params?.position_size ?? EMPTY_VALUE}`;
 }
 
 function isSafeUrl(url: string): boolean {
@@ -175,8 +184,62 @@ function LegacyLayout({
             {factorSnapshot.extreme_strength_score != null && (
               <InfoRow label="极端强势分">{factorSnapshot.extreme_strength_score.toFixed(1)}</InfoRow>
             )}
+            {factorSnapshot.theme_pool_score != null && (
+              <InfoRow label="· 题材池分">{factorSnapshot.theme_pool_score.toFixed(1)}</InfoRow>
+            )}
+            {factorSnapshot.leadership_score != null && (
+              <InfoRow label="· 龙头分">{factorSnapshot.leadership_score.toFixed(1)}</InfoRow>
+            )}
+            {factorSnapshot.entry_signal_score != null && (
+              <InfoRow label="· 入场信号分">{factorSnapshot.entry_signal_score.toFixed(1)}</InfoRow>
+            )}
+            {factorSnapshot.timing_penalty != null && factorSnapshot.timing_penalty < 0 && (
+              <InfoRow label="· 时机惩罚">
+                <span className="text-red-400">{factorSnapshot.timing_penalty.toFixed(1)}</span>
+              </InfoRow>
+            )}
+            {factorSnapshot.leader_double_count != null &&
+              factorSnapshot.leader_double_count > 0 &&
+              factorSnapshot.extreme_strength_score_deduplicated != null && (
+                <InfoRow label="· 去重净分">
+                  <span
+                    className="text-amber-300"
+                    title="扣除 leader_score 与其它桶之间可观测的重复加权估算值"
+                  >
+                    {factorSnapshot.extreme_strength_score_deduplicated.toFixed(1)}
+                    <span className="ml-1 text-xs text-secondary-text">
+                      (−{factorSnapshot.leader_double_count.toFixed(1)})
+                    </span>
+                  </span>
+                </InfoRow>
+              )}
+            {factorSnapshot.stage_label && factorSnapshot.stage_label !== 'none' && (
+              <div className="flex items-center gap-2 text-xs">
+                <span className="shrink-0 text-secondary-text">阶段</span>
+                <LabeledBadge
+                  value={factorSnapshot.stage_label}
+                  labelMap={STAGE_LABEL_LABELS}
+                  colorMap={STAGE_LABEL_COLORS}
+                />
+              </div>
+            )}
             {factorSnapshot.entry_reason && (
               <InfoRow label="入选原因">{factorSnapshot.entry_reason}</InfoRow>
+            )}
+            {factorSnapshot.primary_signal && (
+              <div className="flex items-center gap-2 text-xs">
+                <span className="shrink-0 text-secondary-text">主信号</span>
+                <span className="inline-flex rounded border border-border/40 bg-elevated/40 px-1.5 py-0.5 text-[10px] font-medium text-foreground">
+                  {factorSnapshot.primary_signal}
+                </span>
+                {factorSnapshot.signal_kind && factorSnapshot.signal_kind !== 'none' && (
+                  <LabeledBadge
+                    value={factorSnapshot.signal_kind}
+                    labelMap={SIGNAL_KIND_LABELS}
+                    colorMap={SIGNAL_KIND_COLORS}
+                  />
+                )}
+              </div>
             )}
             {factorSnapshot.core_signal && (
               <InfoRow label="核心技术信号">{factorSnapshot.core_signal}</InfoRow>

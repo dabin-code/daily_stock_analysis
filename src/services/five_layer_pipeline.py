@@ -513,6 +513,9 @@ class FiveLayerPipeline:
                 theme_position=tp,
                 market_regime=market_env.regime,
                 is_limit_up=bool(fs.get("is_limit_up", False)),
+                # A3/C：把"已走远勿追"阶段标签交给 L3 做 opt-in 降级；
+                # snapshot 没有 stage_label 时传 None，完全保留旧行为。
+                stage_label=fs.get("stage_label") or None,
             )
 
             # L5: 交易阶段裁决

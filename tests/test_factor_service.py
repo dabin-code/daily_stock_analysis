@@ -236,24 +236,49 @@ class FactorServiceTestCase(unittest.TestCase):
         self.assertNotIn("is_hot_theme_stock", snapshot_df.columns)
         self.assertNotIn("theme_boards", snapshot_df.columns)
 
-    def test_compute_extended_factors_marks_recent_pullback_touch(self) -> None:
+    def test_compute_extended_factors_exposes_shrink_pullback_fields(self) -> None:
+        """新 ShrinkPullbackDetector 的输出被展平到 snapshot，且兼容字段
+        ``pullback_touched_ma`` 仍然存在。
+
+        注意：detector 前置要求多头排列 + 阶段缩量 + 收盘站回等完整结构，
+        单元测试用简化 fixture 不一定能走到 ``confirmed``；这里只断言字段
+        存在与类型正确，真正的状态机行为由 ``test_shrink_pullback_detector``
+        覆盖。
+        """
         rows = []
         start_date = date(2026, 3, 1)
-        closes = [10.0] * 17 + [10.0, 10.1, 10.2, 10.3]
-        lows = [9.8] * 18 + [9.95, 10.0, 10.1]
+        # 上涨 25 天 + 回踩 3 天 + 企稳 1 天
+        uptrend_closes = [9.0 + i * 0.06 for i in range(25)]      # 9.0 → 10.44
+        pullback_closes = [10.35, 10.25, 10.42]
+        closes = uptrend_closes + pullback_closes
+        uptrend_vol = 2000
+        pullback_vol = [900, 700, 1100]
+
         for idx, close in enumerate(closes):
             trade_date = start_date + timedelta(days=idx)
+            if idx < 25:
+                vol = uptrend_vol
+                low = close - 0.05
+                high = close + 0.05
+                open_ = close - 0.02
+                pct = 0.5
+            else:
+                vol = pullback_vol[idx - 25]
+                low = close - 0.10
+                high = close + 0.08
+                open_ = close + (0.1 if idx < 27 else -0.14)
+                pct = -1.0 if idx < 27 else 1.6
             rows.append(
                 {
                     "date": trade_date,
                     "code": "600519",
-                    "open": close - 0.05,
-                    "high": close + 0.1,
-                    "low": lows[idx],
+                    "open": open_,
+                    "high": high,
+                    "low": low,
                     "close": close,
-                    "volume": 1000 + idx * 10,
-                    "amount": (1000 + idx * 10) * close,
-                    "pct_chg": 1.0,
+                    "volume": vol,
+                    "amount": vol * close,
+                    "pct_chg": pct,
                 }
             )
 
@@ -261,7 +286,13 @@ class FactorServiceTestCase(unittest.TestCase):
         result = self.service._compute_extended_factors(group, group.iloc[-1], group["close"])
 
         self.assertIn("pullback_touched_ma", result)
-        self.assertTrue(result["pullback_touched_ma"])
+        self.assertIn("shrink_pullback_state", result)
+        self.assertIn("shrink_pullback_support_ma", result)
+        self.assertIn("shrink_pullback_volume_shrink", result)
+        self.assertIn("shrink_pullback_rebound_confirmed", result)
+        self.assertIn("shrink_pullback_stop_loss_price", result)
+        self.assertIsInstance(result["shrink_pullback_state"], str)
+        self.assertIsInstance(result["pullback_touched_ma"], bool)
 
 
 if __name__ == "__main__":

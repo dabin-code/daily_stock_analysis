@@ -268,3 +268,99 @@ class TestFadingTheme:
             theme_position=ThemePosition.FADING_THEME,
         )
         assert result.strategy_family == StrategyFamily.REVERSAL
+
+
+# ── Stock-pool role regression ─────────────────────────────────────────────
+#
+# extreme_strength_combo 的 system_role 是 stock_pool，不应被 SetupResolver
+# 当成 entry_core 处理；它永远不能成为 primary_strategy，也不应产出
+# 具体 setup_type。这些测试锁住既有行为，防止后续权重/排序调整时
+# 误把池子层策略提升为买点策略。
+
+class TestExtremeStrengthComboAsStockPool:
+    def test_alone_returns_none_setup(self, resolver: SetupResolver):
+        """仅有 extreme_strength_combo 时返回 SetupType.NONE + no_entry_core_in_allowed。"""
+        result = resolver.resolve(
+            allowed_strategies=["extreme_strength_combo"],
+            strategy_scores={"extreme_strength_combo": 95.0},
+            market_regime=MarketRegime.AGGRESSIVE,
+            theme_position=ThemePosition.MAIN_THEME,
+        )
+        assert result.setup_type == SetupType.NONE
+        assert result.strategy_family is None
+        assert result.primary_strategy is None
+        assert result.reason == "no_entry_core_in_allowed"
+        assert "extreme_strength_combo" in result.contributing_strategies
+
+    def test_with_other_non_entry_core_still_returns_none(self, resolver: SetupResolver):
+        """与其他非 entry_core 策略组合，仍然没有 setup_type。"""
+        result = resolver.resolve(
+            allowed_strategies=[
+                "extreme_strength_combo",
+                "dragon_head",
+                "volume_breakout",
+            ],
+            strategy_scores={
+                "extreme_strength_combo": 90.0,
+                "dragon_head": 80.0,
+                "volume_breakout": 70.0,
+            },
+            market_regime=MarketRegime.AGGRESSIVE,
+            theme_position=ThemePosition.MAIN_THEME,
+        )
+        assert result.setup_type == SetupType.NONE
+        assert result.primary_strategy is None
+        assert result.reason == "no_entry_core_in_allowed"
+        assert set(result.contributing_strategies) >= {
+            "extreme_strength_combo",
+            "dragon_head",
+            "volume_breakout",
+        }
+
+    def test_with_entry_core_never_wins_primary(self, resolver: SetupResolver):
+        """即使 extreme_strength_combo 分数更高，也不能成为 primary_strategy。"""
+        result = resolver.resolve(
+            allowed_strategies=[
+                "extreme_strength_combo",
+                "ma100_60min_combined",
+            ],
+            strategy_scores={
+                "extreme_strength_combo": 99.0,
+                "ma100_60min_combined": 40.0,
+            },
+            market_regime=MarketRegime.AGGRESSIVE,
+            theme_position=ThemePosition.MAIN_THEME,
+        )
+        assert result.primary_strategy == "ma100_60min_combined"
+        assert result.setup_type == SetupType.TREND_BREAKOUT
+        assert result.strategy_family == StrategyFamily.TREND
+        assert "single_entry_core" in result.reason
+        assert "extreme_strength_combo" in result.contributing_strategies
+
+    @pytest.mark.parametrize(
+        "regime,theme_pos",
+        [
+            (MarketRegime.AGGRESSIVE, ThemePosition.MAIN_THEME),
+            (MarketRegime.BALANCED, ThemePosition.MAIN_THEME),
+            (MarketRegime.BALANCED, ThemePosition.SECONDARY_THEME),
+            (MarketRegime.DEFENSIVE, ThemePosition.NON_THEME),
+            (MarketRegime.BALANCED, ThemePosition.FADING_THEME),
+        ],
+    )
+    def test_never_becomes_primary_across_contexts(
+        self,
+        resolver: SetupResolver,
+        regime: MarketRegime,
+        theme_pos: ThemePosition,
+    ) -> None:
+        """不同市场/题材上下文下，extreme_strength_combo 都不应被当成 setup_type 来源。"""
+        result = resolver.resolve(
+            allowed_strategies=["extreme_strength_combo"],
+            strategy_scores={"extreme_strength_combo": 100.0},
+            market_regime=regime,
+            theme_position=theme_pos,
+        )
+        assert result.setup_type == SetupType.NONE
+        assert result.primary_strategy is None
+        assert result.strategy_family is None
+        assert result.reason == "no_entry_core_in_allowed"

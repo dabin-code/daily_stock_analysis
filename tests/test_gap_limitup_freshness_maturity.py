@@ -128,3 +128,45 @@ def test_maturity_legacy_gap_breakaway_still_routed():
     assert assessor.assess(
         SetupType.GAP_BREAKOUT, snapshot
     ) == EntryMaturity.HIGH
+
+
+# ── SetupFreshnessAssessor: bottom divergence ──────────────────
+# Regression: 历史实现读了 ``bottom_divergence_signal`` 这个根本不存在
+# 的键，导致 BOTTOM_DIVERGENCE_BREAKOUT 在缺少 MA100 日历键时总是回退
+# 到 0.5，而不是基于 ``bottom_divergence_confirmation_days`` 给出合理
+# 新鲜度。以下三组断言覆盖新鲜度真实来源与向后兼容。
+
+
+def test_freshness_bottom_divergence_uses_confirmation_days():
+    assessor = SetupFreshnessAssessor()
+    # 0 表示当根 K 线刚刚 confirmed → 最新鲜
+    score_zero = assessor.assess(
+        SetupType.BOTTOM_DIVERGENCE_BREAKOUT,
+        {"bottom_divergence_confirmation_days": 0},
+    )
+    assert score_zero == 1.0
+
+    score_three = assessor.assess(
+        SetupType.BOTTOM_DIVERGENCE_BREAKOUT,
+        {"bottom_divergence_confirmation_days": 3},
+    )
+    assert 0.6 <= score_three <= 0.9
+
+
+def test_freshness_bottom_divergence_confirmed_flag_fallback():
+    """confirmation_days 缺失但 confirmed 布尔为 True → 返回"较新鲜"档位。"""
+    assessor = SetupFreshnessAssessor()
+    score = assessor.assess(
+        SetupType.BOTTOM_DIVERGENCE_BREAKOUT,
+        {"bottom_divergence_double_breakout": True},
+    )
+    assert score >= 0.75
+
+
+def test_freshness_bottom_divergence_default_when_no_signal():
+    """既无天数也无 confirmed 布尔 → 默认 0.5（与旧行为兼容）。"""
+    assessor = SetupFreshnessAssessor()
+    score = assessor.assess(
+        SetupType.BOTTOM_DIVERGENCE_BREAKOUT, {}
+    )
+    assert score == 0.5

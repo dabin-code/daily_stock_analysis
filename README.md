@@ -115,6 +115,9 @@ The scheduled prewarm is now best treated as an optional fallback. The primary l
 - L2 本地热点板块识别已从“绝对综合分 + 固定阈值”切换为“市场相对排名驱动”：`hot/warm` 由 `board_strength_score / board_strength_rank / percentile` 决定，`stage` 与 `quality_flags` 仅负责生命周期解释和主线优先级排序
 - 候选详情中的 `phase_results` 已统一为正式五阶段键，并新增 `phase_explanations` 供前端直接展示阶段解释；OpenClaw `options.candidate_limit/ai_top_k` 也会在接口层做准确校验
 - OpenClaw `extreme_strength_combo` 候选详情现会把原始规则表达式转成中文展示，并将命中的技术形态单独收敛到独立板块；因子快照中的对象/数组值也会展开为可读文本，避免出现 `[object Object]`
+- `extreme_strength_combo` 已明确收敛为“热点题材股票池 / 排序器”角色：候选详情现拆分出 `题材池分 / 龙头分 / 入场信号分 / 时机惩罚` 四桶，并展示 `阶段标签`（`池子层 / 仅观察 / 突破当日 / 回踩确认 / 已走远·勿追`）与 `主信号类型`（`低位结构入场 / 动量突破 / 动量追涨`）；阶段 3 优先展示 `primary_signal`，让结构型右侧买点不再被事件型强势覆盖；当阶段为 `已走远·勿追` 时 L3 候选池会把 `leader_pool` 降级为 `focus_list`，`phase4_entry_readiness` 也会硬闸关闭，避免扎堆追高
+- 候选详情 `入选原因` 改由阶段标签主导（如 `突破当日 · 开盘半小时内涨停` / `仅观察 · 刚突破MA100` / `已走远·勿追`），旧描述词退化为可选上下文后缀；阶段 5 止损参考现会按 `primary_signal` 引用真实子信号的止损依据（`123结构低点 / 底背离临界区 / 缺口下沿 / 涨停前关键位`），并通过新增的 `stop_loss_basis` 字段透明标注来源，`已走远·勿追` 阶段仓位建议强制为 `不建议入场`
+- L2 题材地位 / 候选详情抽屉新增 `去重净分` 行：显式展示 `leader_score` 与其它桶之间可观测的重复加权估算值（`leader_double_count`）以及去除该部分后的净总分（`extreme_strength_score_deduplicated`）。`extreme_strength_score` 本身保持不变，所有 `>=50 / >=60 / >=80` 阈值契约不受影响，仅作为审计/解释视图存在
 - 筛选结果内部与落库统一为 `CandidateDecision`，补齐 `setup_freshness`、`theme_duration/trade_theme_stage`、`trade_plan.execution_note` 等字段，API 与通知模板同步消费这套结构
 - `/api/v1/screening/strategies` 现在会返回 `system_role / strategy_family / applicable_market / applicable_theme / setup_type` 元数据，便于前端和审计面板按策略角色解释结果
 - 筛选任务响应现在会把 `local_theme_pipeline / external_theme_pipeline / fused_theme_pipeline` 作为一等字段返回；运行状态面板也会直接展示融合后的热点题材摘要，不再需要从 `config_snapshot` 手工解析

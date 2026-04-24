@@ -20,6 +20,7 @@ from src.indicators.low_123_trendline_detector import Low123TrendlineDetector
 from src.indicators.bottom_divergence_breakout_detector import (
     BottomDivergenceBreakoutDetector,
 )
+from src.indicators.shrink_pullback_detector import ShrinkPullbackDetector
 
 logger = logging.getLogger(__name__)
 
@@ -465,7 +466,11 @@ class FactorService:
         bottom_div_factors = self._compute_bottom_divergence_factors(group)
 
         # Trend pullback freshness / support confirmation
-        pullback_touched_ma = self._compute_pullback_touched_ma(group, close_series)
+        shrink_pullback_factors = self._compute_shrink_pullback_factors(group)
+        pullback_touched_ma = bool(
+            shrink_pullback_factors.get("shrink_pullback_touched_ma5")
+            or shrink_pullback_factors.get("shrink_pullback_touched_ma10")
+        )
 
         # MA100 + Low-123 combined factors (Strategy 2)
         ma100_low123_factors = self._compute_ma100_low123_combined_factors(
@@ -483,6 +488,7 @@ class FactorService:
             "close_strength": close_strength,
             "candle_pattern": candle_pattern,
             "pullback_touched_ma": pullback_touched_ma,
+            **shrink_pullback_factors,
             **ma100_factors,
             **gap_limit_factors,
             **macd_factors,
@@ -552,17 +558,102 @@ class FactorService:
 
     @staticmethod
     def _compute_gap_limit_factors(group: pd.DataFrame) -> dict:
-        """Compute gap and limit-up factors for screening strategy C."""
+        """Compute gap and limit-up factors for screening strategy C.
+
+        Legacy keys (``gap_up``, ``gap_breakaway``, ``gap_exhaustion_risk``,
+        ``is_limit_up``, ``limit_up_breakout``) are preserved untouched so
+        downstream consumers (leader score, hot theme enricher, extreme
+        strength scorer, sector heat engine, five-layer pipeline) keep
+        working against existing snapshots.  Additive sub-semantic fields
+        implement the split described in the ``gap_limitup`` review plan.
+        """
+        if group is None or group.empty:
+            return {
+                "gap_up": False,
+                "gap_breakaway": False,
+                "gap_exhaustion_risk": False,
+                "is_limit_up": False,
+                "limit_up_breakout": False,
+            }
+
         gap_result = GapDetector.detect_breakaway_gap(group)
-        pct_chg = float(group.iloc[-1].get("pct_chg", 0)) if not group.empty else 0.0
+        continuation_result = GapDetector.detect_continuation_gap(group)
+        gap_retest = GapDetector.detect_gap_retest_hold(group)
+        gap_locate = GapDetector.locate_recent_breakaway_gap(group)
+
         limit_result = LimitUpDetector.is_breakout_limit_up(group)
+        limit_retest = LimitUpDetector.detect_limitup_retest_hold(group)
+        limit_locate = LimitUpDetector.locate_recent_structural_limitup(group)
+
+        # Derived: bars_since_event takes the smaller of the two (≥0 only).
+        bars_gap = int(gap_locate.get("bars_since_event", -1))
+        bars_limit = int(limit_locate.get("bars_since_event", -1))
+        valid_bars = [b for b in (bars_gap, bars_limit) if b >= 0]
+        bars_since_event = min(valid_bars) if valid_bars else -1
+        has_recent_breakaway_event = bars_since_event >= 0
+
+        # Unified retest-hold summary.
+        gap_retest_hold = bool(gap_retest.get("retest_hold", False))
+        limit_retest_hold = bool(limit_retest.get("retest_hold", False))
+        retest_hold = gap_retest_hold or limit_retest_hold
+        if gap_retest_hold:
+            retest_type = "gap_support"
+            retest_support_price = float(gap_retest.get("gap_high", 0.0))
+        elif limit_retest_hold:
+            retest_type = "limitup_pullback"
+            retest_support_price = float(limit_retest.get("support_price", 0.0))
+        else:
+            retest_type = "none"
+            retest_support_price = 0.0
+
+        # Near-rally-peak heuristic: price within 3% of the max close
+        # observed in the last 20 bars excluding the current bar.
+        near_peak = False
+        if len(group) >= 21:
+            recent_max = float(group["close"].iloc[-21:-1].max())
+            curr_close = float(group["close"].iloc[-1])
+            if recent_max > 0:
+                near_peak = (recent_max - curr_close) / recent_max <= 0.03
 
         return {
+            # ── Legacy fields (semantics preserved) ──
             "gap_up": gap_result.get("is_gap_up", False),
             "gap_breakaway": gap_result.get("is_breakaway", False),
             "gap_exhaustion_risk": gap_result.get("is_exhaustion_risk", False),
             "is_limit_up": limit_result.get("is_limit_up", False),
             "limit_up_breakout": limit_result.get("is_breakout_high", False),
+            # ── New: strict breakaway / continuation / exhaustion level ──
+            "breakaway_gap_strict": gap_result.get("is_breakaway_strict", False),
+            "breakaway_gap_pct": gap_result.get("gap_pct", 0.0),
+            "breakaway_gap_low": gap_result.get("gap_low", 0.0),
+            "breakaway_gap_high": gap_result.get("gap_high", 0.0),
+            "gap_broke_key_level": gap_result.get("broke_key_level", False),
+            "gap_key_level_type": gap_result.get("key_level_type", "none"),
+            "gap_key_level_price": gap_result.get("key_level_price", 0.0),
+            "gap_exhaustion_risk_level": gap_result.get("exhaustion_risk_level", "none"),
+            "gap_exhaustion_risk_reasons": gap_result.get("exhaustion_risk_reasons", []),
+            "continuation_gap": continuation_result.get("is_continuation", False),
+            "continuation_gap_pct": continuation_result.get("gap_pct", 0.0),
+            # ── New: structural limit-up / high-acceleration risk ──
+            "limitup_structure_breakout": limit_result.get("is_structural_breakout", False),
+            "limitup_key_level_type": limit_result.get("key_level_type", "none"),
+            "limitup_key_level_price": limit_result.get("key_level_price", 0.0),
+            "limitup_consecutive_count": limit_result.get("consecutive_limit_up_count", 0),
+            "limitup_is_first_board": limit_result.get("is_first_board", False),
+            "limitup_high_acceleration_risk": limit_result.get("high_acceleration_risk", False),
+            "limitup_high_acceleration_reasons": limit_result.get("high_acceleration_reasons", []),
+            # ── New: retest-hold unified summary ──
+            "gap_retest_hold": gap_retest_hold,
+            "limitup_retest_hold": limit_retest_hold,
+            "retest_hold": retest_hold,
+            "retest_type": retest_type,
+            "retest_support_price": retest_support_price,
+            # ── New: event location & derived gating fields ──
+            "bars_since_breakaway_gap": bars_gap,
+            "bars_since_limitup_structure_breakout": bars_limit,
+            "bars_since_event": bars_since_event,
+            "has_recent_breakaway_event": has_recent_breakaway_event,
+            "near_recent_rally_peak": near_peak,
         }
 
     @staticmethod
@@ -750,26 +841,36 @@ class FactorService:
             return None
 
     @staticmethod
-    def _compute_pullback_touched_ma(group: pd.DataFrame, close_series: pd.Series) -> bool:
-        if len(group) < 10:
-            return False
+    def _compute_shrink_pullback_factors(group: pd.DataFrame) -> dict:
+        """Run ShrinkPullbackDetector and flatten its output into snapshot fields.
 
-        recent = group.tail(3).copy()
-        recent_closes = close_series.astype(float)
-        ma5_series = recent_closes.rolling(5).mean()
-        ma10_series = recent_closes.rolling(10).mean()
-
-        for idx, row in recent.iterrows():
-            low = float(row.get("low", row.get("close", 0.0)) or 0.0)
-            ma5 = ma5_series.iloc[idx] if idx < len(ma5_series) else np.nan
-            ma10 = ma10_series.iloc[idx] if idx < len(ma10_series) else np.nan
-
-            if pd.notna(ma5) and ma5 > 0 and abs(low - float(ma5)) / float(ma5) <= 0.01:
-                return True
-            if pd.notna(ma10) and ma10 > 0 and abs(low - float(ma10)) / float(ma10) <= 0.02:
-                return True
-
-        return False
+        Fields share the ``shrink_pullback_`` prefix except the structural
+        ``entry_price`` / ``support_ma_value`` / ``stop_loss_*`` keys which are
+        namespaced to avoid colliding with other strategies' stop-loss fields.
+        """
+        result = ShrinkPullbackDetector.detect(group)
+        return {
+            "shrink_pullback_state": result.get("state", "rejected"),
+            "shrink_pullback_support_ma": result.get("support_ma", "none"),
+            "shrink_pullback_maturity_hint": result.get("maturity_hint", "low"),
+            "shrink_pullback_touched_ma5": bool(result.get("touched_ma5", False)),
+            "shrink_pullback_touched_ma10": bool(result.get("touched_ma10", False)),
+            "shrink_pullback_days": int(result.get("pullback_days", 0) or 0),
+            "shrink_pullback_depth_pct": float(result.get("pullback_depth_pct", 0.0) or 0.0),
+            "shrink_pullback_volume_shrink": bool(
+                result.get("volume_shrink_during_pullback", False)
+            ),
+            "shrink_pullback_volume_shrink_ratio": float(
+                result.get("volume_shrink_ratio", 0.0) or 0.0
+            ),
+            "shrink_pullback_close_back": bool(result.get("close_back_above_support", False)),
+            "shrink_pullback_rebound_confirmed": bool(result.get("rebound_confirmed", False)),
+            "shrink_pullback_entry_price": float(result.get("entry_price", 0.0) or 0.0),
+            "shrink_pullback_support_value": float(result.get("support_ma_value", 0.0) or 0.0),
+            "shrink_pullback_stop_loss_price": float(result.get("stop_loss_price", 0.0) or 0.0),
+            "shrink_pullback_stop_loss_basis": result.get("stop_loss_basis", ""),
+            "shrink_pullback_reject_reason": result.get("reject_reason", ""),
+        }
 
     @staticmethod
     def _compute_ma100_low123_combined_factors(

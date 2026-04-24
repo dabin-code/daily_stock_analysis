@@ -19,10 +19,19 @@ class EntryMaturityAssessor:
 
 
 def _assess_bottom_divergence(fs: dict) -> EntryMaturity:
+    """底背离双突破 → 成熟度。
+
+    状态映射对齐 Notion《各形态买卖点识别手册》：
+    - ``confirmed``：双突破同步 → HIGH
+    - ``late_or_weak``：两条线都突破但同步性弱（间隔 > 3 bars）→ MEDIUM，
+      手册认可此买点成立但明确其成熟度略逊于同步双突破
+    - ``structure_ready``：仅单边突破 → MEDIUM
+    - 其它（``divergence_only`` / ``rejected``）→ LOW
+    """
     state = fs.get("bottom_divergence_state", "")
     if state == "confirmed":
         return EntryMaturity.HIGH
-    if state == "structure_ready":
+    if state in ("late_or_weak", "structure_ready"):
         return EntryMaturity.MEDIUM
     return EntryMaturity.LOW
 

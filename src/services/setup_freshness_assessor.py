@@ -29,6 +29,22 @@ class SetupFreshnessAssessor:
         if setup_type == SetupType.NONE:
             return 0.0
 
+        # ── Priority override for bottom-divergence double-breakout ──
+        # BottomDivergenceBreakoutDetector 会写入 ``bottom_divergence_
+        # confirmation_days``（0 = 最新一根 K 线刚 confirmed）。使用
+        # 该字段作为新鲜度来源，比旧的 ``ma100_breakout_days`` 更贴合
+        # 底背离事件本身；当字段缺失但 ``bottom_divergence_double_
+        # breakout`` 为 True 时给一个偏高的兜底分数，避免历史上的
+        # ``bottom_divergence_signal`` 死键导致永远降到 0.5。
+        if setup_type == SetupType.BOTTOM_DIVERGENCE_BREAKOUT:
+            days = factor_snapshot.get("bottom_divergence_confirmation_days")
+            if isinstance(days, (int, float)) and days >= 0:
+                return self._score_from_breakout_days(float(days) + 1)
+            if factor_snapshot.get("bottom_divergence_double_breakout"):
+                return 0.8
+            if factor_snapshot.get("bottom_divergence_state") == "confirmed":
+                return 0.8
+
         # ── Priority override for gap/limit-up setups ────────────────
         # When the new structured detectors emit ``bars_since_event``,
         # prefer that signal over the legacy day-counter fields so the
@@ -76,7 +92,14 @@ class SetupFreshnessAssessor:
             return 0.95
         if factor_snapshot.get("pattern_123_signal"):
             return 0.8
-        if factor_snapshot.get("bottom_divergence_signal"):
+        # Back-compat：历史上用过 ``bottom_divergence_signal`` 这个从未被
+        # 真正写入的键，这里保留同值兜底，同时识别当前真实使用的
+        # ``bottom_divergence_double_breakout`` 布尔。主流路径已由顶部
+        # 的 BOTTOM_DIVERGENCE_BREAKOUT 分支优先处理。
+        if (
+            factor_snapshot.get("bottom_divergence_signal")
+            or factor_snapshot.get("bottom_divergence_double_breakout")
+        ):
             return 0.75
         return 0.5
 

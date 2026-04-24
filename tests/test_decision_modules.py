@@ -49,6 +49,17 @@ class EntryMaturityAssessorTestCase(unittest.TestCase):
         result = self.assessor.assess(SetupType.BOTTOM_DIVERGENCE_BREAKOUT, fs)
         self.assertEqual(result, EntryMaturity.LOW)
 
+    def test_bottom_divergence_late_or_weak_medium(self) -> None:
+        """late_or_weak：两线都突破但间隔 > 3 bars，仍是有效买点，标记 MEDIUM。
+
+        书中《各形态买卖点识别手册》对底背离双突破的要求是"同步双突破"，
+        但 detector 已确认两条线都被突破，只是同步性弱 → 买点成立但成熟度
+        略逊于 confirmed，按 Notion 描述归为 MEDIUM 而非 LOW。
+        """
+        fs = {"bottom_divergence_state": "late_or_weak"}
+        result = self.assessor.assess(SetupType.BOTTOM_DIVERGENCE_BREAKOUT, fs)
+        self.assertEqual(result, EntryMaturity.MEDIUM)
+
     def test_low123_breakout_ready_high(self) -> None:
         """Low123 breakout_ready → HIGH。"""
         fs = {"pattern_123_state": "breakout_ready", "pattern_123_signal_strength": 0.8}

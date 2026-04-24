@@ -335,6 +335,12 @@ export interface ScreeningPhaseExplanation {
 
 export interface ScreeningRiskParams {
   stop_loss?: number;
+  /**
+   * A6: 止损依据标签（如 `"123结构低点" / "底背离临界区" / "缺口下沿" /
+   * "涨停前trendline" / "MA100×0.95" / "none"`）。
+   * 由 `hot_theme_factor_enricher._resolve_stop_loss` 按 `primary_signal` 选定。
+   */
+  stop_loss_basis?: string;
   position_size?: string;
   take_profit_ratio?: number;
 }
@@ -351,6 +357,22 @@ export interface TechnicalPattern {
   readonly metrics: readonly TechnicalPatternMetric[];
   readonly hitReasons: readonly string[];
 }
+
+/**
+ * Signal summary for A4's `all_signals` snapshot field.
+ * Each entry represents one hit signal with its classification and raw score.
+ */
+export interface ScreeningSignalSummary {
+  name: string;
+  kind: string;
+  score: number;
+}
+
+/**
+ * Layered breakdown of extreme_strength_score (A1/A2).
+ * Keys are free-form because the backend may evolve sub-contributions.
+ */
+export type ScreeningStrengthBreakdown = Record<string, number>;
 
 export interface ScreeningFactorSnapshot extends Record<string, unknown> {
   close?: number;
@@ -374,6 +396,37 @@ export interface ScreeningFactorSnapshot extends Record<string, unknown> {
   bottom_divergence_hit_reasons?: string[];
   rule_hits_display?: string[];
   bonus_signals?: string[];
+
+  // A1/A2: layered extreme_strength_score 四桶字段
+  theme_pool_score?: number;
+  leadership_score?: number;
+  entry_signal_score?: number;
+  timing_penalty?: number;
+  extreme_strength_breakdown?: ScreeningStrengthBreakdown;
+
+  /**
+   * A7：leader_score 与其它桶之间可观测的重复加权估算值（已按 0.15 缩放回
+   * leader_contribution 的量纲）。仅由 `small_circ_mv / turnover /
+   * breakout_strength / trend_strength(above_ma100 下界)` 回推，`theme_match`
+   * 因无法从 scalar leader_score 精确还原而不计入。
+   */
+  leader_double_count?: number;
+  /**
+   * A7：`extreme_strength_score - leader_double_count` 的净总分，用于可选的
+   * 去重视图。`extreme_strength_score` 本身保持不变，所有阈值契约依旧生效。
+   */
+  extreme_strength_score_deduplicated?: number;
+
+  // A3: 时机评估字段
+  stage_label?: string;
+  timing_reasons?: string[];
+  timing_bars_since_event?: number;
+  timing_extended_pct?: number;
+
+  // A4: 统一信号分类字段
+  primary_signal?: string | null;
+  signal_kind?: string;
+  all_signals?: ScreeningSignalSummary[];
 
   // Bottom divergence pattern fields
   bottom_divergence_double_breakout?: boolean;
@@ -576,4 +629,48 @@ export const ENTRY_MATURITY_LABELS: Record<string, string> = {
   high: '成熟',
   medium: '发展中',
   low: '早期',
+};
+
+// ============ A3：时机阶段标签 ============
+
+/**
+ * Timing stage labels emitted by ExtremeStrengthTimingAssessor.
+ * Keep keys aligned with ``src/services/extreme_strength_timing_assessor.py::StageLabel``.
+ */
+export const STAGE_LABEL_LABELS: Record<string, string> = {
+  pool_only: '池子层',
+  watch_only: '仅观察',
+  breakout_day: '突破当日',
+  retest_entry: '回踩确认',
+  extended_do_not_chase: '已走远·勿追',
+  none: '无',
+};
+
+export const STAGE_LABEL_COLORS: Record<string, string> = {
+  pool_only: 'bg-gray-500/20 text-gray-400 border-gray-500/30',
+  watch_only: 'bg-blue-500/20 text-blue-400 border-blue-500/30',
+  breakout_day: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
+  retest_entry: 'bg-green-500/20 text-green-400 border-green-500/30',
+  extended_do_not_chase: 'bg-red-500/20 text-red-400 border-red-500/30',
+  none: 'bg-gray-500/20 text-gray-400 border-gray-500/30',
+};
+
+// ============ A4：信号类型标签 ============
+
+/**
+ * Signal kinds emitted by CoreSignalIdentifier.classify_signals.
+ * Keep keys aligned with ``src/services/core_signal_identifier.py::SignalKind``.
+ */
+export const SIGNAL_KIND_LABELS: Record<string, string> = {
+  structure_low_entry: '低位结构入场',
+  momentum_breakout: '动量突破',
+  momentum_chase: '动量追涨',
+  none: '无信号',
+};
+
+export const SIGNAL_KIND_COLORS: Record<string, string> = {
+  structure_low_entry: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
+  momentum_breakout: 'bg-blue-500/20 text-blue-400 border-blue-500/30',
+  momentum_chase: 'bg-orange-500/20 text-orange-400 border-orange-500/30',
+  none: 'bg-gray-500/20 text-gray-400 border-gray-500/30',
 };

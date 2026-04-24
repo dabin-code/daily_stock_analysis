@@ -41,6 +41,32 @@ export const SectionL2: React.FC<{
         {factorSnapshot.extreme_strength_score != null && (
           <InfoRow label="极端强势分">{factorSnapshot.extreme_strength_score.toFixed(1)}</InfoRow>
         )}
+        {factorSnapshot.theme_pool_score != null && (
+          <InfoRow label="· 题材池分">{factorSnapshot.theme_pool_score.toFixed(1)}</InfoRow>
+        )}
+        {factorSnapshot.leadership_score != null && (
+          <InfoRow label="· 龙头分">{factorSnapshot.leadership_score.toFixed(1)}</InfoRow>
+        )}
+        {factorSnapshot.entry_signal_score != null && (
+          <InfoRow label="· 入场信号分">{factorSnapshot.entry_signal_score.toFixed(1)}</InfoRow>
+        )}
+        {factorSnapshot.timing_penalty != null && factorSnapshot.timing_penalty < 0 && (
+          <InfoRow label="· 时机惩罚">
+            <span className="text-red-400">{factorSnapshot.timing_penalty.toFixed(1)}</span>
+          </InfoRow>
+        )}
+        {factorSnapshot.leader_double_count != null &&
+          factorSnapshot.leader_double_count > 0 &&
+          factorSnapshot.extreme_strength_score_deduplicated != null && (
+            <InfoRow label="· 去重净分">
+              <span className="text-amber-300" title="扣除 leader_score 与其它桶之间可观测的重复加权估算值">
+                {factorSnapshot.extreme_strength_score_deduplicated.toFixed(1)}
+                <span className="ml-1 text-xs text-secondary-text">
+                  (−{factorSnapshot.leader_double_count.toFixed(1)})
+                </span>
+              </span>
+            </InfoRow>
+          )}
         {candidate.leaderStocks && candidate.leaderStocks.length > 0 && (
           <InfoRow label="龙头股">{candidate.leaderStocks.join(' / ')}</InfoRow>
         )}
