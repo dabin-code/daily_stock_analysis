@@ -71,3 +71,66 @@ instructions: |
   - signal_strength（综合评分：touch_count、volume_ratio、突破幅度、背离强度）权重最高。
   - 量比作为流动性确认。
   - 趋势评分和流动性作为辅助确认。
+
+ai_gate:
+  version: v1
+  ai_priority: 1
+  supported: true
+
+  playbook:
+    goal: 确认底背离双突破结构的有效性，判断当前是否处于可操作的入场窗口
+    focus:
+      - 验证背离结构（A/B低点、MACD背离形态）是否完整
+      - 确认双突破（水平阻力 + 下降趋势线）的同步性和力度
+      - 评估量价配合关系
+      - 结合新闻/公告判断是否存在基本面否决因子
+    output_contract:
+      verdict: "buy | watch | reject"
+      confidence: "0.0-1.0"
+      stage: "当前所处阶段标签"
+      primary_action: "下一步操作建议（一句话）"
+      watch_levels:
+        entry_price: "建议入场价"
+        stop_loss: "止损价"
+        target_price: "目标价"
+      reasoning: "结构化判断依据（2-3句）"
+
+  stage_definitions:
+    structure_forming:
+      label: 结构形成中
+      description: A/B低点和MACD背离已识别，但双突破尚未确认
+      typical_verdict: watch
+    confirm_entry_window:
+      label: 确认入场窗口
+      description: 双突破已确认（sync_breakout=True），处于3根K线入场窗口内
+      typical_verdict: buy
+    late_or_weak:
+      label: 迟到或弱势
+      description: 突破不同步或已超过入场窗口
+      typical_verdict: watch
+    breakout_failed:
+      label: 突破失败
+      description: 价格回落至阻力线下方，结构失效
+      typical_verdict: reject
+
+  hard_veto_rules:
+    - "ST / *ST股票直接reject"
+    - "上市不足60天直接reject"
+    - "重大利空公告（财务造假、退市风险警示）直接reject"
+    - "连续跌停未开板直接reject"
+
+  news_focus:
+    - 行业政策变化
+    - 公司重大公告
+    - 机构调研/持仓变动
+    - 板块资金流向
+
+  payload_fields:
+    - signal_strength
+    - divergence_pattern
+    - sync_breakout
+    - breakout_freshness_bars
+    - price_low_a
+    - price_low_b
+    - rebound_high
+    - horizontal_resistance
