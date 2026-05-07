@@ -5,7 +5,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import date
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from data_provider.base import DataFetchError, DataFetcherManager
 from src.storage import DatabaseManager
@@ -56,6 +56,8 @@ class MarketDataSyncService:
         四层防御策略：
         1. 数据库已有目标交易日数据 → 跳过该股票（非按覆盖率短路）
         2. 先尝试 bulk sync，仍缺失的股票继续进入后续流程
+           - bulk 哨兵：bulk 已确认不存在的代码（如已退市但 instrument_master 未及时同步）
+             直接标 skip_eligible，避免逐只兜底浪费时间
         3. 逐只同步有上限 _MAX_INDIVIDUAL_SYNC
         4. 每次 API 调用有 _PER_STOCK_FETCH_TIMEOUT 超时
         """
@@ -82,13 +84,40 @@ class MarketDataSyncService:
         skipped = len(codes) - len(codes_needing_sync)
 
         # ── bulk sync 阶段 ──
+        bulk_returned_universe: Optional[Set[str]] = None
         if codes_needing_sync:
-            bulk_synced = self._try_bulk_sync(trade_date, set(codes_needing_sync))
-            if bulk_synced is not None:
+            bulk_result = self._try_bulk_sync(trade_date, set(codes_needing_sync))
+            if bulk_result is not None:
+                bulk_synced, bulk_returned_universe = bulk_result
                 synced += bulk_synced
                 # 批量复查哪些已被 bulk sync 覆盖
                 still_existing = self.db.batch_has_today_data(codes_needing_sync, target_date=trade_date)
                 codes_needing_sync = [c for c in codes_needing_sync if c not in still_existing]
+
+        # ── bulk 哨兵：bulk 当日 universe 之外的代码视为无源数据，立即标 skip_eligible ──
+        if (
+            bulk_returned_universe is not None
+            and codes_needing_sync
+            and self._is_bulk_sentinel_enabled()
+        ):
+            not_in_bulk = [c for c in codes_needing_sync if c not in bulk_returned_universe]
+            if not_in_bulk:
+                logger.info(
+                    f"[SyncTradeDate] bulk 哨兵命中 {len(not_in_bulk)} 只缺失代码不在 Tushare bulk universe，"
+                    f"跳过逐只兜底"
+                )
+                errors.extend(
+                    self._build_service_failure_record(
+                        code=c,
+                        trade_date=trade_date,
+                        reason="not_in_bulk_universe",
+                        detail="code absent from tushare bulk daily snapshot for target trade date",
+                        reason_class="skip_eligible",
+                        source="tushare_bulk_sentinel",
+                    )
+                    for c in not_in_bulk
+                )
+                codes_needing_sync = [c for c in codes_needing_sync if c in bulk_returned_universe]
 
         # ── 第三层防御：缺失数量超过100只时，改用批量同步 ──
         if len(codes_needing_sync) > 100:
@@ -96,8 +125,9 @@ class MarketDataSyncService:
                 f"[SyncTradeDate] 缺失 {len(codes_needing_sync)} 只 > 100，"
                 f"改用批量同步而非逐只同步"
             )
-            bulk_synced_retry = self._try_bulk_sync(trade_date, set(codes_needing_sync))
-            if bulk_synced_retry is not None:
+            bulk_retry_result = self._try_bulk_sync(trade_date, set(codes_needing_sync))
+            if bulk_retry_result is not None:
+                bulk_synced_retry, _retry_universe = bulk_retry_result
                 synced += bulk_synced_retry
                 still_existing = self.db.batch_has_today_data(codes_needing_sync, target_date=trade_date)
                 codes_needing_sync = [c for c in codes_needing_sync if c not in still_existing]
@@ -242,12 +272,20 @@ class MarketDataSyncService:
     # ------------------------------------------------------------------
     # Tushare 批量同步（带超时，统一 SQLAlchemy）
     # ------------------------------------------------------------------
-    def _try_bulk_sync(self, trade_date: date, needed_codes: set) -> Optional[int]:
+    def _try_bulk_sync(
+        self, trade_date: date, needed_codes: set
+    ) -> Optional[Tuple[int, Set[str]]]:
         """
         尝试用 Tushare daily(trade_date=...) 批量获取全市场当日数据。
 
         一次 API 调用覆盖全市场，比逐只调用快 1000x。
-        若 Tushare 不可用则返回 None，由调用方降级到逐只模式。
+
+        返回：
+            None  → Tushare 不可用 / 调用失败，由调用方降级到逐只模式。
+            (synced_count, bulk_returned_codes) → bulk 调用成功；
+                synced_count 是写入 stock_daily 的行数；
+                bulk_returned_codes 是 Tushare 当日 daily 返回的全部 6 位代码集合，
+                可被调用方用作 "当日真正存在数据的股票" 哨兵。
         """
         from src.config import get_config
         config = get_config()
@@ -281,17 +319,21 @@ class MarketDataSyncService:
 
                 if df is None or df.empty:
                     logger.info(f"[BulkSync] Tushare daily({td_str}) 返回空，可能非交易日")
-                    return 0
+                    return 0, set()
 
                 # 统一使用 SQLAlchemy 写入，继承 busy_timeout + 连接池
                 synced = 0
+                bulk_returned: Set[str] = set()
                 now_str = time.strftime("%Y-%m-%d %H:%M:%S")
                 from sqlalchemy import text
                 with self.db._engine.begin() as conn:
                     for _, row in df.iterrows():
                         ts_code = str(row.get("ts_code", ""))
                         code = ts_code.split(".")[0] if ts_code else ""
-                        if not code or code not in needed_codes:
+                        if not code:
+                            continue
+                        bulk_returned.add(code)
+                        if code not in needed_codes:
                             continue
 
                         td = str(row.get("trade_date", ""))
@@ -318,8 +360,11 @@ class MarketDataSyncService:
                         synced += 1
                     # commit 由 begin() 上下文管理器自动处理
 
-                logger.info(f"[BulkSync] Tushare 批量同步 {trade_date}: {synced}/{len(needed_codes)} 只")
-                return synced
+                logger.info(
+                    f"[BulkSync] Tushare 批量同步 {trade_date}: {synced}/{len(needed_codes)} 只 "
+                    f"(bulk universe={len(bulk_returned)} 只)"
+                )
+                return synced, bulk_returned
 
             except Exception as e:
                 if attempt < 2:
@@ -329,6 +374,15 @@ class MarketDataSyncService:
                 else:
                     logger.warning(f"[BulkSync] Tushare 批量同步失败，降级到逐只模式: {e}")
                     return None
+
+    @staticmethod
+    def _is_bulk_sentinel_enabled() -> bool:
+        """读取 Config.kline_sync_bulk_sentinel_enabled，默认 True。"""
+        try:
+            from src.config import get_config
+            return bool(getattr(get_config(), "kline_sync_bulk_sentinel_enabled", True))
+        except Exception:  # 任何配置读取异常都退化为启用，保守不阻塞主流程
+            return True
 
     # ------------------------------------------------------------------
     # 历史回填

@@ -579,6 +579,9 @@ class Config:
     kline_deep_audit_schedule_time: str = "17:00"
     kline_retry_max_attempts: int = 3
     kline_skip_candidate_failure_threshold: int = 3
+    # bulk 哨兵：Tushare bulk 当日 universe 之外的代码直接标 skip_eligible，
+    # 避免对已退市等"显然无源"的代码做无谓逐只兜底，提升整体同步速度
+    kline_sync_bulk_sentinel_enabled: bool = True
     # Discord 机器人状态
     discord_bot_status: str = "A股智能分析 | /help"
 
@@ -1172,6 +1175,10 @@ class Config:
             kline_skip_candidate_failure_threshold=max(
                 1,
                 int(os.getenv('KLINE_SKIP_CANDIDATE_FAILURE_THRESHOLD', '3')),
+            ),
+            kline_sync_bulk_sentinel_enabled=parse_env_bool(
+                os.getenv('KLINE_SYNC_BULK_SENTINEL_ENABLED'),
+                default=True,
             ),
         )
     

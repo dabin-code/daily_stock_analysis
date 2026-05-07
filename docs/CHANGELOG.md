@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Screening ingest now consumes audit-derived truth: blocking/retryable sync failures are no longer silently downgraded, and non-`passed` trade dates fail closed before factor building
 - Added scheduled K-line governance wiring with opt-in `17:00` post-close execution, independent deep-audit registration, and explicit failure bubbling through the scheduler
 - Added manual governance scripts for auditing/repairing completeness and approving `candidate_skip -> approved_skip` transitions
+- `MarketDataSyncService` now uses the Tushare bulk-daily snapshot as a sentinel: codes outside the bulk universe (delisted/suspended/不在 list 的股票) are immediately recorded with `reason='not_in_bulk_universe'` / `reason_class='skip_eligible'` instead of wasted individual fetcher fallbacks, dramatically shortening end-to-end sync time when `instrument_master` lags upstream listing changes. Toggle via `KLINE_SYNC_BULK_SENTINEL_ENABLED` (default `true`)
 - Documented `pass_status` semantics, the daily `sync -> audit -> repair -> re-audit` flow, and the manual recovery/approval commands in `README.md` / `.env.example`
 
 ### Backtest experience

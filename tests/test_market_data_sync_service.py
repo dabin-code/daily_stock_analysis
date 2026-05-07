@@ -477,5 +477,215 @@ class MarketDataSyncServiceTestCase(unittest.TestCase):
         self.assertEqual(result["health_report"]["reason_class_counts"]["retryable"], 1)
 
 
+class MarketDataSyncServiceBulkSentinelTestCase(unittest.TestCase):
+    """验证 bulk 哨兵：Tushare bulk 都没返回的股票直接进 candidate_skip，不走逐只兜底。"""
+
+    def setUp(self) -> None:
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self._db_path = os.path.join(self._temp_dir.name, "test_bulk_sentinel.db")
+        os.environ["DATABASE_PATH"] = self._db_path
+
+        Config.reset_instance()
+        DatabaseManager.reset_instance()
+        self.db = DatabaseManager.get_instance()
+
+        self.db.upsert_instruments(
+            [
+                {
+                    "code": "600519",
+                    "name": "贵州茅台",
+                    "market": "cn",
+                    "exchange": "SSE",
+                    "listing_status": "active",
+                    "is_st": False,
+                    "industry": "白酒",
+                    "list_date": date(2001, 8, 27),
+                },
+                {
+                    "code": "000001",
+                    "name": "平安银行",
+                    "market": "cn",
+                    "exchange": "SZSE",
+                    "listing_status": "active",
+                    "is_st": False,
+                    "industry": "银行",
+                    "list_date": date(1991, 4, 3),
+                },
+            ]
+        )
+
+    def tearDown(self) -> None:
+        DatabaseManager.reset_instance()
+        Config.reset_instance()
+        os.environ.pop("DATABASE_PATH", None)
+        self._temp_dir.cleanup()
+
+    def test_bulk_returned_universe_filters_unfetchable_codes_before_individual_fallback(self) -> None:
+        """bulk 返回 (1, {600519}): 000001 不在 bulk universe，应跳过 fetcher 直接标 skip_eligible。"""
+        target_date = date(2026, 3, 13)
+        # 模拟 bulk 已经把 600519 写入 db
+        bulk_frame = pd.DataFrame(
+            [
+                {
+                    "date": target_date,
+                    "open": 1500.0,
+                    "high": 1520.0,
+                    "low": 1490.0,
+                    "close": 1510.0,
+                    "volume": 1000,
+                    "amount": 1_510_000,
+                    "pct_chg": 2.2,
+                }
+            ]
+        )
+        self.db.save_daily_data(bulk_frame, "600519", data_source="TushareFetcher(bulk)")
+
+        fetcher_manager = _StubDataFetcherManager({})
+        service = MarketDataSyncService(db_manager=self.db, fetcher_manager=fetcher_manager)
+
+        with patch.object(
+            MarketDataSyncService,
+            "_try_bulk_sync",
+            return_value=(1, {"600519"}),
+        ):
+            result = service.sync_trade_date(trade_date=target_date, force=True)
+
+        self.assertEqual(fetcher_manager.calls, [], "bulk-sentinel 应阻止 fetcher 被 000001 调用")
+        errors_by_code = {e["code"]: e for e in result["errors"]}
+        self.assertIn("000001", errors_by_code)
+        self.assertEqual(errors_by_code["000001"]["reason"], "not_in_bulk_universe")
+        self.assertEqual(errors_by_code["000001"]["reason_class"], "skip_eligible")
+        self.assertTrue(errors_by_code["000001"]["candidate_skip"]["eligible"])
+        self.assertEqual(result["health_report"]["available_count"], 1)
+        self.assertEqual(result["health_report"]["missing_count"], 1)
+        self.assertEqual(result["health_report"]["missing_codes"], ["000001"])
+
+    def test_bulk_returned_universe_still_falls_back_for_codes_inside_bulk(self) -> None:
+        """bulk 返回 (0, {000001}): 000001 在 bulk universe 但本地没入库，应走 fetcher 兜底。"""
+        target_date = date(2026, 3, 13)
+        recovery_frame = pd.DataFrame(
+            [
+                {
+                    "date": target_date,
+                    "open": 12.0,
+                    "high": 12.3,
+                    "low": 11.9,
+                    "close": 12.1,
+                    "volume": 2000,
+                    "amount": 24_200,
+                    "pct_chg": 1.1,
+                }
+            ]
+        )
+        # 600519 也在 universe 里但 fetcher 没数据，让它失败
+        fetcher_manager = _StubDataFetcherManager({"000001": recovery_frame, "600519": pd.DataFrame()})
+        service = MarketDataSyncService(db_manager=self.db, fetcher_manager=fetcher_manager)
+
+        with patch.object(
+            MarketDataSyncService,
+            "_try_bulk_sync",
+            return_value=(0, {"000001", "600519"}),
+        ):
+            result = service.sync_trade_date(trade_date=target_date, force=True)
+
+        called_codes = {c[0] for c in fetcher_manager.calls}
+        self.assertEqual(called_codes, {"000001", "600519"}, "bulk universe 内的股票应走 fetcher")
+        self.assertEqual(result["synced"], 1)
+        # 000001 入库，600519 fetcher 返空 → empty_data
+        errors_by_code = {e["code"]: e for e in result["errors"]}
+        self.assertIn("600519", errors_by_code)
+        self.assertEqual(errors_by_code["600519"]["reason"], "empty_data")
+
+    def test_bulk_unavailable_keeps_individual_fallback_for_all_missing(self) -> None:
+        """bulk 返回 None（Tushare 不可用）: 没有 ground truth，所有 missing 仍走 fetcher。"""
+        target_date = date(2026, 3, 13)
+        recovery_frame = pd.DataFrame(
+            [
+                {
+                    "date": target_date,
+                    "open": 1500.0,
+                    "high": 1520.0,
+                    "low": 1490.0,
+                    "close": 1510.0,
+                    "volume": 1000,
+                    "amount": 1_510_000,
+                    "pct_chg": 2.2,
+                }
+            ]
+        )
+        fetcher_manager = _StubDataFetcherManager(
+            {"600519": recovery_frame, "000001": recovery_frame.copy()}
+        )
+        service = MarketDataSyncService(db_manager=self.db, fetcher_manager=fetcher_manager)
+
+        with patch.object(MarketDataSyncService, "_try_bulk_sync", return_value=None):
+            result = service.sync_trade_date(trade_date=target_date, force=True)
+
+        called_codes = {c[0] for c in fetcher_manager.calls}
+        self.assertEqual(
+            called_codes, {"600519", "000001"},
+            "bulk 不可用时不应启用哨兵过滤，所有 missing 都要走 fetcher 兜底",
+        )
+        self.assertEqual(result["synced"], 2)
+
+    def test_bulk_returned_empty_universe_marks_all_missing_as_skip_eligible(self) -> None:
+        """bulk 返回 (0, set()) 表示当天没有任何股票数据（疑似非交易日），全部标 skip_eligible，不走兜底。"""
+        target_date = date(2026, 3, 13)
+        fetcher_manager = _StubDataFetcherManager({})
+        service = MarketDataSyncService(db_manager=self.db, fetcher_manager=fetcher_manager)
+
+        with patch.object(MarketDataSyncService, "_try_bulk_sync", return_value=(0, set())):
+            result = service.sync_trade_date(trade_date=target_date, force=True)
+
+        self.assertEqual(fetcher_manager.calls, [], "bulk 空集时不应触发任何 fetcher 调用")
+        self.assertEqual(len(result["errors"]), 2)
+        for err in result["errors"]:
+            self.assertEqual(err["reason"], "not_in_bulk_universe")
+            self.assertEqual(err["reason_class"], "skip_eligible")
+
+    def test_bulk_sentinel_can_be_disabled_via_config_flag(self) -> None:
+        """关闭 KLINE_SYNC_BULK_SENTINEL_ENABLED 后退化为原逻辑：missing 走 fetcher 兜底。"""
+        target_date = date(2026, 3, 13)
+        recovery_frame = pd.DataFrame(
+            [
+                {
+                    "date": target_date,
+                    "open": 12.0,
+                    "high": 12.3,
+                    "low": 11.9,
+                    "close": 12.1,
+                    "volume": 2000,
+                    "amount": 24_200,
+                    "pct_chg": 1.1,
+                }
+            ]
+        )
+        fetcher_manager = _StubDataFetcherManager({"000001": recovery_frame})
+        service = MarketDataSyncService(db_manager=self.db, fetcher_manager=fetcher_manager)
+
+        os.environ["KLINE_SYNC_BULK_SENTINEL_ENABLED"] = "false"
+        Config.reset_instance()
+        try:
+            with patch.object(
+                MarketDataSyncService,
+                "_try_bulk_sync",
+                return_value=(0, {"000001"}),  # 600519 不在 bulk universe，但开关关，应仍走兜底
+            ):
+                result = service.sync_trade_date(trade_date=target_date, force=True)
+        finally:
+            os.environ.pop("KLINE_SYNC_BULK_SENTINEL_ENABLED", None)
+            Config.reset_instance()
+
+        called_codes = {c[0] for c in fetcher_manager.calls}
+        self.assertIn("600519", called_codes, "开关关闭时 bulk 没返回的 600519 也应走 fetcher")
+        # 没人提供 600519 数据 → empty_data；000001 走 fetcher 拿到 → synced
+        errors_by_code = {e["code"]: e for e in result["errors"]}
+        self.assertIn("600519", errors_by_code)
+        self.assertNotEqual(
+            errors_by_code["600519"]["reason"], "not_in_bulk_universe",
+            "开关关闭时不应该写入 not_in_bulk_universe",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
