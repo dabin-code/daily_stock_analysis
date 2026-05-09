@@ -59,9 +59,14 @@ def _run_to_response(run) -> FiveLayerRunResponse:
     payload = run.to_dict()
     config = _parse_json_dict(payload.get("config_json"), field_name="config_json")
     sample_baseline = config.get("sample_baseline")
+    candidate_filter = _parse_json_dict(
+        payload.get("candidate_filter_json"),
+        field_name="candidate_filter_json",
+    ) or None
     payload.update(
         {
             "sample_baseline": sample_baseline if isinstance(sample_baseline, dict) else None,
+            "candidate_filter": candidate_filter if isinstance(candidate_filter, dict) else None,
         }
     )
     return FiveLayerRunResponse(**payload)
@@ -131,15 +136,27 @@ def _summary_to_response(summary) -> FiveLayerGroupSummaryItem:
 
 
 def _ranking_to_response(report) -> RankingEffectivenessResponse:
+    # D2: keep both ``top_k_hit_rate`` (legacy alias) and
+    #     ``leader_pool_win_share`` (canonical) in the payload.
+    # D1: also surface family_scope plus the mixed-legacy parallel values so
+    #     analysts can audit how much the family-mix bias was inflating the
+    #     pre-D1 numbers.
+    win_share = getattr(report, "leader_pool_win_share", None)
+    if win_share is None:
+        win_share = getattr(report, "top_k_hit_rate", None)
     return RankingEffectivenessResponse(
         comparisons=[
             RankingComparisonItem(**comparison.__dict__)
             for comparison in (report.comparisons or [])
         ],
         overall_effectiveness_ratio=report.overall_effectiveness_ratio,
-        top_k_hit_rate=report.top_k_hit_rate,
+        top_k_hit_rate=win_share,
+        leader_pool_win_share=win_share,
         excess_return_pct=report.excess_return_pct,
         ranking_consistency=report.ranking_consistency,
+        family_scope=getattr(report, "family_scope", None),
+        leader_pool_win_share_mixed=getattr(report, "leader_pool_win_share_mixed", None),
+        excess_return_pct_mixed=getattr(report, "excess_return_pct_mixed", None),
     )
 
 

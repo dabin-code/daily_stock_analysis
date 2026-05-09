@@ -59,8 +59,10 @@ class RunRepository:
         completed_count: Optional[int] = None,
         error_count: Optional[int] = None,
         config_json: Optional[str] = None,
+        candidate_filter_json: Optional[str] = None,
         started_at: Optional[datetime] = None,
         completed_at: Optional[datetime] = None,
+        data_version: Optional[str] = None,
     ) -> Optional[FiveLayerBacktestRun]:
         with self.db.get_session() as session:
             run = (
@@ -80,10 +82,14 @@ class RunRepository:
                 run.error_count = error_count
             if config_json is not None:
                 run.config_json = config_json
+            if candidate_filter_json is not None:
+                run.candidate_filter_json = candidate_filter_json
             if started_at is not None:
                 run.started_at = started_at
             if completed_at is not None:
                 run.completed_at = completed_at
+            if data_version is not None:
+                run.data_version = data_version
             session.commit()
             session.refresh(run)
             return run

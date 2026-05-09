@@ -87,6 +87,11 @@ class FiveLayerRunResponse(BaseModel):
     candidate_snapshot_version: Optional[str] = None
     rules_version: Optional[str] = None
     sample_baseline: Optional[SampleBaselineResponse] = None
+    # A1: structured filter snapshot — source / screening_run_ids / market /
+    # evaluation_mode / execution_model / eval_window_days. Lets API consumers
+    # answer "which screening runs did this backtest cover?" without re-querying
+    # screening tables by trade date.
+    candidate_filter: Optional[Dict[str, Any]] = None
     created_at: Optional[str] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
@@ -138,6 +143,7 @@ class FiveLayerEvaluationItem(BaseModel):
     outcome: Optional[str] = None
     stage_success: Optional[bool] = None
     eval_status: Optional[str] = None
+    suppression_reason: Optional[str] = None
     metrics_json: Optional[str] = None
     evidence_json: Optional[str] = None
     factor_snapshot_json: Optional[str] = None
@@ -170,7 +176,10 @@ class FiveLayerGroupSummaryItem(BaseModel):
     avg_mae: Optional[float] = None
     avg_mfe: Optional[float] = None
     avg_drawdown: Optional[float] = None
+    # ``top_k_hit_rate`` is a DEPRECATED alias kept for backward
+    # compatibility. Prefer ``leader_pool_win_share`` in new clients.
     top_k_hit_rate: Optional[float] = None
+    leader_pool_win_share: Optional[float] = None
     excess_return_pct: Optional[float] = None
     ranking_consistency: Optional[float] = None
     p25_return_pct: Optional[float] = None
@@ -202,14 +211,29 @@ class RankingComparisonItem(BaseModel):
     high_sample_count: int
     low_sample_count: int
     is_effective: bool
+    # D1: ``family_entry`` / ``family_observation`` mean the comparison was
+    # anchored on the family-correct numbers from family_breakdown;
+    # ``mixed_legacy`` means it reproduced the pre-D1 mixed-summary read;
+    # ``mixed_fallback`` means at least one tier lacked the requested family
+    # and the comparison silently fell back to mixed columns.
+    metric_source: Optional[str] = None
 
 
 class RankingEffectivenessResponse(BaseModel):
     comparisons: List[RankingComparisonItem] = Field(default_factory=list)
     overall_effectiveness_ratio: float
+    # ``top_k_hit_rate`` is a DEPRECATED alias of ``leader_pool_win_share``.
+    # Both fields hold identical values in current responses.
     top_k_hit_rate: Optional[float] = None
+    leader_pool_win_share: Optional[float] = None
     excess_return_pct: Optional[float] = None
     ranking_consistency: Optional[float] = None
+    # D1: family_scope on which the headline numbers above are computed
+    # (default ``"entry"``); the mixed-legacy values are exposed in parallel
+    # so analysts can quantify the family-mix bias.
+    family_scope: Optional[str] = None
+    leader_pool_win_share_mixed: Optional[float] = None
+    excess_return_pct_mixed: Optional[float] = None
 
 
 class FiveLayerSummariesResponse(BaseModel):

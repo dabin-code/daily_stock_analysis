@@ -473,6 +473,73 @@ class TestGroupSummaryAggregator(unittest.TestCase):
         metrics = json.loads(entry.metrics_json)
         self.assertNotIn("family_breakdown", metrics)
 
+    def test_setup_type_summary_always_emits_family_breakdown(self):
+        """Mixed-capable single-dimension summaries should always carry a
+        ``family_breakdown`` so consumers can read family-correct metrics
+        without falling back to legacy mixed fields.
+
+        Regression guard for C3/C4/C5: even when a setup_type bucket happens
+        to contain a single family, the breakdown must be present so the API
+        contract is uniform.
+        """
+        from src.backtest.aggregators.group_summary_aggregator import GroupSummaryAggregator
+        from src.backtest.repositories.evaluation_repo import EvaluationRepository
+        from src.backtest.repositories.summary_repo import SummaryRepository
+
+        agg = GroupSummaryAggregator(EvaluationRepository(self.db), SummaryRepository(self.db))
+        summaries = agg.compute_all_summaries("run-agg")
+        trend_breakout = next(
+            s for s in summaries
+            if s.group_type == "setup_type" and s.group_key == "trend_breakout"
+        )
+
+        metrics = json.loads(trend_breakout.metrics_json)
+        self.assertIn("family_breakdown", metrics)
+        self.assertIn("entry", metrics["family_breakdown"])
+        self.assertEqual(metrics["family_breakdown"]["entry"]["sample_count"], 1)
+
+    def test_family_breakdown_entry_uses_entry_only_win_rate(self):
+        """family_breakdown.entry win_rate must only count entry winners
+        (``outcome=='win'``) and ignore observation outcomes.
+
+        Regression guard for C4: legacy mixed win_rate combined ``win`` and
+        ``correct_wait`` and was therefore meaningless for entry-quality
+        decisions.
+        """
+        from src.backtest.aggregators.group_summary_aggregator import GroupSummaryAggregator
+        from src.backtest.repositories.evaluation_repo import EvaluationRepository
+        from src.backtest.repositories.summary_repo import SummaryRepository
+
+        agg = GroupSummaryAggregator(EvaluationRepository(self.db), SummaryRepository(self.db))
+        summaries = agg.compute_all_summaries("run-agg")
+        overall = next(s for s in summaries if s.group_type == "overall" and s.group_key == "all")
+
+        metrics = json.loads(overall.metrics_json)
+        # Seeded entries: one win + one loss → 50% entry win_rate
+        self.assertAlmostEqual(metrics["family_breakdown"]["entry"]["win_rate_pct"], 50.0)
+        # Seeded observations: one correct_wait + one missed_opportunity
+        # → 50% correct-wait rate, NOT mixed with entry's "win" outcomes
+        self.assertAlmostEqual(metrics["family_breakdown"]["observation"]["win_rate_pct"], 50.0)
+
+    def test_family_breakdown_entry_profit_factor_uses_entry_returns_only(self):
+        """family_breakdown.entry.profit_factor must use only entry's
+        forward_return_5d, never observation's risk_avoided_pct.
+
+        Regression guard for C5: profit_factor only makes sense for realised
+        directional pnl; mixing observation's "risk avoided" inflates it.
+        """
+        from src.backtest.aggregators.group_summary_aggregator import GroupSummaryAggregator
+        from src.backtest.repositories.evaluation_repo import EvaluationRepository
+        from src.backtest.repositories.summary_repo import SummaryRepository
+
+        agg = GroupSummaryAggregator(EvaluationRepository(self.db), SummaryRepository(self.db))
+        summaries = agg.compute_all_summaries("run-agg")
+        overall = next(s for s in summaries if s.group_type == "overall" and s.group_key == "all")
+
+        metrics = json.loads(overall.metrics_json)
+        # Seeded entry returns: +5.0 and -2.0 → profit_factor = 5.0/2.0 = 2.5
+        self.assertAlmostEqual(metrics["family_breakdown"]["entry"]["profit_factor"], 2.5)
+
     def test_strategy_cohort_summaries_use_primary_strategy_and_sample_bucket(self):
         """Strategy cohort rows should group by primary strategy, bucket and snapshot context."""
         from src.backtest.aggregators.group_summary_aggregator import GroupSummaryAggregator

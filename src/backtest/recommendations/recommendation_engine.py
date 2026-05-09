@@ -30,7 +30,12 @@ from src.backtest.recommendations.evidence_builder import EvidenceBuilder
 from src.backtest.repositories.evaluation_repo import EvaluationRepository
 from src.backtest.repositories.recommendation_repo import RecommendationRepository
 from src.backtest.repositories.summary_repo import SummaryRepository
-from src.backtest.utils.summary_metrics import get_aggregatable_sample_count
+from src.backtest.utils.summary_metrics import (
+    compute_family_share,
+    get_aggregatable_sample_count,
+    get_sample_baseline,
+    load_summary_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +45,24 @@ TIME_BUCKET_STABILITY_MAX = 0.15   # max stddev of bucket win rates
 EXTREME_SAMPLE_RATIO_MAX = 0.10    # max fraction of extreme outliers
 WIN_RATE_STRONG_THRESHOLD = 60.0   # win_rate above this = strong signal
 WIN_RATE_WEAK_THRESHOLD = 40.0     # win_rate below this = weak signal
+
+# D4: family-share confidence penalties.
+#
+# When the recommendation inference is anchored on a family that is the
+# minority slice of the group (e.g. an entry-family inference on a group
+# that is 80 % observation samples), the headline numbers become much less
+# reliable and confidence must be discounted accordingly. Two thresholds:
+#
+# * ``FAMILY_SHARE_STRICT_MIN`` (50 %) — below this, the inferring family
+#   is no longer the dominant population. Apply a meaningful penalty.
+# * ``FAMILY_SHARE_HARD_MIN`` (20 %) — below this, the inferring family is
+#   a small minority and confidence must be heavily discounted regardless
+#   of stability/consistency results.
+FAMILY_SHARE_STRICT_MIN = 0.50
+FAMILY_SHARE_HARD_MIN = 0.20
+FAMILY_SHARE_PENALTY_STRICT = 0.10
+FAMILY_SHARE_PENALTY_HARD = 0.20
+FAMILY_SHARE_DOMINANT_BONUS = 0.05
 
 
 @dataclass
@@ -55,6 +78,16 @@ class RecommendationDraft:
     threshold_result: ThresholdResult
     stability_passed: bool
     consistency_passed: bool
+    # Which subset of the summary the recommendation was derived from.
+    # ``entry`` and ``observation`` come from family_breakdown[family];
+    # ``mixed`` falls back to the legacy mixed-family fields (only used for
+    # ``signal_family`` rows that are themselves single-family).
+    family_scope: str
+    inference_metrics: Dict[str, Any]
+    # D4: structured snapshot of how each family contributes to this group.
+    # Used by ``_compute_confidence`` to discount recommendations whose
+    # inferring family is a minority slice of the group's actual sample mix.
+    family_share: Dict[str, Any]
 
 
 class RecommendationEngine:
@@ -128,21 +161,49 @@ class RecommendationEngine:
         self,
         summary: FiveLayerBacktestGroupSummary,
     ) -> Optional[RecommendationDraft]:
-        """Evaluate a single group summary for recommendation potential."""
+        """Evaluate a single group summary for recommendation potential.
+
+        Inference metrics (win_rate / avg_return) are pulled from
+        ``family_breakdown[family]`` whenever it is available, because the
+        legacy mixed-family ``summary.win_rate_pct`` averages
+        ``forward_return_5d`` (entry) with ``risk_avoided_pct`` (observation)
+        — that mixed number is unsafe for "increase weight" / "decrease weight"
+        recommendations. Falls back to the mixed fields only for groups that
+        are themselves single-family (``signal_family``).
+        """
         threshold = SampleThresholdGate.check(get_aggregatable_sample_count(summary))
         if not threshold.can_display:
             return None
 
-        # Determine recommendation type based on group performance
-        rec_type, current_rule, suggested_change = _infer_recommendation(summary)
+        family_scope, inference_metrics = _resolve_inference_source(summary)
+        if not inference_metrics:
+            return None
+
+        rec_type, current_rule, suggested_change = _infer_recommendation(
+            summary=summary,
+            family_scope=family_scope,
+            metrics=inference_metrics,
+        )
         if rec_type is None:
             return None
 
-        # Stability check
-        stability_passed = _check_stability(summary)
+        # Stability check now reads stability metrics from the same source as
+        # the recommendation inference (family-correct when family_breakdown
+        # is available, mixed summary fields otherwise). This closes the
+        # earlier asymmetry where inference used family-correct numbers but
+        # the gate validated against the mixed-pollued summary fields.
+        stability_passed = _check_stability(inference_metrics)
 
-        # Consistency check: win_rate and avg_return agree on direction
-        consistency_passed = _check_consistency(summary)
+        # Consistency uses the same family-correct numbers as inference so
+        # the gate doesn't accept a recommendation that is internally
+        # inconsistent at the family level.
+        consistency_passed = _check_consistency(inference_metrics)
+
+        # D4: snapshot the group's family share so confidence can discount
+        # recommendations whose inferring family is a minority slice. The
+        # snapshot is also forwarded to evidence_builder so reviewers see
+        # exactly the same numbers that drove confidence.
+        family_share = compute_family_share(summary)
 
         return RecommendationDraft(
             group_summary=summary,
@@ -154,6 +215,9 @@ class RecommendationEngine:
             threshold_result=threshold,
             stability_passed=stability_passed,
             consistency_passed=consistency_passed,
+            family_scope=family_scope,
+            inference_metrics=inference_metrics,
+            family_share=family_share,
         )
 
     def _build_recommendation(
@@ -182,17 +246,28 @@ class RecommendationEngine:
             group_summary=draft.group_summary,
             evaluations_sample=sample_evals,
             threshold_result=draft.threshold_result,
+            family_scope=draft.family_scope,
+            inference_metrics=draft.inference_metrics,
         )
 
         confidence = _compute_confidence(draft)
 
         summary = draft.group_summary
+        # ``metrics_before_json`` carries BOTH the mixed summary numbers
+        # (for backward compatibility) AND the family-correct numbers
+        # actually used to make the recommendation, so reviewers can compare
+        # the two without re-querying the summary table.
         metrics_snapshot = {
             "avg_return_pct": summary.avg_return_pct,
             "win_rate_pct": summary.win_rate_pct,
             "median_return_pct": summary.median_return_pct,
             "sample_count": summary.sample_count,
             "aggregatable_sample_count": get_aggregatable_sample_count(summary),
+            "family_scope": draft.family_scope,
+            "inference_metrics": draft.inference_metrics,
+            # D4: surface the family-share snapshot used by confidence so
+            # reviewers can audit the discount path without re-querying.
+            "family_share": draft.family_share,
         }
 
         return FiveLayerBacktestRecommendation(
@@ -237,10 +312,20 @@ def _determine_level(
     return None
 
 
-def _check_stability(summary: FiveLayerBacktestGroupSummary) -> bool:
-    """Check time-bucket stability and extreme sample ratio."""
-    tbs = summary.time_bucket_stability
-    esr = summary.extreme_sample_ratio
+def _check_stability(metrics: Dict[str, Any]) -> bool:
+    """Check time-bucket stability and extreme sample ratio.
+
+    Operates on a metrics dict (family-level when available, otherwise the
+    summary-level mixed fields exposed via :func:`_summary_metrics_to_dict`)
+    so the gate evaluates the same numerical surface that the recommendation
+    inference is anchored on. Without this alignment, a recommendation could
+    be inferred from family-correct ``win_rate``/``avg_return`` and then
+    accepted (or rejected) by stability metrics that average entry's
+    ``forward_return_5d`` with observation's ``risk_avoided_pct`` — the very
+    contamination ``family_breakdown`` was introduced to avoid.
+    """
+    tbs = metrics.get("time_bucket_stability")
+    esr = metrics.get("extreme_sample_ratio")
 
     if tbs is not None and tbs > TIME_BUCKET_STABILITY_MAX:
         return False
@@ -249,10 +334,15 @@ def _check_stability(summary: FiveLayerBacktestGroupSummary) -> bool:
     return True
 
 
-def _check_consistency(summary: FiveLayerBacktestGroupSummary) -> bool:
-    """Check that win_rate and avg_return agree on direction."""
-    wr = summary.win_rate_pct
-    ar = summary.avg_return_pct
+def _check_consistency(metrics: Dict[str, Any]) -> bool:
+    """Check that win_rate and avg_return agree on direction.
+
+    Operates on a metrics dict (family-level when available, otherwise the
+    summary-level mixed fields) so consistency is evaluated against the same
+    source the recommendation type was inferred from.
+    """
+    wr = metrics.get("win_rate_pct")
+    ar = metrics.get("avg_return_pct")
     if wr is None or ar is None:
         return False
 
@@ -266,19 +356,25 @@ def _check_consistency(summary: FiveLayerBacktestGroupSummary) -> bool:
 
 def _infer_recommendation(
     summary: FiveLayerBacktestGroupSummary,
+    family_scope: str,
+    metrics: Dict[str, Any],
 ) -> tuple:
-    """Infer recommendation type from group summary metrics.
+    """Infer recommendation type from family-correct group metrics.
 
-    Returns (recommendation_type, current_rule, suggested_change)
-    or (None, None, None) if no recommendation warranted.
+    Returns (recommendation_type, current_rule, suggested_change) or
+    (None, None, None) when no recommendation is warranted.
+
+    ``family_scope`` is appended to the human-readable strings so reviewers
+    can immediately see which subset (entry / observation / mixed) the
+    suggestion is anchored on.
     """
-    wr = summary.win_rate_pct
-    ar = summary.avg_return_pct
+    wr = metrics.get("win_rate_pct")
+    ar = metrics.get("avg_return_pct")
 
     if wr is None or ar is None:
         return None, None, None
 
-    group_desc = f"{summary.group_type}={summary.group_key}"
+    group_desc = f"{summary.group_type}={summary.group_key} [{family_scope}]"
 
     if wr >= WIN_RATE_STRONG_THRESHOLD and ar > 0:
         return (
@@ -305,12 +401,92 @@ def _infer_recommendation(
     return None, None, None
 
 
+def _resolve_inference_source(
+    summary: FiveLayerBacktestGroupSummary,
+) -> tuple[str, Dict[str, Any]]:
+    """Pick the family-correct metrics dict to drive recommendation inference.
+
+    Priority:
+      1. ``signal_family`` rows are themselves single-family — use the mixed
+         summary fields directly with ``family_scope = group_key`` so the
+         recommendation correctly attributes "entry" vs "observation".
+      2. For any other group_type, prefer ``family_breakdown[entry]`` because
+         "increase weight" / "decrease weight" decisions are about tradable
+         entry signals; observation rows describe wait-correctness, which
+         ``execution_review`` semantics don't fit.
+      3. If only ``observation`` data exists, return that — recommendations
+         derived from observation will be inherently weaker (handled later
+         by the level/confidence gates).
+      4. As a last resort, fall back to the mixed summary fields and mark
+         ``family_scope = "mixed"`` so reviewers know not to trust the number.
+    """
+    metrics_payload = load_summary_metrics(summary)
+    family_breakdown = metrics_payload.get("family_breakdown") or {}
+
+    if summary.group_type == "signal_family":
+        scope = (summary.group_key or "mixed").strip().lower() or "mixed"
+        return scope, _summary_metrics_to_dict(summary)
+
+    if isinstance(family_breakdown, dict):
+        entry_metrics = family_breakdown.get("entry")
+        if isinstance(entry_metrics, dict) and entry_metrics.get("win_rate_pct") is not None:
+            return "entry", entry_metrics
+        observation_metrics = family_breakdown.get("observation")
+        if (
+            isinstance(observation_metrics, dict)
+            and observation_metrics.get("win_rate_pct") is not None
+        ):
+            return "observation", observation_metrics
+
+    return "mixed", _summary_metrics_to_dict(summary)
+
+
+def _summary_metrics_to_dict(summary: FiveLayerBacktestGroupSummary) -> Dict[str, Any]:
+    """Project the summary row's mixed-family columns into a metrics dict.
+
+    Used as the fallback metrics surface when :func:`_resolve_inference_source`
+    can't find a family_breakdown entry to use. ``time_bucket_stability`` and
+    ``extreme_sample_ratio`` are included so :func:`_check_stability` reads
+    the same underlying numerical source the recommendation inference came
+    from — see _check_stability for why this matters.
+    """
+    return {
+        "win_rate_pct": summary.win_rate_pct,
+        "avg_return_pct": summary.avg_return_pct,
+        "median_return_pct": summary.median_return_pct,
+        "profit_factor": summary.profit_factor,
+        "sample_count": summary.sample_count,
+        "time_bucket_stability": summary.time_bucket_stability,
+        "extreme_sample_ratio": summary.extreme_sample_ratio,
+    }
+
+
 def _compute_confidence(draft: RecommendationDraft) -> float:
-    """Compute confidence score from draft attributes."""
+    """Compute confidence score from draft attributes.
+
+    Base components (max 1.0):
+      * Sample size      0.0 – 0.4
+      * Stability        0.0 – 0.3
+      * Consistency      0.0 – 0.3
+
+    D4 family-share adjustment (max ±0.05 to ±-0.20):
+      * If family_share is unavailable (no family_breakdown payload) the
+        adjustment is skipped — the legacy mixed-family path is unchanged.
+      * If the inferring family dominates the group (share ≥ 50 %), apply
+        a small bonus to acknowledge the recommendation is anchored on the
+        majority population.
+      * If the inferring family is below 50 % share, apply a strict penalty.
+      * If the inferring family is below 20 % share, apply a hard penalty
+        that survives even the strongest sample/stability scores. This is
+        the family equivalent of the aggregatable-ratio downgrade the
+        SystemGrader already applies for compressed samples.
+
+    Penalties skip ``signal_family`` rows because those are single-family
+    by construction and ``family_share`` is not meaningful there.
+    """
     score = 0.0
     t = draft.threshold_result
 
-    # Sample size contribution (0-0.4)
     if t.can_action:
         score += 0.4
     elif t.can_suggest:
@@ -318,15 +494,60 @@ def _compute_confidence(draft: RecommendationDraft) -> float:
     elif t.can_display:
         score += 0.1
 
-    # Stability contribution (0-0.3)
     if draft.stability_passed:
         score += 0.3
 
-    # Consistency contribution (0-0.3)
     if draft.consistency_passed:
         score += 0.3
 
-    return min(score, 1.0)
+    score += _family_share_confidence_adjustment(
+        draft.family_scope,
+        draft.family_share,
+        draft.target_scope,
+    )
+
+    # Clamp to [0, 1] — penalties can drag a borderline recommendation
+    # below zero in pathological cases.
+    return max(0.0, min(score, 1.0))
+
+
+def _family_share_confidence_adjustment(
+    family_scope: str,
+    family_share: Dict[str, Any],
+    target_scope: str,
+) -> float:
+    """Return the family-share-driven confidence delta for a draft.
+
+    Pure function so it can be unit-tested independently of the engine.
+    See :func:`_compute_confidence` for the threshold semantics.
+    """
+    if target_scope == "signal_family":
+        # signal_family rows are themselves single-family — no meaningful
+        # share to evaluate.
+        return 0.0
+    if not family_share or not family_share.get("available"):
+        return 0.0
+
+    # ``mixed`` inferences mean the engine couldn't anchor on a specific
+    # family — apply a mild penalty regardless of the dominant share, since
+    # the recommendation is built on contaminated numbers.
+    if family_scope == "mixed":
+        return -FAMILY_SHARE_PENALTY_STRICT
+
+    inferring_share: Optional[float] = None
+    if family_scope == "entry":
+        inferring_share = family_share.get("entry_share")
+    elif family_scope == "observation":
+        inferring_share = family_share.get("observation_share")
+
+    if inferring_share is None:
+        return 0.0
+
+    if inferring_share < FAMILY_SHARE_HARD_MIN:
+        return -FAMILY_SHARE_PENALTY_HARD
+    if inferring_share < FAMILY_SHARE_STRICT_MIN:
+        return -FAMILY_SHARE_PENALTY_STRICT
+    return FAMILY_SHARE_DOMINANT_BONUS
 
 
 def _group_type_to_field(group_type: str) -> Optional[str]:

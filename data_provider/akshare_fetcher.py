@@ -152,6 +152,19 @@ def is_hk_stock_code(stock_code: str) -> bool:
     return _is_hk_code(stock_code)
 
 
+def _is_adj_factor_fetch_enabled() -> bool:
+    """B6 (3a): opt-in switch for the dual-fetch adj_factor enrichment.
+
+    Disabled by default because it doubles the akshare API call count per
+    stock fetch and therefore doubles the rate-limiting / ban exposure.
+    Set ``AKSHARE_FETCH_ADJ_FACTOR=true`` in the environment to enable.
+    Once enabled, every cn-stock fetch will pull both qfq and raw prices
+    and stamp the per-row ``adj_factor``.
+    """
+    raw = os.getenv("AKSHARE_FETCH_ADJ_FACTOR", "false").strip().lower()
+    return raw in {"true", "1", "yes", "on"}
+
+
 def _is_us_code(stock_code: str) -> bool:
     """
     判断代码是否为美股股票（不包括美股指数）。
@@ -428,6 +441,17 @@ class AkshareFetcher(BaseFetcher):
         1. 优先尝试东方财富接口 (ak.stock_zh_a_hist)
         2. 失败后尝试新浪财经接口 (ak.stock_zh_a_daily)
         3. 最后尝试腾讯财经接口 (ak.stock_zh_a_hist_tx)
+
+        B6 (3a) enrichment:
+        Once the qfq DataFrame is in hand, optionally call the same fetcher
+        a SECOND time with ``adjust=""`` to retrieve raw (non-adjusted)
+        prices, then compute ``adj_factor = qfq_close / raw_close`` per
+        row and stamp ``adj_factor_source='akshare_qfq_div_raw'``. This
+        doubles the API calls per fetch and therefore is OPT-IN via the
+        env knob ``AKSHARE_FETCH_ADJ_FACTOR=true``. When disabled (default)
+        the qfq DataFrame is returned unchanged and the storage layer
+        records ``adj_factor=1.0`` / ``adj_factor_source='fetcher_unset'``
+        so the backtest layer can detect "this row's qfq base may drift".
         """
         # 尝试列表
         methods = [
@@ -445,6 +469,24 @@ class AkshareFetcher(BaseFetcher):
 
                 if df is not None and not df.empty:
                     logger.info(f"[数据源] {source_name} 获取成功")
+                    # B6 (3a): opt-in adj_factor enrichment. Failure here
+                    # is non-fatal — the qfq DataFrame is still usable;
+                    # we just lose the adj_factor stamp on this batch.
+                    if _is_adj_factor_fetch_enabled():
+                        try:
+                            df = self._enrich_with_adj_factor(
+                                qfq_df=df,
+                                stock_code=stock_code,
+                                start_date=start_date,
+                                end_date=end_date,
+                                source_name=source_name,
+                            )
+                        except Exception as enrich_exc:  # noqa: BLE001
+                            logger.warning(
+                                "[B6] adj_factor enrichment failed for %s "
+                                "(via %s): %s — continuing with qfq only",
+                                stock_code, source_name, enrich_exc,
+                            )
                     return df
             except Exception as e:
                 last_error = e
@@ -454,10 +496,118 @@ class AkshareFetcher(BaseFetcher):
         # 所有都失败
         raise DataFetchError(f"Akshare 所有渠道获取失败: {last_error}")
 
-    def _fetch_stock_data_em(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    def _enrich_with_adj_factor(
+        self,
+        qfq_df: pd.DataFrame,
+        stock_code: str,
+        start_date: str,
+        end_date: str,
+        source_name: str,
+    ) -> pd.DataFrame:
+        """B6 (3a): fetch raw prices and append per-row adj_factor.
+
+        Strategy:
+          1. Re-call the same data source with ``adjust=""`` (raw prices).
+          2. Join on date → compute ``adj_factor = qfq_close / raw_close``
+             for each row. Both prices share the same date axis so the
+             join is 1:1 within the available overlap.
+          3. Stamp ``adj_anchor_date = end_date`` (the moment qfq was
+             anchored at fetch time) and ``adj_factor_source =
+             'akshare_qfq_div_raw'`` on every row.
+          4. Rows that fail to match get ``adj_factor=1.0`` and source
+             ``'akshare_qfq_div_raw_fallback'`` so the backtest layer can
+             distinguish "computed factor" from "missing match" later.
+        """
+        # Pick the same provider as the qfq fetch (best chance of matching
+        # date axes). Source mapping mirrors the methods list above.
+        raw_fetcher = {
+            "东方财富": self._fetch_stock_data_em,
+            "新浪财经": self._fetch_stock_data_sina,
+            "腾讯财经": self._fetch_stock_data_tx,
+        }.get(source_name, self._fetch_stock_data_em)
+
+        raw_df = raw_fetcher(stock_code, start_date, end_date, adjust="")
+        if raw_df is None or raw_df.empty:
+            logger.info(
+                "[B6] raw fetch returned no rows for %s (via %s); skipping enrich",
+                stock_code, source_name,
+            )
+            return qfq_df
+
+        # ── Find (date, close) on both sides and join ─────────────────
+        # Akshare returns Chinese column names by default; sina path may
+        # already have rebuilt the columns to Chinese in fetch_stock_data_sina.
+        # Use a tolerant getter so the enrichment works with either layout.
+        def _date_col(df: pd.DataFrame) -> Optional[str]:
+            for cand in ("日期", "date"):
+                if cand in df.columns:
+                    return cand
+            return None
+
+        def _close_col(df: pd.DataFrame) -> Optional[str]:
+            for cand in ("收盘", "close"):
+                if cand in df.columns:
+                    return cand
+            return None
+
+        qfq_date_col = _date_col(qfq_df)
+        qfq_close_col = _close_col(qfq_df)
+        raw_date_col = _date_col(raw_df)
+        raw_close_col = _close_col(raw_df)
+        if not all([qfq_date_col, qfq_close_col, raw_date_col, raw_close_col]):
+            logger.warning(
+                "[B6] cannot locate date/close columns for adj_factor join "
+                "(qfq cols=%s, raw cols=%s); skipping enrich",
+                list(qfq_df.columns), list(raw_df.columns),
+            )
+            return qfq_df
+
+        # Align dates as strings to dodge dtype mismatches across providers.
+        qfq_dates = qfq_df[qfq_date_col].astype(str)
+        raw_dates = raw_df[raw_date_col].astype(str)
+        raw_close_by_date = dict(zip(raw_dates, raw_df[raw_close_col]))
+
+        adj_factors: list[float] = []
+        sources: list[str] = []
+        for qfq_close, qfq_date in zip(qfq_df[qfq_close_col], qfq_dates):
+            raw_close = raw_close_by_date.get(qfq_date)
+            if (
+                raw_close is None or pd.isna(raw_close)
+                or pd.isna(qfq_close) or raw_close == 0
+            ):
+                adj_factors.append(1.0)
+                sources.append("akshare_qfq_div_raw_fallback")
+            else:
+                adj_factors.append(float(qfq_close) / float(raw_close))
+                sources.append("akshare_qfq_div_raw")
+
+        out = qfq_df.copy()
+        out["adj_factor"] = adj_factors
+        out["adj_factor_source"] = sources
+        # ``end_date`` is the moment we anchored qfq at — record it so the
+        # backtest layer can detect drift across reruns.
+        out["adj_anchor_date"] = end_date
+        logger.info(
+            "[B6] adj_factor enrichment OK for %s: %d rows stamped (via %s)",
+            stock_code, len(out), source_name,
+        )
+        return out
+
+    def _fetch_stock_data_em(
+        self,
+        stock_code: str,
+        start_date: str,
+        end_date: str,
+        adjust: str = "qfq",
+    ) -> pd.DataFrame:
         """
         获取普通 A 股历史数据 (东方财富)
         数据来源：ak.stock_zh_a_hist()
+
+        ``adjust`` defaults to ``"qfq"`` (前复权) to preserve the legacy
+        behaviour. Pass ``adjust=""`` to fetch raw (non-adjusted) prices —
+        used by B6 (3a) when ``AKSHARE_FETCH_ADJ_FACTOR=true`` so the
+        fetcher can compute ``adj_factor = qfq_close / raw_close``.
         """
         import akshare as ak
 
@@ -467,7 +617,9 @@ class AkshareFetcher(BaseFetcher):
         # 防封禁策略 2: 强制休眠
         self._enforce_rate_limit()
 
-        logger.info(f"[API调用] ak.stock_zh_a_hist(symbol={stock_code}, ...)")
+        logger.info(
+            f"[API调用] ak.stock_zh_a_hist(symbol={stock_code}, adjust={adjust!r}, ...)"
+        )
 
         try:
             import time as _time
@@ -478,7 +630,7 @@ class AkshareFetcher(BaseFetcher):
                 period="daily",
                 start_date=start_date.replace('-', ''),
                 end_date=end_date.replace('-', ''),
-                adjust="qfq"
+                adjust=adjust,
             )
 
             api_elapsed = _time.time() - api_start
@@ -496,10 +648,19 @@ class AkshareFetcher(BaseFetcher):
                 raise RateLimitError(f"Akshare(EM) 可能被限流: {e}") from e
             raise e
 
-    def _fetch_stock_data_sina(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    def _fetch_stock_data_sina(
+        self,
+        stock_code: str,
+        start_date: str,
+        end_date: str,
+        adjust: str = "qfq",
+    ) -> pd.DataFrame:
         """
         获取普通 A 股历史数据 (新浪财经)
         数据来源：ak.stock_zh_a_daily()
+
+        ``adjust`` defaults to ``"qfq"``; pass ``""`` to fetch raw prices
+        (B6 (3a) adj_factor enrichment).
         """
         import akshare as ak
 
@@ -513,7 +674,7 @@ class AkshareFetcher(BaseFetcher):
                 symbol=symbol,
                 start_date=start_date.replace('-', ''),
                 end_date=end_date.replace('-', ''),
-                adjust="qfq"
+                adjust=adjust,
             )
 
             # 标准化新浪数据列名
@@ -542,10 +703,19 @@ class AkshareFetcher(BaseFetcher):
         except Exception as e:
             raise e
 
-    def _fetch_stock_data_tx(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    def _fetch_stock_data_tx(
+        self,
+        stock_code: str,
+        start_date: str,
+        end_date: str,
+        adjust: str = "qfq",
+    ) -> pd.DataFrame:
         """
         获取普通 A 股历史数据 (腾讯财经)
         数据来源：ak.stock_zh_a_hist_tx()
+
+        ``adjust`` defaults to ``"qfq"``; pass ``""`` to fetch raw prices
+        (B6 (3a) adj_factor enrichment).
         """
         import akshare as ak
 
@@ -559,7 +729,7 @@ class AkshareFetcher(BaseFetcher):
                 symbol=symbol,
                 start_date=start_date.replace('-', ''),
                 end_date=end_date.replace('-', ''),
-                adjust="qfq"
+                adjust=adjust,
             )
 
             # 标准化腾讯数据列名
@@ -834,12 +1004,18 @@ class AkshareFetcher(BaseFetcher):
         
         # 添加股票代码列
         df['code'] = stock_code
-        
-        # 只保留需要的列
+
+        # 只保留需要的列 — 加上 B6 (3a) 的三个 adj_factor 字段（如果
+        # ``_enrich_with_adj_factor`` 已经在 df 上写过，就保留下去到
+        # save_daily_data 让 storage 层落库；否则三列不存在，下游会按
+        # ``fetcher_unset`` 默认处理）。
         keep_cols = ['code'] + STANDARD_COLUMNS
-        existing_cols = [col for col in keep_cols if col in df.columns]
+        b6_extra_cols = ['adj_factor', 'adj_factor_source', 'adj_anchor_date']
+        existing_cols = [col for col in keep_cols if col in df.columns] + [
+            c for c in b6_extra_cols if c in df.columns
+        ]
         df = df[existing_cols]
-        
+
         return df
     
     def get_realtime_quote(self, stock_code: str, source: str = "em") -> Optional[UnifiedRealtimeQuote]:

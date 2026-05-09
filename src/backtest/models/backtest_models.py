@@ -166,7 +166,16 @@ class FiveLayerBacktestEvaluation(Base):
     # ── Labels & outcome ─────────────────────────────────────────────────
     outcome = Column(String(16))
     stage_success = Column(Boolean)
-    eval_status = Column(String(16), default="pending")
+    eval_status = Column(String(16), default="pending")  # pending / evaluated / suppressed / error
+    # Why this row was not aggregatable (or why evaluation failed). Codes:
+    #   exec_not_filled:<fill_status>  – execution model rejected the entry
+    #   no_forward_bars                – missing forward OHLCV bars
+    #   invalid_hypothetical_price     – observation hypothetical price <= 0
+    #   exception:<ExceptionClass>     – evaluation raised an unexpected error
+    #   missing_forward_return_5d      – legacy fallback for old rows
+    #   missing_risk_avoided_pct       – legacy fallback for old rows
+    #   missing_primary_metric         – legacy fallback (unknown family)
+    suppression_reason = Column(String(64), index=True)
     evaluated_at = Column(DateTime)
 
     # ── JSON extension fields ────────────────────────────────────────────
@@ -232,6 +241,7 @@ class FiveLayerBacktestEvaluation(Base):
             "outcome": self.outcome,
             "stage_success": self.stage_success,
             "eval_status": self.eval_status,
+            "suppression_reason": self.suppression_reason,
             "evaluated_at": self.evaluated_at.isoformat() if self.evaluated_at else None,
             "metrics_json": self.metrics_json,
             "evidence_json": self.evidence_json,
@@ -259,7 +269,11 @@ class FiveLayerBacktestGroupSummary(Base):
     avg_mae = Column(Float)
     avg_mfe = Column(Float)
     avg_drawdown = Column(Float)
+    # ``top_k_hit_rate`` is a DEPRECATED alias preserved for old API consumers
+    # and dashboards. Always written together with ``leader_pool_win_share``
+    # by the aggregator. New code should read ``leader_pool_win_share``.
     top_k_hit_rate = Column(Float)
+    leader_pool_win_share = Column(Float)
     excess_return_pct = Column(Float)
     ranking_consistency = Column(Float)
     p25_return_pct = Column(Float)
@@ -296,6 +310,7 @@ class FiveLayerBacktestGroupSummary(Base):
             "avg_mfe": self.avg_mfe,
             "avg_drawdown": self.avg_drawdown,
             "top_k_hit_rate": self.top_k_hit_rate,
+            "leader_pool_win_share": self.leader_pool_win_share,
             "excess_return_pct": self.excess_return_pct,
             "ranking_consistency": self.ranking_consistency,
             "p25_return_pct": self.p25_return_pct,

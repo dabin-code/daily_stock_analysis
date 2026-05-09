@@ -216,9 +216,16 @@ class GroupSummaryAggregator:
                 "reason": threshold.reason,
             },
         }
-        family_breakdown = _build_family_breakdown(evaluations)
-        if len(family_breakdown) > 1:
-            extra["family_breakdown"] = family_breakdown
+        # Always expose family_breakdown for mixed-capable group types so
+        # downstream consumers can read family-correct metrics
+        # (avg_return_pct/win_rate_pct/profit_factor/stage_accuracy_rate) per
+        # signal_family without falling back to the legacy mixed fields.
+        # ``signal_family`` rows are themselves single-family — skip there to
+        # avoid a redundant nested object.
+        if group_type != "signal_family":
+            family_breakdown = _build_family_breakdown(evaluations)
+            if family_breakdown:
+                extra["family_breakdown"] = family_breakdown
         if group_type == "strategy_cohort":
             extra["strategy_cohort_context"] = _build_strategy_cohort_context(evaluations)
 
@@ -251,15 +258,36 @@ class GroupSummaryAggregator:
 
 def aggregate_group(
     evaluations: List[FiveLayerBacktestEvaluation],
+    family_filter: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Compute aggregate metrics for a group of evaluations.
 
-    Uses forward_return_5d as the primary return metric.
-    Returns None if no valid evaluations.
+    Args:
+        evaluations: candidate-level evaluation rows.
+        family_filter: when provided, only the matching ``signal_family`` rows
+            are aggregated. ``None`` keeps the legacy mixed-family behaviour
+            (kept for backward compatibility — read ``family_breakdown`` for
+            the family-aware metrics).
+
+    DEPRECATED MIX (family_filter=None):
+        ``avg_return_pct / win_rate_pct / profit_factor / stage_accuracy_rate``
+        below mix entry's forward_return_5d with observation's risk_avoided_pct
+        and combine ``win`` + ``correct_wait`` into the same numerator. They are
+        kept for legacy callers; new consumers MUST read the per-family metrics
+        from ``family_breakdown[family]`` instead, which uses the correct
+        per-family return source and outcome set.
+
+    Returns None if no evaluations.
     """
     raw_count = len(evaluations)
     if raw_count == 0:
         return None
+
+    if family_filter is not None:
+        evaluations = [e for e in evaluations if e.signal_family == family_filter]
+        if not evaluations:
+            return None
+        raw_count = len(evaluations)
 
     sample_baseline = _build_sample_baseline(evaluations)
 
@@ -267,13 +295,24 @@ def aggregate_group(
     valid = [e for e in evaluations if _is_aggregatable(e)]
     aggregatable_count = len(valid)
 
-    # Primary return: forward_return_5d for entry, risk_avoided_pct for observation
+    # Primary return source depends on which family we are aggregating.
+    # - family_filter='entry'      → only forward_return_5d (directional pnl)
+    # - family_filter='observation'→ only risk_avoided_pct (avoided drawdown)
+    # - family_filter=None         → legacy mix (forward_return_5d for entry,
+    #   risk_avoided_pct for observation), preserved for backward compatibility
     returns = []
     for e in valid:
-        if e.forward_return_5d is not None:
-            returns.append(e.forward_return_5d)
-        elif e.risk_avoided_pct is not None:
-            returns.append(e.risk_avoided_pct)
+        if family_filter == "entry":
+            if e.forward_return_5d is not None:
+                returns.append(e.forward_return_5d)
+        elif family_filter == "observation":
+            if e.risk_avoided_pct is not None:
+                returns.append(e.risk_avoided_pct)
+        else:
+            if e.forward_return_5d is not None:
+                returns.append(e.forward_return_5d)
+            elif e.risk_avoided_pct is not None:
+                returns.append(e.risk_avoided_pct)
 
     if not returns:
         return {
@@ -300,8 +339,18 @@ def aggregate_group(
     # Trade dates for stability
     trade_dates = [e.trade_date for e in valid if e.trade_date is not None]
 
-    # Win rate: "win" for entry, "correct_wait" for observation
-    _WIN_OUTCOMES = frozenset({"win", "correct_wait"})
+    # Win-outcome set depends on what family we are aggregating:
+    # - entry only:        winners are outcome=='win'
+    # - observation only:  winners are outcome=='correct_wait'
+    # - mixed (legacy):    union of both, kept for backward compatibility but
+    #                      cross-language ("win" and "correct_wait" mean
+    #                      different things). Prefer family_breakdown.
+    if family_filter == "entry":
+        _WIN_OUTCOMES = frozenset({"win"})
+    elif family_filter == "observation":
+        _WIN_OUTCOMES = frozenset({"correct_wait"})
+    else:
+        _WIN_OUTCOMES = frozenset({"win", "correct_wait"})
     win_count = sum(1 for e in valid if e.outcome in _WIN_OUTCOMES)
     win_rate = (win_count / aggregatable_count) * 100 if aggregatable_count > 0 else 0.0
 
@@ -416,6 +465,16 @@ def _build_sample_baseline(
 def _infer_suppression_reason(
     evaluation: FiveLayerBacktestEvaluation,
 ) -> str:
+    """Resolve the explanatory code for why an evaluation is non-aggregatable.
+
+    Prefers the ``suppression_reason`` column that the evaluators write
+    explicitly (E2). Falls back to inferring from the missing metric column
+    for legacy rows produced before the column existed.
+    """
+    persisted = getattr(evaluation, "suppression_reason", None)
+    if persisted:
+        return persisted
+
     signal_family = str(evaluation.signal_family or "").lower()
     if signal_family == "observation":
         return "missing_risk_avoided_pct"
@@ -470,11 +529,19 @@ def _group_by_combo(
 def _build_family_breakdown(
     evaluations: List[FiveLayerBacktestEvaluation],
 ) -> Dict[str, Dict[str, Any]]:
-    """Build entry/observation split metrics for mixed groups."""
+    """Build per-family metrics so mixed/legacy fields can be re-derived.
+
+    For each ``signal_family`` present in ``evaluations``, run
+    ``aggregate_group(..., family_filter=family)`` so that the per-family
+    metrics use the family-correct return source (forward_return_5d for entry,
+    risk_avoided_pct for observation) and outcome set (``win`` for entry,
+    ``correct_wait`` for observation), avoiding the cross-family contamination
+    that the legacy mixed metrics suffer from.
+    """
     grouped = _group_by_field(evaluations, "signal_family")
     breakdown: Dict[str, Dict[str, Any]] = {}
     for family, family_evals in grouped.items():
-        metrics = aggregate_group(family_evals)
+        metrics = aggregate_group(family_evals, family_filter=family)
         if metrics is not None:
             breakdown[family] = metrics
     return breakdown

@@ -169,6 +169,7 @@ def _mock_summary(group_type="overall", group_key="all"):
     s.avg_mfe = 5.0
     s.avg_drawdown = -2.0
     s.top_k_hit_rate = 0.7
+    s.leader_pool_win_share = 0.7
     s.excess_return_pct = 1.0
     s.ranking_consistency = 0.8
     s.p25_return_pct = -0.5
@@ -186,6 +187,7 @@ def _mock_summary(group_type="overall", group_key="all"):
         "avg_mfe": 5.0,
         "avg_drawdown": -2.0,
         "top_k_hit_rate": 0.7,
+        "leader_pool_win_share": 0.7,
         "excess_return_pct": 1.0,
         "ranking_consistency": 0.8,
         "p25_return_pct": -0.5,
@@ -250,9 +252,10 @@ def _mock_ranking_report():
             ),
         ],
         overall_effectiveness_ratio=0.75,
-        top_k_hit_rate=0.6,
+        leader_pool_win_share=0.6,
         excess_return_pct=1.2,
         ranking_consistency=0.8,
+        top_k_hit_rate=0.6,
     )
 
 
@@ -390,6 +393,8 @@ class TestGetSummaries:
         assert len(data["items"]) == 1
         assert data["items"][0]["group_type"] == "overall"
         assert data["items"][0]["top_k_hit_rate"] == 0.7
+        # D2: canonical name is now exposed alongside the legacy alias.
+        assert data["items"][0]["leader_pool_win_share"] == 0.7
         assert data["items"][0]["profit_factor"] == 1.8
 
     @patch("api.v1.endpoints.five_layer_backtest.FiveLayerBacktestService")
@@ -420,6 +425,13 @@ class TestGetRankingEffectiveness:
         data = resp.json()
         assert data["overall_effectiveness_ratio"] == 0.75
         assert data["comparisons"][0]["tier_high"] == "HIGH"
+        # D2: both leader_pool_win_share (canonical) and top_k_hit_rate
+        # (deprecated alias) must be exposed and carry the same value so
+        # legacy and new clients both keep working through the deprecation
+        # window.
+        assert data["leader_pool_win_share"] == 0.6
+        assert data["top_k_hit_rate"] == 0.6
+        assert data["leader_pool_win_share"] == data["top_k_hit_rate"]
 
 
 class TestGetCalibration:

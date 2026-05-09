@@ -100,11 +100,32 @@ class StockDaily(Base):
     
     # 数据来源
     data_source = Column(String(50))  # 记录数据来源（如 AkshareFetcher）
-    
+
+    # ── B6: forward-adjustment factor anchoring ──────────────────────
+    # qfq (前复权) prices in OHLC are anchored at the *fetch* moment by
+    # default, which means a送股/分红 happening AFTER fetch silently
+    # rewrites historical bars and breaks backtest reproducibility.
+    # ``adj_factor`` records the factor that was applied at fetch time
+    # so the backtest layer can re-normalise prices to a fixed anchor
+    # (3b will start consuming this; 3a only persists it).
+    #
+    # Semantics:
+    #   raw_price = qfq_price / adj_factor
+    #   adj_factor = 1.0 means "no adjustment applied" (or unknown)
+    #   adj_anchor_date is the date the qfq base was anchored to
+    #   adj_factor_source records how the value was derived:
+    #     - "akshare_qfq_div_raw" — computed from a second non-adjusted fetch
+    #     - "tushare_native"      — pulled directly from a provider that exposes it
+    #     - "legacy_assume_one"   — backfilled by migration for pre-B6 rows
+    #     - "fetcher_unset"       — fetcher did not supply a value (defaults to 1.0)
+    adj_factor = Column(Float, nullable=True)
+    adj_anchor_date = Column(Date, nullable=True)
+    adj_factor_source = Column(String(32), nullable=True, index=True)
+
     # 更新时间
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
-    
+
     # 唯一约束：同一股票同一日期只能有一条数据
     __table_args__ = (
         UniqueConstraint('code', 'date', name='uix_code_date'),
@@ -131,6 +152,9 @@ class StockDaily(Base):
             'ma20': self.ma20,
             'volume_ratio': self.volume_ratio,
             'data_source': self.data_source,
+            'adj_factor': self.adj_factor,
+            'adj_anchor_date': self.adj_anchor_date,
+            'adj_factor_source': self.adj_factor_source,
         }
 
 
@@ -844,7 +868,14 @@ class ScreeningCandidate(Base):
     theme_position = Column(String(32), nullable=True)
     candidate_pool_level = Column(String(32), nullable=True)
     trade_plan_json = Column(Text, nullable=True)
+    # ``created_at`` is the FIRST time this (run_id, code) pair was persisted.
+    # ``updated_at`` is the LATEST persistence time. They diverge when a
+    # candidate is re-saved (e.g. AI re-screening, manual rerun) — backtest
+    # consumers can compare ``updated_at`` against backtest_run.started_at to
+    # detect whether the row was rewritten after the backtest snapshot was
+    # supposed to be frozen (A4 lite: visibility instead of immutable table).
     created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, index=True)
 
     __table_args__ = (
         UniqueConstraint("run_id", "code", name="uix_screening_candidate_run_code"),
@@ -878,6 +909,7 @@ class ScreeningCandidate(Base):
             "candidate_pool_level": self.candidate_pool_level,
             "trade_plan": json.loads(self.trade_plan_json) if self.trade_plan_json else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
         if self.candidate_decision_json:
             try:
@@ -1270,8 +1302,10 @@ class DatabaseManager:
                 self._migrate_sqlite_screening_candidates_decision_fields()
                 self._migrate_sqlite_screening_candidates_strategy_fields()
                 self._migrate_sqlite_screening_candidates_ai_review_fields()
+                self._migrate_sqlite_screening_candidates_updated_at_field()
                 self._migrate_sqlite_daily_sector_heat_rank_fields()
                 self._migrate_sqlite_five_layer_backtest_group_summary_fields()
+                self._migrate_sqlite_stock_daily_adj_factor_fields()
         except Exception as exc:
             logger.exception("Inline database migration failed: %s", exc)
             raise
@@ -1362,6 +1396,98 @@ class DatabaseManager:
             )
             logger.info("Inline SQLite migration for last_activity_at completed")
 
+    def _migrate_sqlite_screening_candidates_updated_at_field(self) -> None:
+        """Ensure screening_candidates has the updated_at column on SQLite.
+
+        Back-fills ``updated_at = created_at`` so legacy rows present a stable
+        timestamp pair (created_at == updated_at means "never rewritten").
+        """
+        with self._engine.begin() as conn:
+            existing = {
+                row[1]
+                for row in conn.exec_driver_sql(
+                    "PRAGMA table_info(screening_candidates)"
+                ).fetchall()
+            }
+            if "updated_at" in existing:
+                return
+
+            logger.info(
+                "Applying inline SQLite migration: adding updated_at to screening_candidates"
+            )
+            conn.exec_driver_sql(
+                "ALTER TABLE screening_candidates ADD COLUMN updated_at DATETIME"
+            )
+            conn.exec_driver_sql(
+                "UPDATE screening_candidates SET updated_at = created_at WHERE updated_at IS NULL"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_screening_candidates_updated_at "
+                "ON screening_candidates(updated_at)"
+            )
+            logger.info("Inline SQLite migration for updated_at completed")
+
+    def _migrate_sqlite_stock_daily_adj_factor_fields(self) -> None:
+        """B6: ensure stock_daily carries adj_factor / adj_anchor_date /
+        adj_factor_source on SQLite.
+
+        Pre-B6 rows are backfilled with ``adj_factor=1.0`` and
+        ``adj_factor_source='legacy_assume_one'`` so the backtest layer
+        can detect "this row's qfq base is unknown and may drift" without
+        crashing on NULL. New rows from updated fetchers will carry the
+        true factor; old rows stay at 1.0 (lossy but stable — see
+        scripts/migrate_stock_daily_adj_factor.py for a verbose offline
+        migration path).
+        """
+        with self._engine.begin() as conn:
+            existing = {
+                row[1]
+                for row in conn.exec_driver_sql(
+                    "PRAGMA table_info(stock_daily)"
+                ).fetchall()
+            }
+            added: List[str] = []
+            if "adj_factor" not in existing:
+                conn.exec_driver_sql(
+                    "ALTER TABLE stock_daily ADD COLUMN adj_factor FLOAT"
+                )
+                added.append("adj_factor")
+            if "adj_anchor_date" not in existing:
+                conn.exec_driver_sql(
+                    "ALTER TABLE stock_daily ADD COLUMN adj_anchor_date DATE"
+                )
+                added.append("adj_anchor_date")
+            if "adj_factor_source" not in existing:
+                conn.exec_driver_sql(
+                    "ALTER TABLE stock_daily ADD COLUMN adj_factor_source VARCHAR(32)"
+                )
+                added.append("adj_factor_source")
+
+            if not added:
+                return
+
+            logger.info(
+                "Applying inline SQLite migration: added %s to stock_daily",
+                ", ".join(added),
+            )
+            # Backfill pre-B6 rows so callers can rely on adj_factor being
+            # non-NULL. ``legacy_assume_one`` is intentionally distinct
+            # from ``fetcher_unset`` so analysts can audit how much of the
+            # corpus pre-dates B6.
+            if "adj_factor" in added:
+                conn.exec_driver_sql(
+                    "UPDATE stock_daily SET adj_factor = 1.0 WHERE adj_factor IS NULL"
+                )
+            if "adj_factor_source" in added:
+                conn.exec_driver_sql(
+                    "UPDATE stock_daily SET adj_factor_source = 'legacy_assume_one' "
+                    "WHERE adj_factor_source IS NULL"
+                )
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_stock_daily_adj_factor_source "
+                    "ON stock_daily(adj_factor_source)"
+                )
+
     def _migrate_sqlite_screening_candidates_strategy_fields(self) -> None:
         """Ensure screening_candidates keeps matched strategy names on SQLite."""
         with self._engine.begin() as conn:
@@ -1432,7 +1558,13 @@ class DatabaseManager:
                 "plan_execution_rate": "ALTER TABLE five_layer_backtest_group_summaries ADD COLUMN plan_execution_rate FLOAT",
                 "stage_accuracy_rate": "ALTER TABLE five_layer_backtest_group_summaries ADD COLUMN stage_accuracy_rate FLOAT",
                 "system_grade": "ALTER TABLE five_layer_backtest_group_summaries ADD COLUMN system_grade VARCHAR(4)",
+                # D2: leader_pool_win_share replaces the misnamed top_k_hit_rate.
+                # Old column is kept (above) as a deprecated alias; this new
+                # column is the canonical one. Backfilled from top_k_hit_rate
+                # below when it already had data.
+                "leader_pool_win_share": "ALTER TABLE five_layer_backtest_group_summaries ADD COLUMN leader_pool_win_share FLOAT",
             }
+            added_columns: List[str] = []
             for col_name, ddl in new_columns.items():
                 if col_name not in existing:
                     logger.info(
@@ -1440,6 +1572,21 @@ class DatabaseManager:
                         col_name,
                     )
                     conn.exec_driver_sql(ddl)
+                    added_columns.append(col_name)
+
+            # If the alias column was just introduced, backfill from the legacy
+            # top_k_hit_rate so existing summaries keep displaying the metric
+            # under both names without a re-run of the aggregator.
+            if "leader_pool_win_share" in added_columns and "top_k_hit_rate" in existing.union({"leader_pool_win_share"}):
+                logger.info(
+                    "Backfilling leader_pool_win_share from top_k_hit_rate on existing rows",
+                )
+                conn.exec_driver_sql(
+                    "UPDATE five_layer_backtest_group_summaries "
+                    "SET leader_pool_win_share = top_k_hit_rate "
+                    "WHERE leader_pool_win_share IS NULL "
+                    "AND top_k_hit_rate IS NOT NULL"
+                )
 
     def get_session(self) -> Session:
         """
@@ -2851,8 +2998,22 @@ class DatabaseManager:
             return result.rowcount > 0
 
     def save_screening_candidates(self, run_id: str, candidates: List[Dict[str, Any]]) -> int:
-        """批量保存筛选候选结果。"""
+        """批量保存筛选候选结果。
+
+        DELETE-then-INSERT 仍是默认语义（用于人工重跑同一 run_id 时清空旧
+        数据），但会优先保留 ``(run_id, code)`` 的**首次** ``created_at``
+        作为决策时刻锚点；本次写入的时间记录到 ``updated_at``。
+        backtest 侧可以据此检测候选是否在回测触发后被改写过（A4 lite）。
+        """
+        now = datetime.now()
         with self.session_scope() as session:
+            existing_first_seen: Dict[str, datetime] = {
+                row.code: row.created_at
+                for row in session.query(ScreeningCandidate)
+                .filter(ScreeningCandidate.run_id == run_id)
+                .all()
+                if row.created_at is not None
+            }
             session.execute(
                 delete(ScreeningCandidate).where(ScreeningCandidate.run_id == run_id)
             )
@@ -2922,7 +3083,11 @@ class DatabaseManager:
                         theme_position=item.get("theme_position"),
                         candidate_pool_level=item.get("candidate_pool_level"),
                         trade_plan_json=self._safe_json_dumps(item.get("trade_plan")) if item.get("trade_plan") is not None else None,
-                        created_at=datetime.now(),
+                        # Keep the first-ever insertion time as the
+                        # decision-time anchor; refresh updated_at on every
+                        # rewrite. See class docstring for ``ScreeningCandidate``.
+                        created_at=existing_first_seen.get(item["code"], now),
+                        updated_at=now,
                     )
                 )
 
@@ -3647,6 +3812,30 @@ class DatabaseManager:
                         )
                     ).scalar_one_or_none()
                     
+                    # B6: read forward-adjustment metadata from the row
+                    # if the fetcher provided it; otherwise default to
+                    # adj_factor=1.0 with source='fetcher_unset' so the
+                    # backtest layer can distinguish "not yet supplied" from
+                    # "legacy data backfilled by migration".
+                    adj_factor = row.get('adj_factor')
+                    if adj_factor is None or pd.isna(adj_factor):
+                        adj_factor = 1.0
+                        adj_factor_source = row.get('adj_factor_source') or 'fetcher_unset'
+                    else:
+                        adj_factor_source = row.get('adj_factor_source') or 'fetcher_provided'
+                    adj_anchor_date = row.get('adj_anchor_date')
+                    if isinstance(adj_anchor_date, str):
+                        try:
+                            adj_anchor_date = datetime.strptime(
+                                adj_anchor_date, '%Y-%m-%d'
+                            ).date()
+                        except ValueError:
+                            adj_anchor_date = None
+                    elif isinstance(adj_anchor_date, (datetime, pd.Timestamp)):
+                        adj_anchor_date = adj_anchor_date.date() if hasattr(
+                            adj_anchor_date, 'date'
+                        ) else adj_anchor_date
+
                     if existing:
                         # 更新现有记录
                         existing.open = row.get('open')
@@ -3661,6 +3850,9 @@ class DatabaseManager:
                         existing.ma20 = row.get('ma20')
                         existing.volume_ratio = row.get('volume_ratio')
                         existing.data_source = data_source
+                        existing.adj_factor = adj_factor
+                        existing.adj_anchor_date = adj_anchor_date
+                        existing.adj_factor_source = adj_factor_source
                         existing.updated_at = datetime.now()
                     else:
                         # 创建新记录
@@ -3679,6 +3871,9 @@ class DatabaseManager:
                             ma20=row.get('ma20'),
                             volume_ratio=row.get('volume_ratio'),
                             data_source=data_source,
+                            adj_factor=adj_factor,
+                            adj_anchor_date=adj_anchor_date,
+                            adj_factor_source=adj_factor_source,
                         )
                         session.add(record)
                         saved_count += 1

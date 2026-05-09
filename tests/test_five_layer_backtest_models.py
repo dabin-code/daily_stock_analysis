@@ -192,6 +192,7 @@ class TestFiveLayerBacktestModels(unittest.TestCase):
             group_key="all",
             sample_count=50,
             top_k_hit_rate=0.7,
+            leader_pool_win_share=0.7,
             excess_return_pct=1.0,
             ranking_consistency=0.8,
             p25_return_pct=-0.5,
@@ -209,6 +210,8 @@ class TestFiveLayerBacktestModels(unittest.TestCase):
         payload = summary.to_dict()
 
         self.assertEqual(payload["top_k_hit_rate"], 0.7)
+        # D2: canonical name must be exposed alongside the legacy alias.
+        self.assertEqual(payload["leader_pool_win_share"], 0.7)
         self.assertEqual(payload["excess_return_pct"], 1.0)
         self.assertEqual(payload["ranking_consistency"], 0.8)
         self.assertEqual(payload["p25_return_pct"], -0.5)

@@ -214,3 +214,36 @@ class TestEntrySignalEvaluator(unittest.TestCase):
         ]
         result = self._evaluate(100.0, bars)
         self.assertEqual(result.optimal_entry_timing, 1)
+
+    def test_outcome_is_none_when_window_immature_no_plan(self):
+        """When forward_return_5d is None and no TP/SL plan is provided,
+        outcome must be None (not 'loss').
+
+        Regression guard for C1 in the backtest defect list: the previous
+        ``(forward_return_5d or 0) > 0`` fallback silently labelled every
+        immature sample as a loss, systematically dragging entry win-rates
+        down and triggering false-positive recommendations.
+        """
+        bars = [
+            MockBar(date(2024, 1, 16), 100.0, 101.0, 99.0, 100.5),
+            MockBar(date(2024, 1, 17), 100.5, 102.0, 99.5, 101.0),
+        ]
+        result = self._evaluate(100.0, bars)
+
+        self.assertIsNone(result.forward_return_5d)
+        self.assertIsNone(result.plan_success)
+        self.assertIsNone(result.outcome)
+
+    def test_outcome_is_loss_when_5d_negative_no_plan(self):
+        """forward_return_5d<0 with no plan should still produce 'loss'."""
+        bars = [
+            MockBar(date(2024, 1, 16), 100.0, 100.0, 95.0, 96.0),
+            MockBar(date(2024, 1, 17), 96.0, 96.5, 92.0, 93.0),
+            MockBar(date(2024, 1, 18), 93.0, 94.0, 90.0, 91.0),
+            MockBar(date(2024, 1, 19), 91.0, 92.0, 88.0, 89.0),
+            MockBar(date(2024, 1, 20), 89.0, 90.0, 86.0, 87.0),
+        ]
+        result = self._evaluate(100.0, bars)
+        self.assertIsNotNone(result.forward_return_5d)
+        self.assertLess(result.forward_return_5d, 0)
+        self.assertEqual(result.outcome, "loss")

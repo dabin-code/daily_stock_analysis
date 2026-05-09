@@ -52,6 +52,7 @@ def _handle_get_run_summary(backtest_run_id: str) -> dict:
                 "avg_mae": s.avg_mae,
                 "avg_mfe": s.avg_mfe,
                 "top_k_hit_rate": s.top_k_hit_rate,
+                "leader_pool_win_share": s.leader_pool_win_share,
                 "excess_return_pct": s.excess_return_pct,
                 "ranking_consistency": s.ranking_consistency,
             }
@@ -110,6 +111,7 @@ def _handle_get_group_summary(
                 "avg_mae": s.avg_mae,
                 "avg_mfe": s.avg_mfe,
                 "top_k_hit_rate": s.top_k_hit_rate,
+                "leader_pool_win_share": s.leader_pool_win_share,
                 "excess_return_pct": s.excess_return_pct,
                 "ranking_consistency": s.ranking_consistency,
                 "p25_return_pct": s.p25_return_pct,

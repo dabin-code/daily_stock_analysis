@@ -147,6 +147,10 @@ class CandidateSelector:
             "name": candidate.name,
             "rank": candidate.rank,
             "rule_score": candidate.rule_score,
+            # A4 lite: expose first-seen vs latest-seen timestamps so
+            # backtest can detect candidates rewritten after the run started.
+            "candidate_created_at": candidate.created_at,
+            "candidate_updated_at": candidate.updated_at,
             # Five-layer snapshot fields
             "trade_stage": candidate.trade_stage,
             "setup_type": candidate.setup_type,

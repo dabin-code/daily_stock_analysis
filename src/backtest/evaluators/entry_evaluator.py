@@ -93,13 +93,19 @@ class EntrySignalEvaluator(BaseEvaluator):
         # holding_days: actual exit day (1-based) if TP/SL triggered, else full window
         actual_holding_days = (exit_bar_index + 1) if exit_bar_index is not None else len(forward_bars)
 
-        # outcome: align with plan_success when available, fallback to 5d return
+        # outcome: align with plan_success when available, fallback to 5d return.
+        # IMPORTANT: when forward_return_5d is None (window not mature, or returns
+        # un-computable), keep outcome=None instead of forcing "loss". The previous
+        # behaviour `(forward_return_5d or 0) > 0` silently labelled all immature
+        # samples as losses and systematically under-stated entry win rates.
         if plan_success is True:
             outcome = "win"
         elif plan_success is False:
             outcome = "loss"
+        elif forward_return_5d is not None:
+            outcome = "win" if forward_return_5d > 0 else "loss"
         else:
-            outcome = "win" if (forward_return_5d or 0) > 0 else "loss"
+            outcome = None
 
         return EvaluationResult(
             forward_return_1d=forward_return_1d,

@@ -92,6 +92,7 @@ def _make_summary(
     mock.p25_return_pct = p25_return_pct
     mock.p75_return_pct = p75_return_pct
     mock.top_k_hit_rate = None
+    mock.leader_pool_win_share = None
     mock.excess_return_pct = None
     mock.ranking_consistency = None
     mock.metrics_json = None
@@ -455,58 +456,92 @@ class TestRecommendationEngine(unittest.TestCase):
         level = _determine_level(threshold, stability_passed=True, consistency_passed=True)
         self.assertIsNone(level)
 
+    # NOTE: After Patch 2, _check_stability / _check_consistency operate on
+    # a metrics ``dict`` (so the gate reads from the same family-correct
+    # surface that drove the recommendation inference). After Step 6 (F1),
+    # _infer_recommendation also takes (summary, family_scope, metrics).
+    # The helpers below adapt the legacy summary mocks to the new surface.
+
+    @staticmethod
+    def _summary_to_metrics(summary):
+        return {
+            "win_rate_pct": summary.win_rate_pct,
+            "avg_return_pct": summary.avg_return_pct,
+            "median_return_pct": summary.median_return_pct,
+            "profit_factor": getattr(summary, "profit_factor", None),
+            "sample_count": summary.sample_count,
+            "time_bucket_stability": summary.time_bucket_stability,
+            "extreme_sample_ratio": summary.extreme_sample_ratio,
+        }
+
     def test_check_stability_passes(self):
         from src.backtest.recommendations.recommendation_engine import _check_stability
         summary = _make_summary(time_bucket_stability=0.08, extreme_sample_ratio=0.05)
-        self.assertTrue(_check_stability(summary))
+        self.assertTrue(_check_stability(self._summary_to_metrics(summary)))
 
     def test_check_stability_fails_on_high_tbs(self):
         from src.backtest.recommendations.recommendation_engine import _check_stability
         summary = _make_summary(time_bucket_stability=0.20, extreme_sample_ratio=0.05)
-        self.assertFalse(_check_stability(summary))
+        self.assertFalse(_check_stability(self._summary_to_metrics(summary)))
 
     def test_check_stability_fails_on_high_esr(self):
         from src.backtest.recommendations.recommendation_engine import _check_stability
         summary = _make_summary(time_bucket_stability=0.08, extreme_sample_ratio=0.15)
-        self.assertFalse(_check_stability(summary))
+        self.assertFalse(_check_stability(self._summary_to_metrics(summary)))
 
     def test_check_consistency_positive(self):
         from src.backtest.recommendations.recommendation_engine import _check_consistency
         summary = _make_summary(avg_return_pct=3.0, win_rate_pct=55.0)
-        self.assertTrue(_check_consistency(summary))
+        self.assertTrue(_check_consistency(self._summary_to_metrics(summary)))
 
     def test_check_consistency_negative(self):
         from src.backtest.recommendations.recommendation_engine import _check_consistency
         summary = _make_summary(avg_return_pct=-2.0, win_rate_pct=35.0)
-        self.assertTrue(_check_consistency(summary))
+        self.assertTrue(_check_consistency(self._summary_to_metrics(summary)))
 
     def test_check_consistency_fails_on_mismatch(self):
         from src.backtest.recommendations.recommendation_engine import _check_consistency
         summary = _make_summary(avg_return_pct=3.0, win_rate_pct=40.0)
-        self.assertFalse(_check_consistency(summary))
+        self.assertFalse(_check_consistency(self._summary_to_metrics(summary)))
 
     def test_infer_recommendation_strong_signal(self):
         from src.backtest.recommendations.recommendation_engine import _infer_recommendation
         summary = _make_summary(win_rate_pct=65.0, avg_return_pct=4.0)
-        rec_type, _, _ = _infer_recommendation(summary)
+        rec_type, _, _ = _infer_recommendation(
+            summary=summary,
+            family_scope="entry",
+            metrics=self._summary_to_metrics(summary),
+        )
         self.assertEqual(rec_type, "weight_increase")
 
     def test_infer_recommendation_weak_signal(self):
         from src.backtest.recommendations.recommendation_engine import _infer_recommendation
         summary = _make_summary(win_rate_pct=35.0, avg_return_pct=-3.0)
-        rec_type, _, _ = _infer_recommendation(summary)
+        rec_type, _, _ = _infer_recommendation(
+            summary=summary,
+            family_scope="entry",
+            metrics=self._summary_to_metrics(summary),
+        )
         self.assertEqual(rec_type, "weight_decrease")
 
     def test_infer_recommendation_execution_review(self):
         from src.backtest.recommendations.recommendation_engine import _infer_recommendation
         summary = _make_summary(win_rate_pct=55.0, avg_return_pct=-1.0)
-        rec_type, _, _ = _infer_recommendation(summary)
+        rec_type, _, _ = _infer_recommendation(
+            summary=summary,
+            family_scope="entry",
+            metrics=self._summary_to_metrics(summary),
+        )
         self.assertEqual(rec_type, "execution_review")
 
     def test_infer_recommendation_no_action(self):
         from src.backtest.recommendations.recommendation_engine import _infer_recommendation
         summary = _make_summary(win_rate_pct=50.0, avg_return_pct=1.0)
-        rec_type, _, _ = _infer_recommendation(summary)
+        rec_type, _, _ = _infer_recommendation(
+            summary=summary,
+            family_scope="entry",
+            metrics=self._summary_to_metrics(summary),
+        )
         self.assertIsNone(rec_type)
 
     def test_engine_has_no_config_write_imports(self):
