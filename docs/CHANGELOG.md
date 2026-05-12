@@ -66,6 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - L2 本地热点板块已改为排名驱动识别：`hot/warm` 不再由固定阈值切分，而是基于 `board_strength_score / board_strength_rank / percentile` 进行分桶；`stage` 与 `quality_flags` 改为解释性字段，并同步落库到 `daily_sector_heat`
 - `ma100_60min_combined` 策略的 MA100 突破语义修正：门控从“最近连续站上 MA100 的天数 ≤ 5”改为“最近一次真实上穿（前一日收盘 ≤ MA100、当日收盘 > MA100）发生在近 5 根 K 线内”，并新增 (1) 突破前背景过滤 `pre_breakout_below_ratio ≥ 0.6` 或 `pre_breakout_consecutive_below_bars ≥ 3`，(2) `|ma100_distance_pct| ≤ 6.0%` 硬距离门控。原 `ma100_breakout_days` 字段以“连续站上”语义保留在 factor 快照中供 `leader_score`、`stock_analyzer` 报告等按既有语义继续复用；新增 `ma100_bars_since_breakout` / `ma100_breakout_bar_index` / `ma100_pre_breakout_below_ratio` / `ma100_pre_breakout_consecutive_below_bars` 精准字段用于新门控
 - `ma100_low123_combined` 的低位 123 买点门控改为只接受两类最佳入场区：最新 K 线介于 P3-P2 之间，或最新 K 线刚突破 P2；突破后第 2 根及以后即使仍在旧的 3 根 K 线窗口内也会被标记为 `not_best_entry_zone` 并剔除。新增 `ma100_low123_entry_timing_score` / `ma100_low123_entry_zone` 字段，刚突破 P2 会获得额外入场时机加分，避免已远离 P2 的候选继续作为初始买点推荐
+- `bottom_divergence_double_breakout` 保留“双突破已确认”的原语义，新增 `bottom_divergence_actionable_entry` 作为主筛选买点门控：主策略仅接受 `price_down_macd_up` / `price_down_macd_flat` / `price_flat_macd_up` 三类底部反转形态，A/B 低点跨度限制为 10~60 根 K，并输出 `bottom_divergence_entry_zone` / `bottom_divergence_entry_timing_score` / `bottom_divergence_extended_pct` / `bottom_divergence_validation_status`。确认后已远离突破确认价的样本会标记为 `extended_not_entry`，不再作为底背离初始买点推荐
 
 ### Screening architecture consolidation
 

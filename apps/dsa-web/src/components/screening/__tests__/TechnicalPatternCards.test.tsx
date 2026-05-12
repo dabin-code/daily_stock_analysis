@@ -45,6 +45,18 @@ describe('extractTechnicalPatterns', () => {
 
       expect(patterns[0].hitReasons).toEqual([]);
     });
+
+    it('suppresses non-actionable bottom divergence cards', () => {
+      const snapshot: ScreeningFactorSnapshot = {
+        bottom_divergence_double_breakout: true,
+        bottom_divergence_actionable_entry: false,
+        bottom_divergence_validation_status: 'extended_not_entry',
+      };
+
+      const patterns = extractTechnicalPatterns(snapshot);
+
+      expect(patterns).toHaveLength(0);
+    });
   });
 
   describe('MA100+Low123 pattern', () => {

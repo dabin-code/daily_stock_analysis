@@ -801,16 +801,37 @@ class FactorService:
                 "bottom_divergence_horizontal_breakout": False,
                 "bottom_divergence_trendline_breakout": False,
                 "bottom_divergence_sync_breakout": False,
+                "bottom_divergence_actionable_entry": False,
                 "bottom_divergence_confirmation_days": None,
                 "bottom_divergence_hit_reasons": [],
                 "bottom_divergence_buy_points": [],
                 "bottom_divergence_exit_plan": None,
                 "bottom_divergence_buy_point_count": 0,
+                "bottom_divergence_valid_pattern": False,
+                "bottom_divergence_ab_bars": None,
+                "bottom_divergence_entry_zone": None,
+                "bottom_divergence_entry_timing_score": 0.0,
+                "bottom_divergence_extended_pct": None,
+                "bottom_divergence_validation_status": "insufficient_data",
             }
 
         result = BottomDivergenceBreakoutDetector.detect(group)
         state = result.get("state", "rejected")
         confirmation_days = FactorService._compute_bottom_divergence_confirmation_days(group, result)
+        entry_context = FactorService._compute_bottom_divergence_entry_context(
+            group=group,
+            detector_result=result,
+            confirmation_days=confirmation_days,
+        )
+        valid_pattern = result.get("pattern_code") in {
+            "price_down_macd_up",
+            "price_down_macd_flat",
+            "price_flat_macd_up",
+        }
+        is_actionable_breakout = state == "confirmed" and valid_pattern and entry_context["validation_status"] in {
+            "just_double_breakout",
+            "near_breakout_entry",
+        }
 
         return {
             "bottom_divergence_double_breakout": state == "confirmed",
@@ -827,6 +848,7 @@ class FactorService:
                 "trendline_breakout_confirmed", False
             ),
             "bottom_divergence_sync_breakout": result.get("double_breakout_sync", False),
+            "bottom_divergence_actionable_entry": is_actionable_breakout,
             "bottom_divergence_confirmation_days": confirmation_days,
             "bottom_divergence_hit_reasons": result.get("hit_reasons", []),
             "bottom_divergence_buy_points": result.get("buy_points", []),
@@ -834,6 +856,15 @@ class FactorService:
             "bottom_divergence_buy_point_count": len([
                 bp for bp in result.get("buy_points", []) if bp.get("triggered")
             ]),
+            "bottom_divergence_valid_pattern": valid_pattern,
+            "bottom_divergence_ab_bars": _bar_gap(
+                result.get("price_low_a"),
+                result.get("price_low_b"),
+            ),
+            "bottom_divergence_entry_zone": entry_context["entry_zone"],
+            "bottom_divergence_entry_timing_score": entry_context["entry_timing_score"],
+            "bottom_divergence_extended_pct": entry_context["extended_pct"],
+            "bottom_divergence_validation_status": entry_context["validation_status"],
         }
 
     @staticmethod
@@ -852,6 +883,55 @@ class FactorService:
             return max(latest_bar - int(confirmation_bar), 0)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _compute_bottom_divergence_entry_context(
+        group: pd.DataFrame,
+        detector_result: dict,
+        confirmation_days: Optional[int],
+    ) -> Dict[str, Any]:
+        """Classify whether a confirmed bottom-divergence breakout is still actionable."""
+        if detector_result.get("state") != "confirmed":
+            return {
+                "entry_zone": None,
+                "entry_timing_score": 0.0,
+                "extended_pct": None,
+                "validation_status": str(detector_result.get("state") or "rejected"),
+            }
+
+        entry_price = _safe_float(detector_result.get("entry_price"))
+        latest_close = _latest_close_value(group)
+        extended_pct = None
+        if entry_price is not None and latest_close is not None and entry_price > 0:
+            extended_pct = round((latest_close - entry_price) / entry_price * 100.0, 4)
+
+        if confirmation_days is None:
+            return {
+                "entry_zone": None,
+                "entry_timing_score": 0.0,
+                "extended_pct": extended_pct,
+                "validation_status": "missing_confirmation_bar",
+            }
+        if confirmation_days == 0:
+            return {
+                "entry_zone": "just_double_breakout",
+                "entry_timing_score": 1.0,
+                "extended_pct": extended_pct,
+                "validation_status": "just_double_breakout",
+            }
+        if extended_pct is not None and confirmation_days <= 3 and 0.0 <= extended_pct <= 10.0:
+            return {
+                "entry_zone": "near_breakout_entry",
+                "entry_timing_score": 0.7,
+                "extended_pct": extended_pct,
+                "validation_status": "near_breakout_entry",
+            }
+        return {
+            "entry_zone": "extended_not_entry",
+            "entry_timing_score": 0.0,
+            "extended_pct": extended_pct,
+            "validation_status": "extended_not_entry",
+        }
 
     @staticmethod
     def _compute_shrink_pullback_factors(group: pd.DataFrame) -> dict:
@@ -1191,6 +1271,27 @@ def _point_price(point: Any) -> Optional[float]:
     if np.isnan(value):
         return None
     return value
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    """Convert a scalar to float, returning None for invalid or NaN values."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if np.isnan(parsed):
+        return None
+    return parsed
+
+
+def _bar_gap(point_a: Any, point_b: Any) -> Optional[int]:
+    """Return bar distance between two detector point dicts."""
+    if not isinstance(point_a, dict) or not isinstance(point_b, dict):
+        return None
+    try:
+        return int(point_b.get("idx")) - int(point_a.get("idx"))
+    except (TypeError, ValueError):
+        return None
 
 
 def _build_ma100_low123_hit_reasons(

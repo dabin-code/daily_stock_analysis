@@ -153,6 +153,7 @@ python scripts/approve_kline_skip.py --market cn --code 000001 --from-date 2026-
 - OpenClaw 热点题材触发的 `extreme_strength_combo` 现在会固定走策略引擎，按请求 `trade_date` 执行，并结合个股所属板块做热点题材硬门槛匹配
 - L2 本地热点板块识别已从“绝对综合分 + 固定阈值”切换为“市场相对排名驱动”：`hot/warm` 由 `board_strength_score / board_strength_rank / percentile` 决定，`stage` 与 `quality_flags` 仅负责生命周期解释和主线优先级排序
 - `ma100_low123_combined` 只把最新 K 线位于 P3-P2 之间，或最新 K 线刚突破 P2 的低位 123 结构视为最佳入场区；突破后已走远的候选会被剔除，刚突破 P2 会通过 `ma100_low123_entry_timing_score` 获得额外加分
+- `bottom_divergence_double_breakout` 保留“双突破已确认”语义，并新增 `bottom_divergence_actionable_entry` 作为买点门控；主策略只接受真正底部反转类底背离，且要求双突破仍处在刚确认或贴近确认价的入场窗口，已明显远离确认价的候选会标记为 `extended_not_entry`
 - 候选详情中的 `phase_results` 已统一为正式五阶段键，并新增 `phase_explanations` 供前端直接展示阶段解释；OpenClaw `options.candidate_limit/ai_top_k` 也会在接口层做准确校验
 - OpenClaw `extreme_strength_combo` 候选详情现会把原始规则表达式转成中文展示，并将命中的技术形态单独收敛到独立板块；因子快照中的对象/数组值也会展开为可读文本，避免出现 `[object Object]`
 - `extreme_strength_combo` 已明确收敛为“热点题材股票池 / 排序器”角色：候选详情现拆分出 `题材池分 / 龙头分 / 入场信号分 / 时机惩罚` 四桶，并展示 `阶段标签`（`池子层 / 仅观察 / 突破当日 / 回踩确认 / 已走远·勿追`）与 `主信号类型`（`低位结构入场 / 动量突破 / 动量追涨`）；阶段 3 优先展示 `primary_signal`，让结构型右侧买点不再被事件型强势覆盖；当阶段为 `已走远·勿追` 时 L3 候选池会把 `leader_pool` 降级为 `focus_list`，`phase4_entry_readiness` 也会硬闸关闭，避免扎堆追高

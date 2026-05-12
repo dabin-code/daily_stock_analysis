@@ -2,6 +2,7 @@
 """Tests for EntryStrategyE (Bottom Divergence Double Breakout)."""
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -59,6 +60,46 @@ class TestEntryStrategyE(unittest.TestCase):
             self.assertIsNotNone(result["stop_loss_price"])
             self.assertGreater(result["entry_price"], 0)
             self.assertGreater(result["stop_loss_price"], 0)
+
+    @patch("src.strategies.entry_strategies.BottomDivergenceBreakoutDetector.detect")
+    def test_extended_confirmed_signal_does_not_trigger(self, detect_mock):
+        """历史已确认但偏离确认价过远时不触发直接策略入口。"""
+        df = self._make_test_df()
+        detect_mock.return_value = {
+            "state": "confirmed",
+            "pattern_code": "price_down_macd_up",
+            "pattern_label": "经典底背离",
+            "entry_price": 10.0,
+            "stop_loss_price": 9.0,
+            "signal_strength": 0.8,
+            "confirmation_bar_index": len(df) - 2,
+        }
+
+        result = EntryStrategyE.evaluate(df)
+
+        self.assertFalse(result["triggered"])
+        self.assertFalse(result["actionable_entry"])
+        self.assertIn("not in actionable entry window", result["reason"])
+
+    @patch("src.strategies.entry_strategies.BottomDivergenceBreakoutDetector.detect")
+    def test_weak_pattern_confirmed_signal_does_not_trigger(self, detect_mock):
+        """强势回撤类 confirmed 不触发底背离买点策略。"""
+        df = self._make_test_df()
+        latest_close = float(df.iloc[-1]["close"])
+        detect_mock.return_value = {
+            "state": "confirmed",
+            "pattern_code": "price_up_macd_flat",
+            "pattern_label": "强势回撤·MACD持平",
+            "entry_price": latest_close,
+            "stop_loss_price": latest_close * 0.9,
+            "signal_strength": 0.8,
+            "confirmation_bar_index": len(df) - 1,
+        }
+
+        result = EntryStrategyE.evaluate(df)
+
+        self.assertFalse(result["triggered"])
+        self.assertFalse(result["actionable_entry"])
 
     def test_result_schema(self):
         """结果 schema 完整。"""

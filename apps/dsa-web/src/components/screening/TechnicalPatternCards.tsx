@@ -25,6 +25,7 @@ function createMetric(label: string, value: unknown): TechnicalPatternMetric {
 
 function extractBottomDivergencePattern(snapshot: ScreeningFactorSnapshot): TechnicalPattern | null {
   if (!snapshot.bottom_divergence_double_breakout) return null;
+  if (snapshot.bottom_divergence_actionable_entry === false) return null;
 
   const metrics: TechnicalPatternMetric[] = [];
   if (snapshot.bottom_divergence_pattern_label) {
@@ -44,6 +45,12 @@ function extractBottomDivergencePattern(snapshot: ScreeningFactorSnapshot): Tech
   }
   if (snapshot.bottom_divergence_sync_breakout) {
     metrics.push(createMetric('双突破同步', '✓'));
+  }
+  if (snapshot.bottom_divergence_entry_timing_score != null) {
+    metrics.push(createMetric('入场时机', snapshot.bottom_divergence_entry_timing_score));
+  }
+  if (snapshot.bottom_divergence_extended_pct != null) {
+    metrics.push(createMetric('偏离确认价', snapshot.bottom_divergence_extended_pct + '%'));
   }
 
   const hitReasons = Array.isArray(snapshot.bottom_divergence_hit_reasons)
@@ -284,7 +291,7 @@ function PatternCard({ pattern }: PatternCardProps) {
             {pattern.hitReasons.map((reason, idx) => (
               <div key={idx} className="flex items-start gap-2 text-xs text-secondary-text">
                 <CheckCircle2 className="h-3 w-3 shrink-0 text-orange mt-0.5" />
-                <span className="break-words">{reason}</span>
+                <span className="wrap-break-word">{reason}</span>
               </div>
             ))}
           </div>

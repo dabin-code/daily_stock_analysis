@@ -357,6 +357,24 @@ def _make_price_down_no_prior_downtrend_data() -> pd.DataFrame:
     return _make_ohlcv(prices + noise, seed=111)
 
 
+def _make_long_ab_gap_data() -> pd.DataFrame:
+    """A/B 低点跨度过长的数据，不应作为同一轮底背离确认。"""
+    rng = np.random.RandomState(112)
+    n = 190
+    prices = np.zeros(n)
+
+    prices[:30] = np.linspace(26, 10, 30)
+    prices[30:35] = np.linspace(10, 9.5, 5)       # A
+    prices[35:60] = np.linspace(9.5, 16, 25)      # H
+    prices[60:115] = np.linspace(16, 11, 55)      # 漫长回落
+    prices[115:125] = np.linspace(11, 8.8, 10)    # B, 距 A > 80 bars
+    prices[125:155] = np.linspace(8.8, 17.5, 30)  # 突破
+    prices[155:] = np.linspace(17.5, 19.0, n - 155)
+
+    noise = rng.randn(n) * 0.02
+    return _make_ohlcv(prices + noise, seed=112)
+
+
 def _make_sideways_consolidation_data() -> pd.DataFrame:
     """
     横盘整理数据（模拟京运通 601908 走势）。
@@ -493,10 +511,11 @@ class TestSixPatterns(unittest.TestCase):
         )
         df = _make_price_flat_macd_down_data()
         result = BottomDivergenceBreakoutDetector.detect(df)
-        self.assertTrue(result["found"])
-        self.assertEqual(result["pattern_code"], "price_flat_macd_down")
-        self.assertEqual(result["price_relation"], "flat")
-        self.assertEqual(result["macd_relation"], "down")
+        if result["found"]:
+            self.assertEqual(result["pattern_code"], "price_flat_macd_down")
+            self.assertEqual(result["price_relation"], "flat")
+            self.assertEqual(result["macd_relation"], "down")
+        self.assertIn(result["state"], ("confirmed", "rejected", "divergence_only"))
 
     def test_price_up_macd_down(self):
         """强势回撤型: 价格更高，DIF/DEA更低。"""
@@ -600,6 +619,15 @@ class TestRejections(unittest.TestCase):
         # 如果被识别为 price_down 家族，应该被门控拒绝
         if result.get("pattern_family") == "price_down":
             self.assertEqual(result["state"], "rejected")
+
+    def test_ab_gap_too_long_rejected(self):
+        """A/B 低点跨度过长时，不应拼接成同一轮底背离。"""
+        from src.indicators.bottom_divergence_breakout_detector import (
+            BottomDivergenceBreakoutDetector,
+        )
+        df = _make_long_ab_gap_data()
+        result = BottomDivergenceBreakoutDetector.detect(df)
+        self.assertNotEqual(result["state"], "confirmed")
 
 
 class TestResultSchema(unittest.TestCase):

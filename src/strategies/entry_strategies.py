@@ -513,10 +513,16 @@ class EntryStrategyB:
 class EntryStrategyE:
     """底背离双突破策略 (Bottom Divergence Double Breakout).
 
-    Uses DIF/DEA-based six-pattern bottom divergence detection combined with
-    double breakout confirmation (descending trendline + horizontal resistance).
-    Only triggers when the detector state reaches "confirmed".
+    Uses DIF/DEA-based bottom divergence detection combined with double breakout
+    confirmation (descending trendline + horizontal resistance). Only triggers
+    when the confirmed signal is still in the actionable entry window.
     """
+
+    _ACTIONABLE_PATTERN_CODES = {
+        "price_down_macd_up",
+        "price_down_macd_flat",
+        "price_flat_macd_up",
+    }
 
     @classmethod
     def evaluate(cls, df: pd.DataFrame) -> Dict[str, Any]:
@@ -546,7 +552,8 @@ class EntryStrategyE:
 
         result = BottomDivergenceBreakoutDetector.detect(df)
         state = result.get("state", "rejected")
-        triggered = state == "confirmed"
+        actionable_entry = cls._is_actionable_entry(df, result)
+        triggered = state == "confirmed" and actionable_entry
 
         # --- scoring ---
         score = 0
@@ -567,6 +574,9 @@ class EntryStrategyE:
             strength = result.get("signal_strength", 0.0)
             strength_bonus = int(strength * 20)
             score = min(100, score + strength_bonus)
+        elif state == "confirmed":
+            score = 10
+            reasons.append("confirmed but not in actionable entry window")
         elif state == "divergence_only":
             score = 15
             reasons.append("divergence detected but no breakout")
@@ -585,4 +595,56 @@ class EntryStrategyE:
             "stop_loss_price": result.get("stop_loss_price"),
             "score": score,
             "reason": " + ".join(reasons) if reasons else f"no signal (state={state})",
+            "actionable_entry": actionable_entry,
         }
+
+    @classmethod
+    def _is_actionable_entry(cls, df: pd.DataFrame, result: Dict[str, Any]) -> bool:
+        """Mirror screening entry timing gates for direct strategy calls."""
+        if result.get("state") != "confirmed":
+            return False
+        if result.get("pattern_code") not in cls._ACTIONABLE_PATTERN_CODES:
+            return False
+
+        confirmation_days = cls._confirmation_days(df, result)
+        if confirmation_days is None:
+            return False
+        if confirmation_days == 0:
+            return True
+
+        entry_price = cls._safe_float(result.get("entry_price"))
+        latest_close = cls._latest_close(df)
+        if entry_price is None or latest_close is None or entry_price <= 0:
+            return False
+
+        extended_pct = (latest_close - entry_price) / entry_price * 100.0
+        return confirmation_days <= 3 and 0.0 <= extended_pct <= 10.0
+
+    @staticmethod
+    def _confirmation_days(df: pd.DataFrame, result: Dict[str, Any]) -> Optional[int]:
+        confirmation_bar = result.get("confirmation_bar_index")
+        if confirmation_bar is None:
+            downtrend_line = result.get("downtrend_line") or {}
+            confirmation_bar = downtrend_line.get("breakout_bar_index")
+        if confirmation_bar is None:
+            return None
+        try:
+            return max(len(df) - 1 - int(confirmation_bar), 0)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _latest_close(df: pd.DataFrame) -> Optional[float]:
+        if df is None or df.empty or "close" not in df:
+            return None
+        return EntryStrategyE._safe_float(df["close"].iloc[-1])
+
+    @staticmethod
+    def _safe_float(value: Any) -> Optional[float]:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        if pd.isna(parsed):
+            return None
+        return parsed

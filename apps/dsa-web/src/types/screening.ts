@@ -461,6 +461,13 @@ export interface ScreeningFactorSnapshot extends Record<string, unknown> {
   bottom_divergence_horizontal_breakout?: boolean;
   bottom_divergence_trendline_breakout?: boolean;
   bottom_divergence_sync_breakout?: boolean;
+  bottom_divergence_actionable_entry?: boolean;
+  bottom_divergence_valid_pattern?: boolean;
+  bottom_divergence_ab_bars?: number;
+  bottom_divergence_entry_zone?: string;
+  bottom_divergence_entry_timing_score?: number;
+  bottom_divergence_extended_pct?: number;
+  bottom_divergence_validation_status?: string;
 
   // Pattern 123 fields
   pattern_123_low_trendline?: boolean;

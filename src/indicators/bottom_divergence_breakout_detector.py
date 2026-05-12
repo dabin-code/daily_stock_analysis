@@ -35,6 +35,7 @@ _MIN_BARS = 60
 _SWING_ORDER = 5
 _LOOKBACK = 100
 _MIN_AB_GAP = 10            # A/B 最小间隔 bars
+_MAX_AB_GAP = 60            # A/B 最大间隔 bars，避免跨越数月拼接结构
 _FLAT_TOLERANCE = 0.05      # 价格 flat 判定容差（5%）
 _MACD_FLAT_TOLERANCE = 0.30 # MACD flat 判定容差（30%，DIF/DEA 波动大于价格）
 _AB_MATCH_WINDOW = 5        # 价格低点与 DIF/DEA 低点配对窗口
@@ -355,6 +356,7 @@ class BottomDivergenceBreakoutDetector:
         swing_order: int = _SWING_ORDER,
         lookback: int = _LOOKBACK,
         min_ab_gap: int = _MIN_AB_GAP,
+        max_ab_gap: int = _MAX_AB_GAP,
         flat_tolerance: float = _FLAT_TOLERANCE,
         macd_flat_tolerance: float = _MACD_FLAT_TOLERANCE,
         ab_match_window: int = _AB_MATCH_WINDOW,
@@ -415,6 +417,7 @@ class BottomDivergenceBreakoutDetector:
             n=n,
             lookback=lookback,
             min_ab_gap=min_ab_gap,
+            max_ab_gap=max_ab_gap,
         )
 
         if not candidates:
@@ -476,6 +479,7 @@ class BottomDivergenceBreakoutDetector:
         n: int,
         lookback: int,
         min_ab_gap: int,
+        max_ab_gap: int,
     ) -> List[Dict[str, Any]]:
         """生成满足约束的 A/B 低点对候选。"""
         candidates = []
@@ -492,6 +496,8 @@ class BottomDivergenceBreakoutDetector:
 
                 # 最小间隔
                 if b_idx - a_idx < min_ab_gap:
+                    continue
+                if b_idx - a_idx > max_ab_gap:
                     continue
 
                 a_price = float(low_col.iloc[a_idx])
