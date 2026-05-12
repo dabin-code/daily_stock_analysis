@@ -38,10 +38,12 @@ class KlineRepairService:
         governance_run_succeeded: bool,
         governance_run_id: Optional[str] = None,
         included_statuses: Optional[set[str]] = None,
+        max_trade_date: Optional[date] = None,
     ) -> Dict[str, int]:
         repaired_gap_count = 0
         candidate_skip_gap_count = 0
         recovered_gap_count = 0
+        skipped_gap_count = 0
         target_statuses = included_statuses or {"pending_retry", "candidate_skip", "approved_skip"}
 
         unresolved_gaps = [
@@ -49,6 +51,14 @@ class KlineRepairService:
             for gap in self.db.list_kline_audit_gaps(market=market)
             if gap.status in target_statuses
         ]
+        if max_trade_date is not None:
+            eligible_gaps = []
+            for gap in unresolved_gaps:
+                if self._gap_starts_after_cutoff(gap, max_trade_date):
+                    skipped_gap_count += 1
+                    continue
+                eligible_gaps.append(gap)
+            unresolved_gaps = eligible_gaps
         if governance_run_succeeded and governance_run_id is None:
             if any(gap.status == "approved_skip" for gap in unresolved_gaps):
                 raise ValueError(
@@ -84,7 +94,13 @@ class KlineRepairService:
             "repaired_gap_count": repaired_gap_count,
             "candidate_skip_gap_count": candidate_skip_gap_count,
             "recovered_gap_count": recovered_gap_count,
+            "skipped_gap_count": skipped_gap_count,
         }
+
+    @staticmethod
+    def _gap_starts_after_cutoff(gap: KlineAuditGap, max_trade_date: date) -> bool:
+        gap_date = gap.trade_date or gap.missing_date_from
+        return isinstance(gap_date, date) and gap_date > max_trade_date
 
     def _has_reached_retry_limit(self, gap: KlineAuditGap) -> bool:
         attempt_events = self.db.list_kline_audit_events(

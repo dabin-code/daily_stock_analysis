@@ -477,6 +477,10 @@ export interface ScreeningFactorSnapshot extends Record<string, unknown> {
   ma100_low123_state?: string;
   ma100_low123_pattern_strength?: number;
   ma100_low123_ma_score?: number;
+  ma100_low123_entry_timing_score?: number;
+  ma100_low123_entry_zone?: string;
+  ma100_low123_validation_status?: string;
+  ma100_low123_validation_reason?: string;
   ma100_low123_hit_reasons?: string[];
   ma100_low123_watch_hit_reasons?: string[];
 

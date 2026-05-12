@@ -69,6 +69,9 @@ function extractMA100Low123Pattern(snapshot: ScreeningFactorSnapshot): Technical
   if (snapshot.ma100_low123_ma_score != null) {
     metrics.push(createMetric('MA评分', snapshot.ma100_low123_ma_score));
   }
+  if (snapshot.ma100_low123_entry_timing_score != null) {
+    metrics.push(createMetric('入场时机', snapshot.ma100_low123_entry_timing_score));
+  }
 
   const hitReasons = Array.isArray(snapshot.ma100_low123_hit_reasons)
     ? snapshot.ma100_low123_hit_reasons
@@ -76,7 +79,9 @@ function extractMA100Low123Pattern(snapshot: ScreeningFactorSnapshot): Technical
 
   return {
     id: 'ma100_low123',
-    name: 'MA100+低位123突破成熟',
+    name: snapshot.ma100_low123_entry_zone === 'between_p3_p2'
+      ? 'MA100+低位123最佳观察区'
+      : 'MA100+低位123刚突破P2',
     signalStrength: snapshot.ma100_low123_pattern_strength,
     metrics,
     hitReasons,
@@ -84,6 +89,7 @@ function extractMA100Low123Pattern(snapshot: ScreeningFactorSnapshot): Technical
 }
 
 function extractMA100Low123WatchlistPattern(snapshot: ScreeningFactorSnapshot): TechnicalPattern | null {
+  if (snapshot.ma100_low123_confirmed) return null;
   if (!snapshot.ma100_low123_watchlist) return null;
 
   const metrics: TechnicalPatternMetric[] = [];

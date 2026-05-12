@@ -224,6 +224,7 @@ class DataHealthTaskService:
                 market=market,
                 governance_run_succeeded=False,
                 included_statuses={"pending_retry", "candidate_skip"},
+                max_trade_date=self._resolve_repair_max_trade_date(market=market),
             )
 
         if operation_type == "retry_failed":
@@ -238,6 +239,7 @@ class DataHealthTaskService:
                 market=market,
                 governance_run_succeeded=False,
                 included_statuses={"pending_retry", "candidate_skip"},
+                max_trade_date=self._resolve_repair_max_trade_date(market=market),
             )
 
         raise ValueError(f"unsupported operation: {operation_type}")
@@ -308,6 +310,15 @@ class DataHealthTaskService:
                 source_run_id=gap.source_run_id,
                 status="pending_retry",
             )
+
+    def _resolve_repair_max_trade_date(self, *, market: str) -> Optional[date]:
+        if not hasattr(self.db, "get_latest_passed_kline_audit_trade_date"):
+            return None
+        latest_passed = self.db.get_latest_passed_kline_audit_trade_date(market=market)
+        if latest_passed is None:
+            return None
+        trade_date = latest_passed.get("trade_date") if isinstance(latest_passed, dict) else getattr(latest_passed, "trade_date", None)
+        return trade_date if isinstance(trade_date, date) else None
 
     def _reject_if_queue_full(self) -> None:
         active_count = sum(

@@ -77,6 +77,7 @@ The scheduled prewarm is now best treated as an optional fallback. The primary l
 
 - 日常治理任务默认建议在 A 股收盘后 `17:00` 执行，顺序固定为 `sync -> audit -> repair -> re-audit`
 - 下游只应消费 `pass_status=passed` 的交易日；`not_passed` 表示该交易日仍存在非豁免缺口，筛选链路会 fail-close
+- 手工 `修复缺口` 只会处理最新 `pass_status=passed` 交易日及以前的缺口，避免在当日未收盘或目标日未通过审计时把全市场临时缺口逐只修复
 - 无法稳定拉取的股票缺口会先进入 `candidate_skip`，只有经过人工确认后才会升级为 `approved_skip`
 - 深度审计任务是独立 job，用于长窗口复核历史缺口与 `candidate_skip` 恢复情况，不会替代日常治理
 - 智能选股页提供 `回填至该日` 操作，可按所选交易日快速批量回填本地全市场日线数据，并在完成后触发目标日治理审计
@@ -151,6 +152,7 @@ python scripts/approve_kline_skip.py --market cn --code 000001 --from-date 2026-
 - 首筛阶段不再按 `avg_amount` 做硬过滤，低成交额股票会继续进入策略匹配，再由后续题材/候选池/交易阶段链路收敛质量
 - OpenClaw 热点题材触发的 `extreme_strength_combo` 现在会固定走策略引擎，按请求 `trade_date` 执行，并结合个股所属板块做热点题材硬门槛匹配
 - L2 本地热点板块识别已从“绝对综合分 + 固定阈值”切换为“市场相对排名驱动”：`hot/warm` 由 `board_strength_score / board_strength_rank / percentile` 决定，`stage` 与 `quality_flags` 仅负责生命周期解释和主线优先级排序
+- `ma100_low123_combined` 只把最新 K 线位于 P3-P2 之间，或最新 K 线刚突破 P2 的低位 123 结构视为最佳入场区；突破后已走远的候选会被剔除，刚突破 P2 会通过 `ma100_low123_entry_timing_score` 获得额外加分
 - 候选详情中的 `phase_results` 已统一为正式五阶段键，并新增 `phase_explanations` 供前端直接展示阶段解释；OpenClaw `options.candidate_limit/ai_top_k` 也会在接口层做准确校验
 - OpenClaw `extreme_strength_combo` 候选详情现会把原始规则表达式转成中文展示，并将命中的技术形态单独收敛到独立板块；因子快照中的对象/数组值也会展开为可读文本，避免出现 `[object Object]`
 - `extreme_strength_combo` 已明确收敛为“热点题材股票池 / 排序器”角色：候选详情现拆分出 `题材池分 / 龙头分 / 入场信号分 / 时机惩罚` 四桶，并展示 `阶段标签`（`池子层 / 仅观察 / 突破当日 / 回踩确认 / 已走远·勿追`）与 `主信号类型`（`低位结构入场 / 动量突破 / 动量追涨`）；阶段 3 优先展示 `primary_signal`，让结构型右侧买点不再被事件型强势覆盖；当阶段为 `已走远·勿追` 时 L3 候选池会把 `leader_pool` 降级为 `focus_list`，`phase4_entry_readiness` 也会硬闸关闭，避免扎堆追高

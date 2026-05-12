@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added K-line governance truth-source tables, audit service, repair service, and skip-registry workflow so daily data completeness is tracked explicitly instead of inferred from loose sync heuristics
 - Screening ingest now consumes audit-derived truth: blocking/retryable sync failures are no longer silently downgraded, and non-`passed` trade dates fail closed before factor building
 - Added a fast backfill-to-date path for screening: Web users can run `回填至该日`, the API exposes `POST /api/v1/screening/backfill-to-date`, and `scripts/fast_backfill.py --to-date YYYY-MM-DD` reuses the same service logic before target-date governance audit
+- Data-health `repair_gaps` now caps repair attempts at the latest `pass_status=passed` K-line audit date, so intraday/current-date gaps are skipped instead of keeping the repair task stuck in `processing`
 - Added scheduled K-line governance wiring with opt-in `17:00` post-close execution, independent deep-audit registration, and explicit failure bubbling through the scheduler
 - Added manual governance scripts for auditing/repairing completeness and approving `candidate_skip -> approved_skip` transitions
 - Added a Web “数据健康” console and `/api/v1/data-health/*` APIs for local stock database health checks, K-line start/end coverage range, coverage/gap drilldown, and background operations for backfill, retry, repair, and re-audit
@@ -64,6 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 首筛公共过滤已移除 `avg_amount < min_avg_amount` 的硬拒绝逻辑，当前会先放行可用股票进入策略匹配，再交给后续五层链路继续收敛
 - L2 本地热点板块已改为排名驱动识别：`hot/warm` 不再由固定阈值切分，而是基于 `board_strength_score / board_strength_rank / percentile` 进行分桶；`stage` 与 `quality_flags` 改为解释性字段，并同步落库到 `daily_sector_heat`
 - `ma100_60min_combined` 策略的 MA100 突破语义修正：门控从“最近连续站上 MA100 的天数 ≤ 5”改为“最近一次真实上穿（前一日收盘 ≤ MA100、当日收盘 > MA100）发生在近 5 根 K 线内”，并新增 (1) 突破前背景过滤 `pre_breakout_below_ratio ≥ 0.6` 或 `pre_breakout_consecutive_below_bars ≥ 3`，(2) `|ma100_distance_pct| ≤ 6.0%` 硬距离门控。原 `ma100_breakout_days` 字段以“连续站上”语义保留在 factor 快照中供 `leader_score`、`stock_analyzer` 报告等按既有语义继续复用；新增 `ma100_bars_since_breakout` / `ma100_breakout_bar_index` / `ma100_pre_breakout_below_ratio` / `ma100_pre_breakout_consecutive_below_bars` 精准字段用于新门控
+- `ma100_low123_combined` 的低位 123 买点门控改为只接受两类最佳入场区：最新 K 线介于 P3-P2 之间，或最新 K 线刚突破 P2；突破后第 2 根及以后即使仍在旧的 3 根 K 线窗口内也会被标记为 `not_best_entry_zone` 并剔除。新增 `ma100_low123_entry_timing_score` / `ma100_low123_entry_zone` 字段，刚突破 P2 会获得额外入场时机加分，避免已远离 P2 的候选继续作为初始买点推荐
 
 ### Screening architecture consolidation
 

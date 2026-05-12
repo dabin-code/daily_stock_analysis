@@ -97,6 +97,9 @@ def test_data_health_task_runs_backfill_operation_and_keeps_result():
 
 def test_data_health_task_dispatches_repair_and_audit_operations():
     service, _backfill, governance, repair, audit = _build_service()
+    service.db.get_latest_passed_kline_audit_trade_date.return_value = SimpleNamespace(
+        trade_date=date(2026, 5, 11)
+    )
 
     repair_task = service.submit_operation(operation_type="repair_gaps", market="cn")
     audit_task = service.submit_operation(
@@ -111,6 +114,7 @@ def test_data_health_task_dispatches_repair_and_audit_operations():
             "market": "cn",
             "governance_run_succeeded": False,
             "included_statuses": {"pending_retry", "candidate_skip"},
+            "max_trade_date": date(2026, 5, 11),
         }
     ]
     assert audit_task["result"]["pass_status"] == "passed"
@@ -219,6 +223,32 @@ def test_repair_gaps_promotes_open_gaps_before_repair():
         source_run_id="audit-open",
         status="pending_retry",
     )
+
+
+def test_repair_gaps_uses_latest_passed_audit_date_as_cutoff():
+    repair = _RepairService()
+    db = _fake_db()
+    db.get_latest_passed_kline_audit_trade_date.return_value = SimpleNamespace(
+        trade_date=date(2026, 5, 11)
+    )
+    service = DataHealthTaskService(
+        backfill_service=_BackfillService(),
+        repair_service=repair,
+        db_manager=db,
+        run_inline=True,
+    )
+
+    task = service.submit_operation(operation_type="repair_gaps", market="cn")
+
+    assert task["status"] == "completed"
+    assert repair.calls == [
+        {
+            "market": "cn",
+            "governance_run_succeeded": False,
+            "included_statuses": {"pending_retry", "candidate_skip"},
+            "max_trade_date": date(2026, 5, 11),
+        }
+    ]
 
 
 def test_inflight_dedup_keeps_different_operation_scopes_distinct():

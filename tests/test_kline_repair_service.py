@@ -607,3 +607,44 @@ def test_repair_service_requires_governance_run_id_for_approved_skip_recovery():
         Config.reset_instance()
         os.environ.pop("DATABASE_PATH", None)
         temp_dir.cleanup()
+
+
+def test_repair_service_skips_gaps_after_max_trade_date():
+    from src.services.kline_repair_service import KlineRepairService
+
+    temp_dir = tempfile.TemporaryDirectory()
+    try:
+        db_path = os.path.join(temp_dir.name, "test_kline_repair_service.db")
+        os.environ["DATABASE_PATH"] = db_path
+        Config.reset_instance()
+        DatabaseManager.reset_instance()
+        db = DatabaseManager.get_instance()
+        _create_run(db, "repair-run-cutoff")
+        gap = db.upsert_kline_audit_gap(
+            market="cn",
+            gap_scope="symbol_range_gap",
+            code="000001",
+            missing_date_from=date(2026, 5, 12),
+            missing_date_to=date(2026, 5, 12),
+            source_run_id="repair-run-cutoff",
+            status="pending_retry",
+        )
+        sync_service = _StubSyncService([{"errors": []}])
+        service = KlineRepairService(db_manager=db, sync_service=sync_service)
+
+        result = service.repair_gaps(
+            market="cn",
+            governance_run_succeeded=False,
+            max_trade_date=date(2026, 5, 11),
+        )
+
+        pending_gaps = db.list_kline_audit_gaps(market="cn", status="pending_retry")
+        assert result["skipped_gap_count"] == 1
+        assert result["repaired_gap_count"] == 0
+        assert sync_service.calls == []
+        assert pending_gaps[0].gap_key == gap.gap_key
+    finally:
+        DatabaseManager.reset_instance()
+        Config.reset_instance()
+        os.environ.pop("DATABASE_PATH", None)
+        temp_dir.cleanup()

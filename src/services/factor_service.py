@@ -892,13 +892,12 @@ class FactorService:
     ) -> dict:
         """Combine MA100 + Low-123 pattern into a single gate with hit reasons.
 
-        Hard freshness gate: bars_since_entry > 3 → reject entirely.
-        Shadow observability mode: if `breakout_bar_index` is missing, keep the
-        legacy confirmation result but emit explicit validation status/reason so
-        downstream screening, backtest attribution, and monitoring can isolate
-        these samples before a future fail-closed rollout.
-        Freshness is derived from `pattern_123_raw["downtrend_line"]["breakout_bar_index"]`
-        relative to the latest bar in `group`.
+        Best-entry gate:
+        - P3 < latest close <= P2 keeps the candidate in the pre-breakout entry zone.
+        - bars_since_entry == 0 means the latest bar just broke P2 and gets the
+          highest timing score.
+        - older breakouts and missing P2 breakout indexes fail closed for the
+          main screening strategy while keeping validation status observable.
         """
         above_ma100 = bool(ma100_factors.get("above_ma100", False))
         p123_state = str(pattern_123_factors.get("pattern_123_state", "rejected") or "rejected")
@@ -917,33 +916,60 @@ class FactorService:
         signal_strength = float(pattern_123_factors.get("pattern_123_signal_strength", 0.0))
         bars_since_entry = FactorService._compute_low123_confirmation_days(group, pattern_123_raw)
         data_complete = p123_breakout_ready and bars_since_entry is not None
+        latest_close = _latest_close_value(group)
+        p2_price = _point_price(pattern_123_raw.get("point2"))
+        p3_price = _point_price(pattern_123_raw.get("point3"))
+        in_pre_p2_entry_zone = (
+            p123_watching
+            and latest_close is not None
+            and p2_price is not None
+            and p3_price is not None
+            and p3_price < latest_close <= p2_price
+        )
+        just_breakout_p2 = (
+            p123_breakout_ready
+            and isinstance(bars_since_entry, (int, float))
+            and int(bars_since_entry) == 0
+        )
+        missing_breakout_bar = p123_breakout_ready and bars_since_entry is None
 
         # Low123 detector and MA100 gate both need to be fresh enough to stay
-        # actionable. We suppress stale breakouts once the P2 breakout
-        # is more than 3 bars old. Watching state is routed into a dedicated
-        # watchlist channel instead of the breakout-confirmed channel.
+        # actionable. Best-entry semantics are stricter than the old <=3 bars
+        # freshness rule: accept only the pre-P2 zone (P3 < close <= P2) or
+        # the latest bar breaking P2.
         validation_status = "confirmed"
         validation_reason: Optional[str] = None
+        entry_zone: Optional[str] = None
+        entry_timing_score = 0.0
         if not above_ma100:
             validation_status = "below_ma100"
             validation_reason = "below_ma100"
+        elif in_pre_p2_entry_zone:
+            validation_status = "pre_p2_entry_zone"
+            entry_zone = "between_p3_p2"
+            entry_timing_score = 0.7
         elif p123_watching:
             validation_status = "watching"
             validation_reason = "watching"
         elif not p123_breakout_ready:
             validation_status = "low123_not_ready"
             validation_reason = "low123_not_ready"
-        elif bars_since_entry is None:
+        elif missing_breakout_bar:
             validation_status = "confirmed_missing_breakout_bar_index"
             validation_reason = "missing_breakout_bar_index"
-        elif bars_since_entry > 3:
-            validation_status = "stale_breakout"
-            validation_reason = "stale_breakout"
+        elif just_breakout_p2:
+            entry_zone = "just_breakout_p2"
+            entry_timing_score = 1.0
+        else:
+            validation_status = "not_best_entry_zone"
+            validation_reason = "not_best_entry_zone"
 
-        confirmed = (
-            p123_breakout_ready
-            and above_ma100
-            and (bars_since_entry is None or bars_since_entry <= 3)
+        confirmed = bool(
+            above_ma100
+            and (
+                in_pre_p2_entry_zone
+                or just_breakout_p2
+            )
         )
         watchlist = above_ma100 and p123_watching
 
@@ -968,17 +994,19 @@ class FactorService:
         # ── Hit reasons (Chinese 【标题】描述 format) ──
         hit_reasons: list[str] = []
         watch_hit_reasons: list[str] = []
-        if confirmed:
+        if confirmed and in_pre_p2_entry_zone:
+            hit_reasons = _build_ma100_low123_watch_hit_reasons(
+                ma100_factors, pattern_123_raw, group, distance_pct, signal_strength,
+            )
+            hit_reasons.insert(0, "【最佳买点】最新K线位于P3-P2之间，等待突破P2触发")
+        elif confirmed:
             hit_reasons = _build_ma100_low123_hit_reasons(
                 ma100_factors, pattern_123_factors, pattern_123_raw, group,
                 breakout_days, distance_pct, signal_strength,
             )
-            if validation_status == "confirmed_missing_breakout_bar_index":
-                hit_reasons.insert(
-                    0,
-                    "【数据校验】缺少 breakout_bar_index，当前按观察模式保留，建议单独统计并人工复核",
-                )
-        elif watchlist:
+            if just_breakout_p2:
+                hit_reasons.insert(0, "【最佳买点】最新K线刚突破P2，进入低位123最佳入场点")
+        if watchlist:
             watch_hit_reasons = _build_ma100_low123_watch_hit_reasons(
                 ma100_factors, pattern_123_raw, group, distance_pct, signal_strength,
             )
@@ -990,6 +1018,8 @@ class FactorService:
             "ma100_low123_data_complete": data_complete,
             "ma100_low123_pattern_strength": signal_strength if (confirmed or watchlist) else 0.0,
             "ma100_low123_ma_score": ma_score if (confirmed or watchlist) else 0.0,
+            "ma100_low123_entry_timing_score": entry_timing_score if confirmed else 0.0,
+            "ma100_low123_entry_zone": entry_zone,
             "ma100_low123_validation_status": validation_status,
             "ma100_low123_validation_reason": validation_reason,
             "ma100_low123_hit_reasons": hit_reasons,
@@ -1135,6 +1165,32 @@ def _idx_to_date(group: pd.DataFrame, idx: int) -> str:
         return "N/A"
     raw = group.iloc[idx]["date"]
     return str(pd.to_datetime(raw).date())
+
+
+def _latest_close_value(group: pd.DataFrame) -> Optional[float]:
+    """Return latest close from an OHLCV group, ignoring missing/NaN values."""
+    if group is None or group.empty or "close" not in group.columns:
+        return None
+    try:
+        value = float(group.iloc[-1]["close"])
+    except (TypeError, ValueError):
+        return None
+    if np.isnan(value):
+        return None
+    return value
+
+
+def _point_price(point: Any) -> Optional[float]:
+    """Extract a numeric price from a detector point dict."""
+    if not isinstance(point, dict):
+        return None
+    try:
+        value = float(point.get("price"))
+    except (TypeError, ValueError):
+        return None
+    if np.isnan(value):
+        return None
+    return value
 
 
 def _build_ma100_low123_hit_reasons(

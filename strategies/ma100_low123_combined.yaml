@@ -3,7 +3,7 @@
 
 name: ma100_low123_combined
 display_name: MA100+低位123结构
-description: 站上MA100均线 + 低位123底部反转形态进入 breakout_ready（P2突破成熟，趋势线突破为加分项），且入场时效≤3根K线。
+description: 站上MA100均线 + 低位123底部反转形态处于最佳入场区：最新K线位于P3-P2之间，或最新K线刚突破P2（趋势线突破为加分项）。
 category: reversal
 core_rules: [1, 3]
 required_tools:
@@ -24,13 +24,16 @@ screening:
       value: true
   scoring:
     - field: ma100_low123_pattern_strength
-      weight: 45
+      weight: 40
       cap: 1.0
     - field: ma100_low123_ma_score
-      weight: 25
+      weight: 20
+      cap: 1.0
+    - field: ma100_low123_entry_timing_score
+      weight: 15
       cap: 1.0
     - field: volume_ratio
-      weight: 15
+      weight: 10
       cap: 5.0
     - field: trend_score
       weight: 15
@@ -39,7 +42,7 @@ instructions: |
   **MA100+低位123结构（Strategy 2 — 联合策略）**
 
   本策略将 MA100 突破确认与低位 123 底部反转形态联合为一个选股条件。
-  核心逻辑：股价站上 MA100 均线 + 低位123处于 breakout_ready 成熟态 + 入场时效严格把控。
+  核心逻辑：股价站上 MA100 均线 + 低位123处于最佳入场区 + 入场时效严格把控。
 
   入选条件（全部满足 → ma100_low123_confirmed = True）：
 
@@ -47,19 +50,21 @@ instructions: |
      - 收盘价 > MA100 均线（above_ma100 = True）。
 
   2. **低位123底部反转确认**：
-     - Low123TrendlineDetector 检测状态为 breakout_ready（P2突破即进入成熟买点）。
+     - Low123TrendlineDetector 检测状态为 watching 且最新K线处于 P3-P2 区间，或状态为 breakout_ready 且最新K线刚突破P2。
      - P1 须在近 60 根 K 线收盘区间最低 30% 分位内。
      - 趋势线同步突破为加分项（提高 signal_strength），非必要条件。
-     - 若仅为 watching（收盘价 > P3 但未突破 P2），进入观察池，不进入本策略主筛选。
+     - 若 watching 但最新价未处于 P3-P2 区间，进入观察池，不进入本策略主筛选。
 
   3. **入场时效门控（硬性截断）**：
-     - 123 结构突破发生在最近 3 根 K 线内（由检测器内置时效控制）。
-     - 超过 3 根 K 线直接不入选。
+     - 最新K线介于 P3-P2 之间，属于突破前最佳观察/埋伏区。
+     - 或最新K线刚突破 P2，属于突破确认最佳入场点，并通过 `ma100_low123_entry_timing_score` 额外加分。
+     - 突破后第 2 根及以后即使仍在旧的 3 根 K 线窗口内，也不再作为最佳买点入选。
 
   评分权重：
-  - ma100_low123_pattern_strength（45%）：123 结构信号强度，P2突破为核心，趋势线突破/MA确认为加分项。
-  - ma100_low123_ma_score（25%）：MA100 突破天数（≤5天=1.0, ≤10天=0.7）× 距离得分。
-  - volume_ratio（15%）：量比，流动性确认。
+  - ma100_low123_pattern_strength（40%）：123 结构信号强度，P2突破为核心，趋势线突破/MA确认为加分项。
+  - ma100_low123_ma_score（20%）：MA100 突破天数（≤5天=1.0, ≤10天=0.7）× 距离得分。
+  - ma100_low123_entry_timing_score（15%）：最佳入场时机分，最新K线刚突破P2得分最高，P3-P2观察区次之。
+  - volume_ratio（10%）：量比，流动性确认。
   - trend_score（15%）：趋势评分辅助确认。
 
   选股理念：选股在于精而不在多，严格控制入场时效。

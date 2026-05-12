@@ -61,10 +61,35 @@ describe('extractTechnicalPatterns', () => {
       expect(patterns).toHaveLength(1);
       expect(patterns[0]).toMatchObject({
         id: 'ma100_low123',
-        name: 'MA100+低位123突破成熟',
+        name: 'MA100+低位123刚突破P2',
         signalStrength: 0.75,
       });
       expect(patterns[0].metrics).toHaveLength(2);
+    });
+
+    it('labels MA100+Low123 pre-P2 entry zone distinctly', () => {
+      const snapshot: ScreeningFactorSnapshot = {
+        ma100_low123_confirmed: true,
+        ma100_low123_watchlist: true,
+        ma100_low123_entry_zone: 'between_p3_p2',
+        ma100_low123_entry_timing_score: 0.7,
+        ma100_low123_pattern_strength: 0.61,
+        ma100_low123_ma_score: 0.72,
+        ma100_low123_hit_reasons: ['【最佳买点】最新K线位于P3-P2之间，等待突破P2触发'],
+      };
+
+      const patterns = extractTechnicalPatterns(snapshot);
+
+      expect(patterns).toHaveLength(1);
+      expect(patterns[0]).toMatchObject({
+        id: 'ma100_low123',
+        name: 'MA100+低位123最佳观察区',
+      });
+      expect(patterns[0].metrics).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ label: '入场时机', value: '0.70' }),
+        ]),
+      );
     });
 
     it('suppresses standalone pattern_123 when MA100+Low123 is confirmed', () => {
