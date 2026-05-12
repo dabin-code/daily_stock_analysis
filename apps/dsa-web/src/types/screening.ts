@@ -49,6 +49,28 @@ export interface CreateScreeningRunRequest {
   market?: string;
 }
 
+export interface ScreeningBackfillToDateRequest {
+  tradeDate: string;
+  market?: string;
+}
+
+export interface ScreeningBackfillGovernanceResult {
+  tradeDate?: string;
+  runResult?: string;
+  passStatus?: string;
+  reason?: string;
+}
+
+export interface ScreeningBackfillToDateResponse {
+  status: string;
+  targetTradeDate: string;
+  fromTradeDate?: string;
+  backfilledDates: string[];
+  savedRows: number;
+  failedDates: string[];
+  governanceResult: ScreeningBackfillGovernanceResult;
+}
+
 export interface ScreeningRun {
   runId: string;
   mode?: string;

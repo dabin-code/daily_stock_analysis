@@ -2,6 +2,8 @@ import apiClient from './index';
 import { toCamelCase } from './utils';
 import type {
   CreateScreeningRunRequest,
+  ScreeningBackfillToDateRequest,
+  ScreeningBackfillToDateResponse,
   ScreeningCandidateDetail,
   ScreeningCandidateListResponse,
   ScreeningNotifyRequest,
@@ -30,6 +32,17 @@ export const screeningApi = {
     };
     const response = await apiClient.post<Record<string, unknown>>('/api/v1/screening/runs', requestData);
     return toCamelCase<ScreeningRun>(response.data);
+  },
+
+  backfillToDate: async (params: ScreeningBackfillToDateRequest): Promise<ScreeningBackfillToDateResponse> => {
+    const requestData = {
+      trade_date: params.tradeDate,
+      market: params.market || 'cn',
+    };
+    const response = await apiClient.post<Record<string, unknown>>('/api/v1/screening/backfill-to-date', requestData, {
+      timeout: 15 * 60 * 1000,
+    });
+    return toCamelCase<ScreeningBackfillToDateResponse>(response.data);
   },
 
   listRuns: async (limit = 20): Promise<ScreeningRunListResponse> => {

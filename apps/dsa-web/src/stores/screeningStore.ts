@@ -29,6 +29,7 @@ interface ScreeningState {
   // run state
   currentRun: ScreeningRun | null;
   isRunning: boolean;
+  isBackfilling: boolean;
   pollingTimer: ReturnType<typeof setInterval> | null;
 
   // history
@@ -50,6 +51,7 @@ interface ScreeningState {
   setAiTopK: (k: number) => void;
   setTradeDate: (date: string) => void;
   startScreening: () => Promise<void>;
+  backfillStocksToTradeDate: () => Promise<void>;
   pollRunStatus: (runId: string) => void;
   stopPolling: () => void;
   fetchRunHistory: () => Promise<void>;
@@ -74,6 +76,7 @@ export const useScreeningStore = create<ScreeningState>((set, get) => ({
   tradeDate: today(),
   currentRun: null,
   isRunning: false,
+  isBackfilling: false,
   pollingTimer: null,
   runHistory: [],
   historyLoading: false,
@@ -89,7 +92,16 @@ export const useScreeningStore = create<ScreeningState>((set, get) => ({
   setTradeDate: (date) => set({ tradeDate: date }),
 
   startScreening: async () => {
-    const { mode, candidateLimit, aiTopK, tradeDate } = get();
+    const { mode, candidateLimit, aiTopK, tradeDate, isBackfilling } = get();
+    if (isBackfilling) {
+      set({
+        blockingDialog: {
+          title: "正在回填数据",
+          message: "股票数据回填完成前暂不能开始筛选，请稍后再试。",
+        },
+      });
+      return;
+    }
     const blockingDialog = buildTodayScreeningBlockDialog(tradeDate);
     if (blockingDialog) {
       set({
@@ -152,6 +164,42 @@ export const useScreeningStore = create<ScreeningState>((set, get) => ({
       set({
         isRunning: false,
         error: parsedError,
+      });
+    }
+  },
+
+  backfillStocksToTradeDate: async () => {
+    const { tradeDate } = get();
+    if (!tradeDate) {
+      set({
+        blockingDialog: {
+          title: "请选择交易日",
+          message: "请先选择目标交易日，再执行股票数据回填。",
+        },
+      });
+      return;
+    }
+    set({ isBackfilling: true, error: null, blockingDialog: null });
+    try {
+      const result = await screeningApi.backfillToDate({
+        tradeDate,
+        market: "cn",
+      });
+      const failedCount = result.failedDates.length;
+      const passStatus = result.governanceResult?.passStatus || "unknown";
+      set({
+        isBackfilling: false,
+        blockingDialog: {
+          title: failedCount > 0 || passStatus !== "passed" ? "回填完成但需检查" : "回填完成",
+          message:
+            `已回填到 ${result.targetTradeDate}，新增/更新 ${result.savedRows} 行。` +
+            `失败日期 ${failedCount} 个，审计状态：${passStatus}。`,
+        },
+      });
+    } catch (err) {
+      set({
+        isBackfilling: false,
+        error: getParsedApiError(err),
       });
     }
   },
@@ -329,6 +377,7 @@ export const useScreeningStore = create<ScreeningState>((set, get) => ({
     set({
       currentRun: null,
       isRunning: false,
+      isBackfilling: false,
       candidates: [],
       selectedCandidate: null,
       error: null,

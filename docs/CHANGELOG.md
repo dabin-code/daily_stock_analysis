@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Added K-line governance truth-source tables, audit service, repair service, and skip-registry workflow so daily data completeness is tracked explicitly instead of inferred from loose sync heuristics
 - Screening ingest now consumes audit-derived truth: blocking/retryable sync failures are no longer silently downgraded, and non-`passed` trade dates fail closed before factor building
+- Added a fast backfill-to-date path for screening: Web users can run `回填至该日`, the API exposes `POST /api/v1/screening/backfill-to-date`, and `scripts/fast_backfill.py --to-date YYYY-MM-DD` reuses the same service logic before target-date governance audit
 - Added scheduled K-line governance wiring with opt-in `17:00` post-close execution, independent deep-audit registration, and explicit failure bubbling through the scheduler
 - Added manual governance scripts for auditing/repairing completeness and approving `candidate_skip -> approved_skip` transitions
 - `MarketDataSyncService` now uses the Tushare bulk-daily snapshot as a sentinel: codes outside the bulk universe (delisted/suspended/不在 list 的股票) are immediately recorded with `reason='not_in_bulk_universe'` / `reason_class='skip_eligible'` instead of wasted individual fetcher fallbacks, dramatically shortening end-to-end sync time when `instrument_master` lags upstream listing changes. Toggle via `KLINE_SYNC_BULK_SENTINEL_ENABLED` (default `true`)

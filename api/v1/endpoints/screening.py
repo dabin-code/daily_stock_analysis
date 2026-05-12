@@ -7,6 +7,8 @@ from typing import List, Optional
 
 from api.v1.schemas.screening import (
     ScreeningCandidateDetailResponse,
+    ScreeningBackfillToDateRequest,
+    ScreeningBackfillToDateResponse,
     CreateScreeningRunRequest,
     ScreeningNotifyRequest,
     ScreeningCandidateListResponse,
@@ -21,6 +23,7 @@ from src.services.screening_notification_service import (
     ScreeningRunNotReadyError,
 )
 from src.services.screening_task_service import ScreeningTaskService, ScreeningTradeDateNotReadyError
+from src.services.fast_backfill_service import FastBackfillService
 
 router = APIRouter()
 
@@ -89,6 +92,31 @@ def get_screening_strategies() -> list[dict]:
 def list_screening_strategies() -> ScreeningStrategyListResponse:
     strategies = get_screening_strategies()
     return ScreeningStrategyListResponse(strategies=strategies)
+
+
+@router.post(
+    "/backfill-to-date",
+    response_model=ScreeningBackfillToDateResponse,
+    summary="快速回填股票数据到目标交易日",
+)
+def backfill_screening_data_to_date(
+    request: ScreeningBackfillToDateRequest,
+) -> ScreeningBackfillToDateResponse:
+    service = FastBackfillService()
+    try:
+        result = service.backfill_to_trade_date(
+            target_trade_date=request.trade_date,
+            market=request.market,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "validation_error",
+                "message": str(exc),
+            },
+        ) from exc
+    return ScreeningBackfillToDateResponse(**result)
 
 
 @router.post("/runs", response_model=ScreeningRunResponse, summary="执行一次全市场筛选")

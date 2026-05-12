@@ -18,6 +18,28 @@ class CreateScreeningRunRequest(BaseModel):
     market: Literal["cn"] = Field("cn", description="市场标识，MVP 仅支持 A 股")
 
 
+class ScreeningBackfillToDateRequest(BaseModel):
+    trade_date: date = Field(..., description="目标交易日，回填本地股票数据到该日")
+    market: Literal["cn"] = Field("cn", description="市场标识，MVP 仅支持 A 股")
+
+
+class ScreeningBackfillGovernanceResult(BaseModel):
+    trade_date: Optional[str] = None
+    run_result: Optional[str] = None
+    pass_status: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class ScreeningBackfillToDateResponse(BaseModel):
+    status: str
+    target_trade_date: str
+    from_trade_date: Optional[str] = None
+    backfilled_dates: List[str] = Field(default_factory=list)
+    saved_rows: int = 0
+    failed_dates: List[str] = Field(default_factory=list)
+    governance_result: ScreeningBackfillGovernanceResult
+
+
 class ScreeningNotifyRequest(BaseModel):
     limit: int = Field(10, ge=1, le=50, description="推送候选数量上限")
     with_ai_only: bool = Field(False, description="是否仅推送已进入 AI 二筛的候选")

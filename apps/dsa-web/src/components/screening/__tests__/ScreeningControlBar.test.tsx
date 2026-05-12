@@ -15,6 +15,8 @@ const mockStore = {
   blockingDialog: null as null | { title: string; message: string },
   clearBlockingDialog: vi.fn(),
   startScreening: vi.fn().mockResolvedValue(undefined),
+  backfillStocksToTradeDate: vi.fn().mockResolvedValue(undefined),
+  isBackfilling: false,
   reset: vi.fn(),
 };
 
@@ -26,6 +28,7 @@ describe('ScreeningControlBar', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockStore.isRunning = false;
+    mockStore.isBackfilling = false;
     mockStore.blockingDialog = null;
   });
 
@@ -41,10 +44,31 @@ describe('ScreeningControlBar', () => {
     expect(screen.getByRole('button', { name: /重置/ })).toBeInTheDocument();
   });
 
+  it('shows backfill button and triggers backfill to selected date', () => {
+    render(<ScreeningControlBar />);
+
+    fireEvent.click(screen.getByRole('button', { name: /回填至该日/ }));
+
+    expect(mockStore.backfillStocksToTradeDate).toHaveBeenCalledTimes(1);
+  });
+
   it('shows loading state when running', () => {
     mockStore.isRunning = true;
     render(<ScreeningControlBar />);
     expect(screen.getByRole('button', { name: /筛选中/ })).toBeDisabled();
+  });
+
+  it('disables backfill button while backfilling', () => {
+    mockStore.isBackfilling = true;
+    render(<ScreeningControlBar />);
+    expect(screen.getByRole('button', { name: /回填中/ })).toBeDisabled();
+  });
+
+  it('disables start and reset buttons while backfilling', () => {
+    mockStore.isBackfilling = true;
+    render(<ScreeningControlBar />);
+    expect(screen.getByRole('button', { name: /开始筛选/ })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /重置/ })).toBeDisabled();
   });
 
   it('renders date input', () => {

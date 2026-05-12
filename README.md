@@ -79,6 +79,7 @@ The scheduled prewarm is now best treated as an optional fallback. The primary l
 - 下游只应消费 `pass_status=passed` 的交易日；`not_passed` 表示该交易日仍存在非豁免缺口，筛选链路会 fail-close
 - 无法稳定拉取的股票缺口会先进入 `candidate_skip`，只有经过人工确认后才会升级为 `approved_skip`
 - 深度审计任务是独立 job，用于长窗口复核历史缺口与 `candidate_skip` 恢复情况，不会替代日常治理
+- 智能选股页提供 `回填至该日` 操作，可按所选交易日快速批量回填本地全市场日线数据，并在完成后触发目标日治理审计
 
 推荐环境变量：
 
@@ -94,6 +95,7 @@ The scheduled prewarm is now best treated as an optional fallback. The primary l
 python scripts/audit_kline_completeness.py --trade-date 2026-04-17
 python scripts/audit_kline_completeness.py --trade-date 2026-04-17 --repair
 python scripts/audit_kline_completeness.py --trade-date 2026-04-17 --dry-run
+python scripts/fast_backfill.py --to-date 2026-04-17
 python scripts/approve_kline_skip.py --market cn --trade-date 2026-04-17 --approved-by ops-user --reason-type manual_review
 python scripts/approve_kline_skip.py --market cn --code 000001 --from-date 2026-04-10 --to-date 2026-04-17 --approved-by ops-user --reason-type manual_review
 ```
@@ -101,6 +103,7 @@ python scripts/approve_kline_skip.py --market cn --code 000001 --from-date 2026-
 其中：
 
 - `audit_kline_completeness.py` 用于手工触发单次审计或完整补偿
+- `fast_backfill.py --to-date` 用于按交易日批量回填本地全市场日线数据到目标日期
 - `approve_kline_skip.py` 用于把人工确认无法拉取的 `candidate_skip` 升级为 `approved_skip`
 - 一旦 `approved_skip` 对应缺口在后续治理中连续恢复成功，系统会自动把它回收为健康状态
 

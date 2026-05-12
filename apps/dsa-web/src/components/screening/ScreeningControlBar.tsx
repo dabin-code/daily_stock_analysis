@@ -1,6 +1,6 @@
 import type React from "react";
 import { useState } from "react";
-import { Play, RotateCcw, Settings2, ChevronDown, ChevronUp } from "lucide-react";
+import { Play, RotateCcw, RefreshCw, Settings2, ChevronDown, ChevronUp } from "lucide-react";
 import { Button, Card, ConfirmDialog, Select } from "../common";
 import { useScreeningStore } from "../../stores/screeningStore";
 import { cn } from "../../utils/cn";
@@ -23,9 +23,11 @@ export const ScreeningControlBar: React.FC = () => {
     aiTopK,
     setAiTopK,
     isRunning,
+    isBackfilling,
     blockingDialog,
     clearBlockingDialog,
     startScreening,
+    backfillStocksToTradeDate,
     reset,
   } = useScreeningStore();
 
@@ -33,6 +35,10 @@ export const ScreeningControlBar: React.FC = () => {
 
   const handleStart = () => {
     void startScreening();
+  };
+
+  const handleBackfill = () => {
+    void backfillStocksToTradeDate();
   };
 
   return (
@@ -44,15 +50,26 @@ export const ScreeningControlBar: React.FC = () => {
               variant="primary"
               onClick={handleStart}
               isLoading={isRunning}
+              disabled={isBackfilling}
               loadingText="筛选中..."
               glow
             >
               <Play className="h-4 w-4" />
               开始筛选
             </Button>
-            <Button variant="ghost" onClick={reset} disabled={isRunning}>
+            <Button variant="ghost" onClick={reset} disabled={isRunning || isBackfilling}>
               <RotateCcw className="h-4 w-4" />
               重置
+            </Button>
+            <Button
+              variant="ghost"
+              onClick={handleBackfill}
+              disabled={isRunning || isBackfilling}
+              isLoading={isBackfilling}
+              loadingText="回填中..."
+            >
+              <RefreshCw className="h-4 w-4" />
+              回填至该日
             </Button>
           </div>
 

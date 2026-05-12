@@ -28,6 +28,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.services.fast_backfill_service import FastBackfillService
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -52,6 +54,10 @@ def get_tushare_api() -> Any:
 def get_db_path() -> str:
     from src.config import get_config
     return getattr(get_config(), "database_path", "./data/stock_analysis.db")
+
+
+def parse_date(value: str):
+    return datetime.strptime(value, "%Y-%m-%d").date()
 
 
 def get_trade_dates_from_db(reference_code: str = "000070") -> list:
@@ -156,10 +162,31 @@ def save_day_data(db_path: str, day_df: Any, index_df: Any) -> int:
 def main():
     parser = argparse.ArgumentParser(description="快速全市场历史数据回填")
     parser.add_argument("--days", type=int, default=250, help="回填最近 N 个交易日")
+    parser.add_argument("--to-date", dest="to_date", type=parse_date, help="回填到指定交易日（YYYY-MM-DD）")
+    parser.add_argument("--market", default="cn", help="市场，默认 cn")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-filled", action="store_true", default=True,
                         help="跳过已有全市场数据的日期")
     args = parser.parse_args()
+
+    if args.to_date:
+        if args.dry_run:
+            logger.info(f"[DRY RUN] 计划快速回填到 {args.to_date.isoformat()} market={args.market}")
+            return
+        result = FastBackfillService().backfill_to_trade_date(
+            target_trade_date=args.to_date,
+            market=args.market,
+        )
+        logger.info(
+            "回填到目标日期完成: status=%s target=%s saved_rows=%s failed_dates=%s audit=%s/%s",
+            result.get("status"),
+            result.get("target_trade_date"),
+            result.get("saved_rows"),
+            len(result.get("failed_dates") or []),
+            (result.get("governance_result") or {}).get("run_result"),
+            (result.get("governance_result") or {}).get("pass_status"),
+        )
+        return
 
     api = get_tushare_api()
     db_path = get_db_path()
