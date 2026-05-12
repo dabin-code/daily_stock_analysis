@@ -80,6 +80,7 @@ The scheduled prewarm is now best treated as an optional fallback. The primary l
 - 无法稳定拉取的股票缺口会先进入 `candidate_skip`，只有经过人工确认后才会升级为 `approved_skip`
 - 深度审计任务是独立 job，用于长窗口复核历史缺口与 `candidate_skip` 恢复情况，不会替代日常治理
 - 智能选股页提供 `回填至该日` 操作，可按所选交易日快速批量回填本地全市场日线数据，并在完成后触发目标日治理审计
+- Web 新增“数据健康”控制台，可查看本地股票池口径、K 线覆盖起止日期、日期覆盖率、审计通过日、K 线缺口和后台治理任务，并通过 `/api/v1/data-health/*` 提交回填、重试、修复、重新审计等操作
 
 推荐环境变量：
 
@@ -106,6 +107,7 @@ python scripts/approve_kline_skip.py --market cn --code 000001 --from-date 2026-
 - `fast_backfill.py --to-date` 用于按交易日批量回填本地全市场日线数据到目标日期
 - `approve_kline_skip.py` 用于把人工确认无法拉取的 `candidate_skip` 升级为 `approved_skip`
 - 一旦 `approved_skip` 对应缺口在后续治理中连续恢复成功，系统会自动把它回收为健康状态
+- `/api/v1/data-health/summary|coverage|gaps|operations|tasks` 用于 Web 控制台读取本地数据健康状态并轮询后台治理任务
 
 > 🤖 基于 AI 大模型的 A股/港股/美股自选股智能分析系统，每日自动分析并推送「决策仪表盘」到企业微信/飞书/Telegram/Discord/邮箱
 

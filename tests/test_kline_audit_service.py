@@ -240,6 +240,137 @@ class KlineAuditServiceTestCase(unittest.TestCase):
         self.assertEqual(symbol_range_gaps[0].missing_date_from, date(2026, 3, 13))
         self.assertEqual(symbol_range_gaps[0].missing_date_to, date(2026, 3, 16))
 
+    def test_audit_service_ignores_non_trading_target_date_for_gap_detection(self) -> None:
+        self._seed_active_instruments()
+        self.db.save_daily_data(
+            _build_daily_rows([date(2026, 3, 13)]),
+            "000001",
+            data_source="test",
+        )
+        self.db.save_daily_data(
+            _build_daily_rows([date(2026, 3, 13)]),
+            "000002",
+            data_source="test",
+        )
+
+        with patch.object(
+            KlineAuditService,
+            "_is_market_session",
+            side_effect=lambda *, market, trade_date: trade_date.weekday() < 5,
+        ):
+            result = self.service.audit_trade_date(
+                market="cn",
+                trade_date=date(2026, 3, 14),
+                window_start=date(2026, 3, 13),
+                window_end=date(2026, 3, 16),
+            )
+
+        self.assertEqual(result["run_result"], "degraded")
+        gap_dates = [
+            gap.trade_date
+            for gap in self.db.list_kline_audit_gaps(market="cn", gap_scope="market_day_gap")
+        ]
+        self.assertNotIn(date(2026, 3, 14), gap_dates)
+        self.assertNotIn(date(2026, 3, 15), gap_dates)
+        self.assertEqual(gap_dates, [date(2026, 3, 16)])
+
+    def test_audit_service_ignores_observed_weekend_rows_when_building_symbol_gaps(self) -> None:
+        self._seed_active_instruments()
+        self.db.save_daily_data(
+            _build_daily_rows([date(2026, 3, 13), date(2026, 3, 14), date(2026, 3, 16)]),
+            "000001",
+            data_source="test",
+        )
+        self.db.save_daily_data(
+            _build_daily_rows([date(2026, 3, 14)]),
+            "000002",
+            data_source="test",
+        )
+
+        with patch.object(
+            KlineAuditService,
+            "_is_market_session",
+            side_effect=lambda *, market, trade_date: trade_date.weekday() < 5,
+        ):
+            self.service.audit_trade_date(
+                market="cn",
+                trade_date=date(2026, 3, 16),
+                window_start=date(2026, 3, 13),
+                window_end=date(2026, 3, 16),
+            )
+
+        symbol_range_gaps = [
+            gap
+            for gap in self.db.list_kline_audit_gaps(market="cn", gap_scope="symbol_range_gap")
+            if gap.code == "000002"
+        ]
+        ranges = [(gap.missing_date_from, gap.missing_date_to) for gap in symbol_range_gaps]
+        self.assertEqual(ranges, [(date(2026, 3, 13), date(2026, 3, 16))])
+
+    def test_audit_service_ignores_weekday_market_holiday_when_building_gaps(self) -> None:
+        self._seed_active_instruments()
+        self.db.save_daily_data(
+            _build_daily_rows([date(2026, 3, 10), date(2026, 3, 12)]),
+            "000001",
+            data_source="test",
+        )
+        self.db.save_daily_data(
+            _build_daily_rows([date(2026, 3, 10), date(2026, 3, 12)]),
+            "000002",
+            data_source="test",
+        )
+
+        with patch.object(
+            KlineAuditService,
+            "_is_market_session",
+            side_effect=lambda *, market, trade_date: trade_date.weekday() < 5
+            and trade_date != date(2026, 3, 11),
+        ):
+            result = self.service.audit_trade_date(
+                market="cn",
+                trade_date=date(2026, 3, 12),
+                window_start=date(2026, 3, 10),
+                window_end=date(2026, 3, 12),
+            )
+
+        self.assertEqual(result["run_result"], "succeeded")
+        self.assertEqual(result["pass_status"], "passed")
+        self.assertEqual(self.db.list_kline_audit_gaps(market="cn"), [])
+
+    def test_audit_service_does_not_pass_non_trading_target_date_with_complete_window(self) -> None:
+        self._seed_active_instruments()
+        self.db.save_daily_data(
+            _build_daily_rows([date(2026, 3, 13)]),
+            "000001",
+            data_source="test",
+        )
+        self.db.save_daily_data(
+            _build_daily_rows([date(2026, 3, 13)]),
+            "000002",
+            data_source="test",
+        )
+
+        with patch.object(
+            KlineAuditService,
+            "_is_market_session",
+            side_effect=lambda *, market, trade_date: trade_date.weekday() < 5,
+        ):
+            result = self.service.audit_trade_date(
+                market="cn",
+                trade_date=date(2026, 3, 14),
+                window_start=date(2026, 3, 13),
+                window_end=date(2026, 3, 14),
+            )
+
+        self.assertEqual(result["run_result"], "degraded")
+        self.assertEqual(result["pass_status"], "not_passed")
+        self.assertEqual(self.db.list_kline_audit_gaps(market="cn"), [])
+
+        trade_date_row = self.db.get_kline_audit_trade_date(market="cn", trade_date=date(2026, 3, 14))
+        self.assertIsNotNone(trade_date_row)
+        self.assertEqual(trade_date_row.pass_status, "not_passed")
+        self.assertIsNone(trade_date_row.passed_at)
+
     def test_audit_service_marks_trade_date_not_passed_when_run_degraded(self) -> None:
         self._seed_active_instruments()
         self.db.save_daily_data(

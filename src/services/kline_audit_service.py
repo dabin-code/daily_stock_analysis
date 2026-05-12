@@ -50,11 +50,10 @@ class KlineAuditService:
         )
         market_dates = self._build_market_dates(
             market=market,
-            observed_by_code=observed_by_code,
-            trade_date=trade_date,
             window_start=window_start,
             window_end=window_end,
         )
+        target_is_market_session = self._is_market_session(market=market, trade_date=trade_date)
         approved_skips = self._load_approved_skips(market=market)
 
         market_day_gap_dates: List[date] = []
@@ -102,6 +101,8 @@ class KlineAuditService:
                 )
         run_result = "degraded" if market_day_gap_dates or symbol_gap_ranges else "succeeded"
         if fail_closed_empty_universe:
+            run_result = "degraded"
+        if not target_is_market_session:
             run_result = "degraded"
         pass_status = "passed" if run_result == "succeeded" else "not_passed"
         passed_at = datetime.now() if pass_status == "passed" else None
@@ -185,6 +186,8 @@ class KlineAuditService:
         }
         if fail_closed_empty_universe:
             completed_payload["fail_closed_reason"] = "empty_expected_universe"
+        if not target_is_market_session:
+            completed_payload["skip_reason"] = "non_trading_trade_date"
 
         event_payloads.append(
             {
@@ -307,38 +310,19 @@ class KlineAuditService:
         self,
         *,
         market: str,
-        observed_by_code: Dict[str, set[date]],
-        trade_date: date,
         window_start: date,
         window_end: date,
     ) -> List[date]:
-        anchor_dates = sorted(
-            {
-                observed_date
-                for dates in observed_by_code.values()
-                for observed_date in dates
-                if window_start <= observed_date <= window_end
-            }
-        )
-        if window_start <= trade_date <= window_end and trade_date not in anchor_dates:
-            anchor_dates.append(trade_date)
-            anchor_dates.sort()
-        if not anchor_dates:
+        if window_start > window_end:
             return []
 
-        market_dates = set(anchor_dates)
+        market_dates: List[date] = []
         candidate = window_start
-        while candidate < anchor_dates[0]:
+        while candidate <= window_end:
             if self._is_market_session(market=market, trade_date=candidate):
-                market_dates.add(candidate)
+                market_dates.append(candidate)
             candidate += timedelta(days=1)
-        for previous, current in zip(anchor_dates, anchor_dates[1:]):
-            candidate = previous + timedelta(days=1)
-            while candidate < current:
-                if self._is_market_session(market=market, trade_date=candidate):
-                    market_dates.add(candidate)
-                candidate += timedelta(days=1)
-        return sorted(market_dates)
+        return market_dates
 
     @staticmethod
     def _is_market_session(*, market: str, trade_date: date) -> bool:

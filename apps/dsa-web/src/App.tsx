@@ -3,6 +3,7 @@ import { useEffect } from 'react';
 import { BrowserRouter as Router, Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import HomePage from './pages/HomePage';
 import BacktestPage from './pages/BacktestPage';
+import DataHealthPage from './pages/DataHealthPage';
 import ScreeningPage from './pages/ScreeningPage';
 import SettingsPage from './pages/SettingsPage';
 import LoginPage from './pages/LoginPage';
@@ -65,6 +66,7 @@ const AppContent: React.FC = () => {
         <Route path="/" element={<HomePage />} />
         <Route path="/chat" element={<ChatPage />} />
         <Route path="/portfolio" element={<PortfolioPage />} />
+        <Route path="/data-health" element={<DataHealthPage />} />
         <Route path="/backtest" element={<BacktestPage />} />
         <Route path="/screening" element={<ScreeningPage />} />
         <Route path="/settings" element={<SettingsPage />} />
