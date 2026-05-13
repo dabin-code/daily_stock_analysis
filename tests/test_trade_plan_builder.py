@@ -398,6 +398,74 @@ class TestTradePlanBuilder(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertIn("现价25.50", result.execution_note)
 
+    # ── 真实交易回放所需结构化字段 ─────────────────────────────────
+
+    def test_low123_plan_carries_structured_entry_and_exit_prices(self) -> None:
+        result = self.builder.build(
+            trade_stage=TradeStage.PROBE_ENTRY,
+            setup_type=SetupType.LOW123_BREAKOUT,
+            entry_maturity=EntryMaturity.HIGH,
+            risk_level=RiskLevel.MEDIUM,
+            pool_level=CandidatePoolLevel.LEADER_POOL,
+            factor_snapshot={
+                "pattern_123_entry_price": 12.5,
+                "pattern_123_stop_loss": 11.8,
+            },
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.entry_price, 12.5)
+        self.assertEqual(result.entry_rule, "触达低位123结构买点")
+        self.assertEqual(result.stop_loss_price, 11.8)
+        self.assertEqual(result.time_stop_days, 3)
+        self.assertEqual(result.entry_valid_days, 1)
+
+    def test_hot_theme_risk_params_drive_structured_trade_plan(self) -> None:
+        result = self.builder.build(
+            trade_stage=TradeStage.PROBE_ENTRY,
+            setup_type=SetupType.TREND_BREAKOUT,
+            entry_maturity=EntryMaturity.HIGH,
+            risk_level=RiskLevel.MEDIUM,
+            pool_level=CandidatePoolLevel.LEADER_POOL,
+            factor_snapshot={
+                "close": 20.0,
+                "risk_params": {
+                    "stop_loss": 18.8,
+                    "take_profit_ratio": 0.1,
+                },
+            },
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.entry_price, 20.0)
+        self.assertEqual(result.stop_loss_price, 18.8)
+        self.assertEqual(result.take_profit_price, 22.0)
+        self.assertTrue(any("止损" in rule for rule in result.exit_rules))
+        self.assertTrue(any("止盈" in rule for rule in result.exit_rules))
+
+    def test_trade_plan_json_round_trips_structured_fields(self) -> None:
+        result = self.builder.build(
+            trade_stage=TradeStage.PROBE_ENTRY,
+            setup_type=SetupType.BOTTOM_DIVERGENCE_BREAKOUT,
+            entry_maturity=EntryMaturity.HIGH,
+            risk_level=RiskLevel.MEDIUM,
+            pool_level=CandidatePoolLevel.LEADER_POOL,
+            factor_snapshot={
+                "bottom_divergence_entry_price": 8.8,
+                "bottom_divergence_stop_loss": 8.2,
+                "bottom_divergence_exit_plan": {
+                    "take_profit_targets": [
+                        {"target_price": 9.7, "label": "第一目标", "action": "减半"}
+                    ]
+                },
+            },
+        )
+
+        payload = json.loads(json.dumps(result, default=lambda item: getattr(item, "value", item.__dict__)))
+        self.assertEqual(payload["entry_price"], 8.8)
+        self.assertEqual(payload["stop_loss_price"], 8.2)
+        self.assertEqual(payload["take_profit_price"], 9.7)
+
 
 if __name__ == "__main__":
     unittest.main()

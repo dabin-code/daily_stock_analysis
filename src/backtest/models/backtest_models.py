@@ -143,6 +143,16 @@ class FiveLayerBacktestEvaluation(Base):
     entry_fill_price = Column(Float)
     exit_fill_status = Column(String(32))
     exit_fill_price = Column(Float)
+    planned_entry_price = Column(Float)
+    planned_stop_loss_price = Column(Float)
+    planned_take_profit_price = Column(Float)
+    actual_entry_price = Column(Float)
+    actual_entry_date = Column(Date)
+    actual_exit_price = Column(Float)
+    actual_exit_date = Column(Date)
+    exit_reason = Column(String(32))
+    trade_return_pct = Column(Float)
+    trade_replay_status = Column(String(32), index=True)
     limit_blocked = Column(Boolean, default=False)
     gap_adjusted = Column(Boolean, default=False)
     ambiguous_intraday_order = Column(Boolean, default=False)
@@ -224,6 +234,16 @@ class FiveLayerBacktestEvaluation(Base):
             "entry_fill_price": self.entry_fill_price,
             "exit_fill_status": self.exit_fill_status,
             "exit_fill_price": self.exit_fill_price,
+            "planned_entry_price": self.planned_entry_price,
+            "planned_stop_loss_price": self.planned_stop_loss_price,
+            "planned_take_profit_price": self.planned_take_profit_price,
+            "actual_entry_price": self.actual_entry_price,
+            "actual_entry_date": self.actual_entry_date.isoformat() if self.actual_entry_date else None,
+            "actual_exit_price": self.actual_exit_price,
+            "actual_exit_date": self.actual_exit_date.isoformat() if self.actual_exit_date else None,
+            "exit_reason": self.exit_reason,
+            "trade_return_pct": self.trade_return_pct,
+            "trade_replay_status": self.trade_replay_status,
             "limit_blocked": self.limit_blocked,
             "gap_adjusted": self.gap_adjusted,
             "forward_return_1d": self.forward_return_1d,

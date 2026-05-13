@@ -58,10 +58,19 @@ interface ResearchDegradedState {
   detail: string;
 }
 
+interface SampleQualityNotice {
+  title: string;
+  messages: string[];
+  severity: 'warning' | 'info';
+}
+
 const ENTRY_MODE_OPTIONS: Array<{ value: BacktestEntryMode; label: string }> = [
   { value: 'screening', label: '研究模式（按选股运行）' },
   { value: 'replay', label: '回放模式（按日期区间）' },
 ];
+
+const MIN_RESEARCH_SAMPLE_COUNT = 30;
+const MIN_ENTRY_SAMPLE_COUNT = 5;
 
 function defaultRange(): { from: string; to: string } {
   const today = new Date();
@@ -107,6 +116,110 @@ function buildFallbackSampleBaseline(
 function pct(value?: number | null): string {
   if (value == null) return '--';
   return `${value.toFixed(1)}%`;
+}
+
+function entryComparableReturn(item: BacktestResultItem): number {
+  return item.tradeReturnPct ?? item.forwardReturn5d ?? item.riskAvoidedPct ?? -Infinity;
+}
+
+function renderEvaluationModeLabel(value?: string | null): string {
+  switch (value) {
+    case 'historical_snapshot':
+      return '历史快照';
+    case 'rule_replay':
+      return '规则回放';
+    case 'parameter_calibration':
+      return '参数校准';
+    default:
+      return value || '--';
+  }
+}
+
+function renderExecutionModelLabel(value?: string | null): string {
+  switch (value) {
+    case 'conservative':
+      return '保守执行';
+    case 'baseline':
+      return '基准执行';
+    case 'optimistic':
+      return '乐观执行';
+    default:
+      return value || '--';
+  }
+}
+
+function renderMarketLabel(value?: string | null): string {
+  switch ((value || '').toLowerCase()) {
+    case 'cn':
+      return 'A股';
+    case 'hk':
+      return '港股';
+    case 'us':
+      return '美股';
+    default:
+      return value?.toUpperCase() || '--';
+  }
+}
+
+function renderSuppressionReasonLabel(reason: string): string {
+  switch (reason) {
+    case 'observation_only':
+      return '仅观察样本';
+    case 'threshold_suppressed':
+      return '样本阈值不足';
+    case 'no_forward_bars':
+      return '缺少后续K线';
+    case 'gap_too_long':
+      return '后续窗口停牌过长';
+    case 'insufficient_forward_bars':
+      return '后续K线不足';
+    case 'forward_window_immature':
+      return '观察窗口未成熟';
+    case 'missing_forward_return_5d':
+      return '缺少5日收益';
+    case 'missing_risk_avoided_pct':
+      return '缺少避险指标';
+    case 'missing_primary_metric':
+      return '缺少主指标';
+    case 'exit_family_not_implemented':
+      return '卖出信号暂未评估';
+    default:
+      if (reason.startsWith('exec_not_filled:')) {
+        return `未成交: ${reason.replace('exec_not_filled:', '')}`;
+      }
+      if (reason.startsWith('exception:')) {
+        return `评估异常: ${reason.replace('exception:', '')}`;
+      }
+      return reason;
+  }
+}
+
+function renderEntryTimingLabel(value?: string | null): string {
+  switch (value) {
+    case 'on_time':
+      return '时机合适';
+    case 'too_early':
+      return '偏早';
+    case 'too_late':
+      return '偏晚';
+    case 'not_applicable':
+      return '不适用';
+    default:
+      return value || '--';
+  }
+}
+
+function renderSampleBucketLabel(value?: string | null): string {
+  switch (value) {
+    case 'core':
+      return '核心样本';
+    case 'boundary':
+      return '边界样本';
+    case 'noise':
+      return '噪音样本';
+    default:
+      return value || '--';
+  }
 }
 
 function formatDateTime(value?: string | null): string {
@@ -222,8 +335,8 @@ function buildResearchDegradedState(evaluations: BacktestResultItem[]): Research
   const reasons: string[] = [];
   const detailParts: string[] = [];
   if (observationCount > 0 && entryCount === 0) {
-    reasons.push('Observation 主导');
-    detailParts.push('当前运行以 observation 为主');
+    reasons.push('观察样本主导');
+    detailParts.push('当前运行以观察样本为主');
   }
   if (!hasPrimaryStrategy) {
     reasons.push('无主策略归因');
@@ -246,6 +359,37 @@ function buildResearchDegradedState(evaluations: BacktestResultItem[]): Research
   };
 }
 
+function buildSampleQualityNotice(baseline: BacktestSampleBaseline | null): SampleQualityNotice | null {
+  if (!baseline) {
+    return null;
+  }
+
+  const messages: string[] = [];
+  const rawCount = baseline.rawSampleCount ?? 0;
+  const entryCount = baseline.entrySampleCount ?? 0;
+  const observationCount = baseline.observationSampleCount ?? 0;
+
+  if (rawCount > 0 && rawCount < MIN_RESEARCH_SAMPLE_COUNT) {
+    messages.push(`本次只有 ${rawCount} 个原始样本，低于 ${MIN_RESEARCH_SAMPLE_COUNT} 个研究样本的建议门槛，分组胜率和排名有效性容易被个别样本影响。`);
+  }
+  if (entryCount === 0 && observationCount > 0) {
+    messages.push('本次回测没有入场样本，不能用于判断买入收益或买点有效性。');
+    messages.push('观察样本只说明“等待/观望是否避开风险”，不是买入后的收益。');
+  } else if (entryCount > 0 && entryCount < MIN_ENTRY_SAMPLE_COUNT) {
+    messages.push(`本次只有 ${entryCount} 个入场样本，买点收益结论还不稳定，建议扩大历史样本后再判断。`);
+  }
+
+  if (messages.length === 0) {
+    return null;
+  }
+
+  return {
+    title: entryCount === 0 ? '样本不足，结论仅供观察' : '样本偏少，结论需谨慎',
+    messages,
+    severity: 'warning',
+  };
+}
+
 function getWarningTag(
   evaluations: BacktestResultItem[],
   cohortSummary: BacktestSummaryItem | null,
@@ -255,7 +399,7 @@ function getWarningTag(
     return '边界样本偏多';
   }
   if (cohortSummary?.strategyCohortContext?.sampleBucket) {
-    return `${cohortSummary.strategyCohortContext.sampleBucket} 样本主导`;
+    return `${renderSampleBucketLabel(cohortSummary.strategyCohortContext.sampleBucket)}主导`;
   }
   if (evaluations.length > 0 && evaluations.every((item) => item.signalFamily === 'observation')) {
     return '观察信号主导';
@@ -358,12 +502,12 @@ const BacktestPage: React.FC = () => {
   const [loadedRunEntryMode, setLoadedRunEntryMode] = useState<BacktestEntryMode | null>(null);
   const [loadedRunScreeningContext, setLoadedRunScreeningContext] = useState<{ runId: string; tradeDate?: string | null } | null>(null);
   const displayedEntryMode = runResult ? (loadedRunEntryMode ?? entryMode) : entryMode;
-  const displayedMarket = (runResult?.market ?? market).toUpperCase();
+  const displayedMarket = renderMarketLabel(runResult?.market ?? market);
   const displayedDateRange = runResult
     ? `${runResult.tradeDateFrom ?? '--'} - ${runResult.tradeDateTo ?? '--'}`
     : `${tradeDateFrom} - ${tradeDateTo}`;
-  const displayedEvaluationMode = runResult?.evaluationMode ?? evaluationMode;
-  const displayedExecutionModel = runResult?.executionModel ?? executionModel;
+  const displayedEvaluationMode = renderEvaluationModeLabel(runResult?.evaluationMode ?? evaluationMode);
+  const displayedExecutionModel = renderExecutionModelLabel(runResult?.executionModel ?? executionModel);
 
   useEffect(() => {
     document.title = '五层回测 - 每日股票分析';
@@ -559,8 +703,8 @@ const BacktestPage: React.FC = () => {
         strategyKey: primary,
         displayName: getStrategyDisplayName(primary),
         metaLabel: item.strategyCohortContext?.sampleBucket
-          ? `cohort · ${item.strategyCohortContext.sampleBucket}`
-          : '策略 cohort',
+          ? `策略分组 · ${renderSampleBucketLabel(item.strategyCohortContext.sampleBucket)}`
+          : '策略分组',
         sampleCount: item.sampleCount,
         winRatePct: item.winRatePct,
         avgReturnPct: item.avgReturnPct,
@@ -616,6 +760,10 @@ const BacktestPage: React.FC = () => {
     () => Object.entries(researchSampleBaseline?.suppressedReasons ?? {}).sort((left, right) => right[1] - left[1]),
     [researchSampleBaseline?.suppressedReasons],
   );
+  const sampleQualityNotice = useMemo(
+    () => buildSampleQualityNotice(researchSampleBaseline),
+    [researchSampleBaseline],
+  );
 
   const selectedStrategyCohort = useMemo(
     () => {
@@ -663,8 +811,7 @@ const BacktestPage: React.FC = () => {
   const representativeEvaluation = useMemo(() => {
     if (filteredEvaluations.length === 0) return null;
     return [...filteredEvaluations].sort(
-      (left, right) => (right.forwardReturn5d ?? right.riskAvoidedPct ?? -Infinity)
-        - (left.forwardReturn5d ?? left.riskAvoidedPct ?? -Infinity),
+      (left, right) => entryComparableReturn(right) - entryComparableReturn(left),
     )[0];
   }, [filteredEvaluations]);
 
@@ -815,7 +962,7 @@ const BacktestPage: React.FC = () => {
                 <div className="text-sm font-semibold text-foreground">研究上下文</div>
                 <Badge variant="default">
                   {hasAuthoritativeSampleBaseline
-                    ? (researchSampleBaseline?.suppressedSampleCount ? `${researchSampleBaseline.suppressedSampleCount} suppressed` : '样本口径已对齐')
+                    ? (researchSampleBaseline?.suppressedSampleCount ? `${researchSampleBaseline.suppressedSampleCount} 个样本已抑制` : '样本口径已对齐')
                     : '估算口径'}
                 </Badge>
               </div>
@@ -824,9 +971,9 @@ const BacktestPage: React.FC = () => {
                   { label: '原始样本', value: researchSampleBaseline?.rawSampleCount ?? '--' },
                   { label: '已评估', value: researchSampleBaseline?.evaluatedSampleCount ?? '--' },
                   { label: '可汇总', value: researchSampleBaseline?.aggregatableSampleCount ?? '--' },
-                  { label: 'Entry', value: researchSampleBaseline?.entrySampleCount ?? '--' },
-                  { label: 'Observation', value: researchSampleBaseline?.observationSampleCount ?? '--' },
-                  { label: 'Suppressed', value: researchSampleBaseline?.suppressedSampleCount ?? '--' },
+                  { label: '入场样本', value: researchSampleBaseline?.entrySampleCount ?? '--' },
+                  { label: '观察样本', value: researchSampleBaseline?.observationSampleCount ?? '--' },
+                  { label: '已抑制', value: researchSampleBaseline?.suppressedSampleCount ?? '--' },
                 ].map((item) => (
                   <div key={item.label} className="rounded-2xl bg-black/10 px-4 py-3">
                     <div className="text-[11px] uppercase tracking-[0.18em] text-secondary-text">{item.label}</div>
@@ -836,10 +983,10 @@ const BacktestPage: React.FC = () => {
               </div>
               {suppressionReasonEntries.length > 0 ? (
                 <div className="mt-4">
-                  <div className="text-[11px] uppercase tracking-[0.18em] text-secondary-text">Suppressed 原因</div>
+                  <div className="text-[11px] uppercase tracking-[0.18em] text-secondary-text">抑制原因</div>
                   <div className="mt-2 flex flex-wrap gap-2">
                     {suppressionReasonEntries.map(([reason, count]) => (
-                      <Badge key={reason} variant="warning">{`${reason} ${count}`}</Badge>
+                      <Badge key={reason} variant="warning">{`${renderSuppressionReasonLabel(reason)} ${count}`}</Badge>
                     ))}
                   </div>
                 </div>
@@ -849,9 +996,23 @@ const BacktestPage: React.FC = () => {
                 </div>
               ) : (
                 <div className="mt-4 text-xs text-secondary-text">
-                  当前运行没有额外 suppressed 原因，页面看到的样本口径可以直接用于研究结论。
+                  当前运行没有额外抑制原因，页面看到的样本口径可以直接用于研究阅读。
                 </div>
               )}
+            </div>
+          </div>
+        ) : null}
+
+        {sampleQualityNotice ? (
+          <div className="mb-4 rounded-3xl border border-warning/20 bg-warning/5 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="text-sm font-semibold text-white">{sampleQualityNotice.title}</div>
+              <Badge variant="warning">{sampleQualityNotice.severity === 'warning' ? '请谨慎解读' : '阅读提示'}</Badge>
+            </div>
+            <div className="mt-3 space-y-2 text-sm leading-6 text-secondary-text">
+              {sampleQualityNotice.messages.map((message) => (
+                <p key={message}>{message}</p>
+              ))}
             </div>
           </div>
         ) : null}
@@ -1044,7 +1205,7 @@ const BacktestPage: React.FC = () => {
                   <div className="mt-3 grid gap-2">
                     {selectedStrategyEntryTimingDistribution.map((item) => (
                       <div key={item.label} className="rounded-xl border border-white/8 bg-black/10 px-3 py-2 font-mono text-foreground">
-                        {item.label}: {item.count}
+                        {renderEntryTimingLabel(item.label)}: {item.count}
                       </div>
                     ))}
                   </div>

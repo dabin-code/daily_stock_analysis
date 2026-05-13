@@ -66,7 +66,61 @@ function countBy<T extends string>(items: T[]): Record<string, number> {
 function topDistributionLabel(entries: Record<string, number>): string {
   const first = Object.entries(entries).sort((a, b) => b[1] - a[1])[0];
   if (!first) return '--';
-  return `${first[0]} (${first[1]})`;
+  return `${renderValueLabel(first[0])} (${first[1]})`;
+}
+
+function renderValueLabel(value?: string | null): string {
+  switch (value) {
+    case 'entry':
+      return '入场';
+    case 'observation':
+      return '观察';
+    case 'exit':
+      return '卖出';
+    case 'core':
+      return '核心样本';
+    case 'boundary':
+      return '边界样本';
+    case 'noise':
+      return '噪音样本';
+    case 'balanced':
+      return '均衡';
+    case 'weak':
+      return '偏弱';
+    case 'bull':
+    case 'aggressive':
+      return '进攻';
+    case 'bear':
+    case 'defensive':
+      return '防守';
+    case 'stand_aside':
+      return '空仓观望';
+    case 'leader_pool':
+      return '龙头池';
+    case 'focus_list':
+      return '重点观察池';
+    case 'watchlist':
+      return '观察池';
+    case 'high':
+    case 'HIGH':
+      return '高';
+    case 'medium':
+    case 'MEDIUM':
+      return '中';
+    case 'low':
+    case 'LOW':
+      return '低';
+    case 'on_time':
+      return '时机合适';
+    case 'too_early':
+      return '偏早';
+    case 'too_late':
+      return '偏晚';
+    case 'not_applicable':
+      return '不适用';
+    default:
+      return value || '--';
+  }
 }
 
 function renderPrimaryStrategy(value?: string | null): string {
@@ -125,7 +179,7 @@ function renderRecommendationScope(value?: string | null): string {
     case 'market_regime':
       return '市场环境';
     case 'strategy_cohort':
-      return '策略 Cohort';
+      return '策略分组';
     default:
       return value || '--';
   }
@@ -134,11 +188,11 @@ function renderRecommendationScope(value?: string | null): string {
 function renderSignalFamily(value?: string | null): string {
   switch (value) {
     case 'entry':
-      return 'Entry';
+      return '入场';
     case 'observation':
-      return 'Observation';
+      return '观察';
     case 'exit':
-      return 'Exit';
+      return '卖出';
     default:
       return value || '--';
   }
@@ -237,6 +291,10 @@ export const StrategyResearchCanvas: React.FC<StrategyResearchCanvasProps> = ({
   onAbnormalSampleSelect,
 }) => {
   const performanceSummary = summary ?? cohortSummary;
+  const entryEvaluations = evaluations.filter((item) => item.signalFamily === 'entry');
+  const hasRealTradeReplay = entryEvaluations.some((item) => item.tradeReturnPct != null);
+  const allEntrySamplesReplayed = entryEvaluations.length > 0
+    && entryEvaluations.every((item) => item.tradeReturnPct != null);
   const sampleBuckets = countBy(
     evaluations
       .map((item) => item.sampleBucket)
@@ -269,6 +327,9 @@ export const StrategyResearchCanvas: React.FC<StrategyResearchCanvasProps> = ({
   ));
   const abnormalCount = abnormalSamples.length;
   const rankingComparisons = rankingEffectiveness?.comparisons ?? [];
+  const entrySampleCount = evaluations.filter((item) => item.signalFamily === 'entry').length;
+  const observationSampleCount = evaluations.filter((item) => item.signalFamily === 'observation').length;
+  const isObservationOnly = evaluations.length > 0 && entrySampleCount === 0 && observationSampleCount > 0;
   const sortRecommendations = (items: BacktestRecommendationItem[]) => [...items].sort((left, right) => {
     const leftRelevant = isRecommendationRelevantToStrategy(left, strategyKey, strategySelectionKey) ? 1 : 0;
     const rightRelevant = isRecommendationRelevantToStrategy(right, strategyKey, strategySelectionKey) ? 1 : 0;
@@ -303,7 +364,7 @@ export const StrategyResearchCanvas: React.FC<StrategyResearchCanvasProps> = ({
           </div>
           <div className="flex flex-wrap gap-2">
             {warningTag ? <Badge variant="warning">{warningTag}</Badge> : null}
-            {cohortSummary?.strategyCohortContext?.primaryStrategy ? <Badge variant="info">P0 Cohort</Badge> : null}
+            {cohortSummary?.strategyCohortContext?.primaryStrategy ? <Badge variant="info">P0 策略群组</Badge> : null}
             {summary?.systemGrade ? <Badge variant="success">评级 {summary.systemGrade}</Badge> : null}
             <Badge variant="default">{abnormalCount} 个异常样本</Badge>
           </div>
@@ -335,7 +396,7 @@ export const StrategyResearchCanvas: React.FC<StrategyResearchCanvasProps> = ({
             <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
               <div>
                 <div className="text-sm font-semibold text-white">研究动作建议</div>
-                <div className="mt-1 text-xs text-secondary-text">把本次运行返回的 recommendations 转成动作、观察与 display 三层研究建议；当前策略 badge 只标记 direct 命中的 setup/cohort 建议。</div>
+                <div className="mt-1 text-xs text-secondary-text">把本次运行返回的研究建议拆成优先动作、继续观察和仅展示三层；当前策略标记只表示建议直接命中当前策略或策略分组。</div>
               </div>
               <div className="flex flex-wrap gap-2">
                 <Badge variant="success">{`优先动作 ${actionableRecommendations.length}`}</Badge>
@@ -361,7 +422,7 @@ export const StrategyResearchCanvas: React.FC<StrategyResearchCanvasProps> = ({
                 },
                 {
                   title: '仅展示',
-                  hint: '当前只到 observation/display 层级，通常代表样本或稳定性仍不足。',
+                  hint: '当前只到观察或展示层级，通常代表样本或稳定性仍不足。',
                   items: observationRecommendations,
                   empty: '当前没有仅展示层级的建议。',
                 },
@@ -375,7 +436,7 @@ export const StrategyResearchCanvas: React.FC<StrategyResearchCanvasProps> = ({
                 <div key={bucket.title} className="rounded-2xl border border-white/8 bg-black/10 p-4">
                   <div className="text-sm font-semibold text-white">{bucket.title}</div>
                   <div className="mt-1 text-xs text-secondary-text">
-                    {bucket.title === '仅展示' ? '仅到 display 层级，暂不形成动作。' : bucket.hint}
+                    {bucket.title === '仅展示' ? '仅到展示层级，暂不形成动作。' : bucket.hint}
                   </div>
                   <div className="mt-3 space-y-3">
                     {bucket.items.length === 0 ? (
@@ -468,10 +529,16 @@ export const StrategyResearchCanvas: React.FC<StrategyResearchCanvasProps> = ({
 
         <div>
           <div className="mb-3 text-sm font-semibold text-white">策略表现</div>
+          {isObservationOnly ? (
+            <div className="mb-3 rounded-2xl border border-warning/20 bg-warning/5 px-4 py-3 text-sm text-secondary-text">
+              <div className="font-semibold text-white">收益类指标已降级为观察指标</div>
+              <div className="mt-1">当前没有入场样本，平均收益位置展示的是观察避险效果，不代表买入收益。</div>
+            </div>
+          ) : null}
           <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
             {[
               { label: '胜率', value: pct(performanceSummary?.winRatePct) },
-              { label: '平均收益', value: pct(performanceSummary?.avgReturnPct) },
+              { label: isObservationOnly ? '观察避险' : allEntrySamplesReplayed ? '真实交易收益' : hasRealTradeReplay ? '平均收益（含真实回放）' : '平均收益', value: pct(performanceSummary?.avgReturnPct) },
               { label: '盈亏比', value: num(performanceSummary?.profitFactor) },
               { label: '平均MAE', value: pct(performanceSummary?.avgMae) },
             ].map((item) => (
@@ -503,7 +570,7 @@ export const StrategyResearchCanvas: React.FC<StrategyResearchCanvasProps> = ({
                 <div className="mt-2 text-lg font-semibold text-white">{evaluations.length}</div>
               </div>
               <div className="rounded-2xl bg-black/10 px-4 py-4">
-                <div className="text-xs uppercase tracking-[0.18em] text-secondary-text">Entry样本</div>
+                <div className="text-xs uppercase tracking-[0.18em] text-secondary-text">入场样本</div>
                 <div className="mt-2 text-lg font-semibold text-white">{cohortSummary?.familyBreakdown?.entry?.sampleCount ?? '--'}</div>
               </div>
               <div className="rounded-2xl bg-black/10 px-4 py-4 sm:col-span-2">
@@ -511,7 +578,7 @@ export const StrategyResearchCanvas: React.FC<StrategyResearchCanvasProps> = ({
                 <div className="mt-3 grid gap-2 sm:grid-cols-2">
                   {marketRegimes.map((item) => (
                     <div key={item.label} className="rounded-xl border border-white/8 bg-white/3 px-3 py-2 text-sm">
-                      <span className="font-mono text-foreground">{item.label}: {item.count}</span>
+                      <span className="font-mono text-foreground">{renderValueLabel(item.label)}: {item.count}</span>
                     </div>
                   ))}
                 </div>
@@ -520,7 +587,7 @@ export const StrategyResearchCanvas: React.FC<StrategyResearchCanvasProps> = ({
                 <div className="text-xs uppercase tracking-[0.18em] text-secondary-text">候选池与成熟度</div>
                 <div className="mt-3 flex flex-wrap gap-2 text-sm">
                   {Array.from(new Set(
-                    evaluations.map((item) => `${item.snapshotCandidatePoolLevel ?? '--'} / ${item.snapshotEntryMaturity ?? '--'}`),
+                    evaluations.map((item) => `${renderValueLabel(item.snapshotCandidatePoolLevel)} / ${renderValueLabel(item.snapshotEntryMaturity)}`),
                   )).map((item) => (
                     <span key={item} className="rounded-full border border-white/10 bg-white/3 px-3 py-1 text-secondary-text">
                       {item}
@@ -624,7 +691,7 @@ export const StrategyResearchCanvas: React.FC<StrategyResearchCanvasProps> = ({
                         : 'border-white/10 bg-black/10 text-secondary-text'
                     }`}
                   >
-                    {`分层: ${item}`}
+                    {`分层: ${renderValueLabel(item)}`}
                   </button>
                 ))}
               </div>
@@ -655,7 +722,7 @@ export const StrategyResearchCanvas: React.FC<StrategyResearchCanvasProps> = ({
                         : 'border-white/10 bg-black/10 text-secondary-text'
                     }`}
                   >
-                    {`时机: ${item}`}
+                    {`时机: ${renderValueLabel(item)}`}
                   </button>
                 ))}
               </div>
@@ -678,12 +745,12 @@ export const StrategyResearchCanvas: React.FC<StrategyResearchCanvasProps> = ({
                       <div className="text-sm font-semibold text-foreground">{item.code}</div>
                       <div className="mt-1 text-xs text-secondary-text">{item.name ?? '--'} · {item.tradeDate ?? '--'}</div>
                     </div>
-                    <Badge variant="warning">{item.sampleBucket ?? 'abnormal'}</Badge>
+                    <Badge variant="warning">{renderValueLabel(item.sampleBucket ?? 'abnormal')}</Badge>
                   </div>
                   <div className="mt-3 grid gap-2 text-sm">
                     <div className="flex items-center justify-between">
                       <span className="text-secondary-text">买点时机</span>
-                      <span className="font-mono text-foreground">{item.entryTimingLabel ?? '--'}</span>
+                      <span className="font-mono text-foreground">{renderValueLabel(item.entryTimingLabel)}</span>
                     </div>
                     <div className="flex items-center justify-between">
                       <span className="text-secondary-text">Low123校验</span>
@@ -691,7 +758,7 @@ export const StrategyResearchCanvas: React.FC<StrategyResearchCanvasProps> = ({
                     </div>
                     <div className="flex items-center justify-between">
                       <span className="text-secondary-text">信号族</span>
-                      <span className="font-mono text-foreground">{item.signalFamily}</span>
+                      <span className="font-mono text-foreground">{renderSignalFamily(item.signalFamily)}</span>
                     </div>
                   </div>
                 </button>

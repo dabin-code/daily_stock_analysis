@@ -71,8 +71,8 @@ const today = () => getTodayInShanghai();
 
 export const useScreeningStore = create<ScreeningState>((set, get) => ({
   mode: "balanced",
-  candidateLimit: 5,
-  aiTopK: 2,
+  candidateLimit: 10,
+  aiTopK: 0,
   tradeDate: today(),
   currentRun: null,
   isRunning: false,
@@ -190,7 +190,10 @@ export const useScreeningStore = create<ScreeningState>((set, get) => ({
       set({
         isBackfilling: false,
         blockingDialog: {
-          title: failedCount > 0 || passStatus !== "passed" ? "回填完成但需检查" : "回填完成",
+          title:
+            failedCount > 0 || passStatus !== "passed"
+              ? "回填完成但需检查"
+              : "回填完成",
           message:
             `已回填到 ${result.targetTradeDate}，新增/更新 ${result.savedRows} 行。` +
             `失败日期 ${failedCount} 个，审计状态：${passStatus}。`,
@@ -270,7 +273,9 @@ export const useScreeningStore = create<ScreeningState>((set, get) => ({
         runHistory: data.items,
         currentRun: nextCurrentRun,
         historyLoading: false,
-        isRunning: nextCurrentRun ? !isTerminalStatus(nextCurrentRun.status) : false,
+        isRunning: nextCurrentRun
+          ? !isTerminalStatus(nextCurrentRun.status)
+          : false,
       });
 
       if (

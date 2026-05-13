@@ -296,21 +296,24 @@ def aggregate_group(
     aggregatable_count = len(valid)
 
     # Primary return source depends on which family we are aggregating.
-    # - family_filter='entry'      → only forward_return_5d (directional pnl)
+    # - family_filter='entry'      → real trade_return_pct when available,
+    #   otherwise legacy forward_return_5d
     # - family_filter='observation'→ only risk_avoided_pct (avoided drawdown)
     # - family_filter=None         → legacy mix (forward_return_5d for entry,
     #   risk_avoided_pct for observation), preserved for backward compatibility
     returns = []
     for e in valid:
         if family_filter == "entry":
-            if e.forward_return_5d is not None:
-                returns.append(e.forward_return_5d)
+            entry_return = _entry_return(e)
+            if entry_return is not None:
+                returns.append(entry_return)
         elif family_filter == "observation":
             if e.risk_avoided_pct is not None:
                 returns.append(e.risk_avoided_pct)
         else:
-            if e.forward_return_5d is not None:
-                returns.append(e.forward_return_5d)
+            entry_return = _entry_return(e)
+            if entry_return is not None:
+                returns.append(entry_return)
             elif e.risk_avoided_pct is not None:
                 returns.append(e.risk_avoided_pct)
 
@@ -397,9 +400,9 @@ def aggregate_group(
     stage_correct = 0
     stage_total = 0
     for evaluation in valid:
-        if evaluation.signal_family == "entry" and evaluation.forward_return_5d is not None:
+        if evaluation.signal_family == "entry" and _entry_return(evaluation) is not None:
             stage_total += 1
-            if evaluation.forward_return_5d > 0:
+            if _entry_return(evaluation) > 0:
                 stage_correct += 1
         elif evaluation.signal_family == "observation" and _as_bool(evaluation.stage_success) is not None:
             stage_total += 1
@@ -429,7 +432,18 @@ def aggregate_group(
 
 
 def _is_aggregatable(evaluation: FiveLayerBacktestEvaluation) -> bool:
-    return evaluation.forward_return_5d is not None or evaluation.risk_avoided_pct is not None
+    return (
+        _entry_return(evaluation) is not None
+        or evaluation.risk_avoided_pct is not None
+    )
+
+
+def _entry_return(evaluation: FiveLayerBacktestEvaluation) -> Optional[float]:
+    if evaluation.signal_family != "entry":
+        return None
+    if evaluation.trade_return_pct is not None:
+        return evaluation.trade_return_pct
+    return evaluation.forward_return_5d
 
 
 def _build_sample_baseline(

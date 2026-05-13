@@ -324,6 +324,16 @@ class TestFiveLayerBacktestModels(unittest.TestCase):
                 forward_return_1d=1.5,
                 mae=-2.0,
                 mfe=5.0,
+                planned_entry_price=10.0,
+                planned_stop_loss_price=9.2,
+                planned_take_profit_price=11.0,
+                actual_entry_price=10.0,
+                actual_entry_date=date(2024, 1, 16),
+                actual_exit_price=11.0,
+                actual_exit_date=date(2024, 1, 17),
+                exit_reason="take_profit",
+                trade_return_pct=10.0,
+                trade_replay_status="completed",
                 factor_snapshot_json=json.dumps({"ma100_breakout_days": 3}),
                 trade_plan_json=json.dumps({"take_profit": 5}),
             )
@@ -341,6 +351,16 @@ class TestFiveLayerBacktestModels(unittest.TestCase):
             self.assertIn("replayed", d)
             self.assertIn("factor_snapshot_json", d)
             self.assertIn("trade_plan_json", d)
+            self.assertEqual(d["planned_entry_price"], 10.0)
+            self.assertEqual(d["planned_stop_loss_price"], 9.2)
+            self.assertEqual(d["planned_take_profit_price"], 11.0)
+            self.assertEqual(d["actual_entry_price"], 10.0)
+            self.assertEqual(d["actual_entry_date"], "2024-01-16")
+            self.assertEqual(d["actual_exit_price"], 11.0)
+            self.assertEqual(d["actual_exit_date"], "2024-01-17")
+            self.assertEqual(d["exit_reason"], "take_profit")
+            self.assertEqual(d["trade_return_pct"], 10.0)
+            self.assertEqual(d["trade_replay_status"], "completed")
             self.assertEqual(d["code"], "600519")
 
     def test_run_to_dict(self):

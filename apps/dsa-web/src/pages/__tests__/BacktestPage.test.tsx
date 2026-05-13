@@ -213,6 +213,16 @@ const resultsResponse = {
       snapshotTradeStage: 'probe_entry',
       snapshotSetupType: 'trend_breakout',
       entryFillPrice: 1800,
+      plannedEntryPrice: 1800,
+      plannedStopLossPrice: 1746,
+      plannedTakeProfitPrice: 1890,
+      actualEntryPrice: 1800,
+      actualEntryDate: '2026-03-16',
+      actualExitPrice: 1890,
+      actualExitDate: '2026-03-18',
+      exitReason: 'take_profit',
+      tradeReturnPct: 5.0,
+      tradeReplayStatus: 'completed',
       forwardReturn5d: 2.5,
       forwardReturn10d: 4.1,
       mae: -1.2,
@@ -512,11 +522,68 @@ describe('BacktestPage', () => {
     expect(screen.getByText('原始样本')).toBeInTheDocument();
     expect(screen.getByText('已评估')).toBeInTheDocument();
     expect(screen.getByText('可汇总')).toBeInTheDocument();
-    expect(screen.getByText('Entry')).toBeInTheDocument();
-    expect(screen.getByText('Observation')).toBeInTheDocument();
-    expect(screen.getByText('Suppressed')).toBeInTheDocument();
-    expect(screen.getByText('observation_only 2')).toBeInTheDocument();
-    expect(screen.getByText('threshold_suppressed 2')).toBeInTheDocument();
+    expect(screen.getAllByText('入场样本').length).toBeGreaterThan(0);
+    expect(screen.getByText('观察样本')).toBeInTheDocument();
+    expect(screen.getByText('已抑制')).toBeInTheDocument();
+    expect(screen.getByText('仅观察样本 2')).toBeInTheDocument();
+    expect(screen.getByText('样本阈值不足 2')).toBeInTheDocument();
+  });
+
+  it('explains low-sample observation-only runs in Chinese instead of implying tradable returns', async () => {
+    const observationOnlyRunResponse = {
+      ...runResponse,
+      run: {
+        ...runResponse.run,
+        sampleCount: 10,
+        completedCount: 10,
+        sampleBaseline: {
+          rawSampleCount: 10,
+          evaluatedSampleCount: 10,
+          aggregatableSampleCount: 10,
+          entrySampleCount: 0,
+          observationSampleCount: 10,
+          suppressedSampleCount: 0,
+          suppressedReasons: {},
+        },
+      },
+      summaries: runResponse.summaries.map((item) => ({
+        ...item,
+        familyBreakdown: { observation: { sampleCount: item.sampleCount, avgReturnPct: item.avgReturnPct } },
+      })),
+    };
+    const observationOnlyResultsResponse = {
+      ...resultsResponse,
+      total: 10,
+      items: resultsResponse.items.slice(0, 2).map((item) => ({
+        ...item,
+        signalFamily: 'observation',
+        forwardReturn5d: null,
+        riskAvoidedPct: 2.1,
+        entryTimingLabel: 'not_applicable',
+        outcome: 'correct_wait',
+      })),
+    };
+
+    apiMock.runByScreeningRun.mockResolvedValue(observationOnlyRunResponse);
+    apiMock.getResults.mockResolvedValue(observationOnlyResultsResponse);
+
+    render(<BacktestPage />);
+
+    await waitFor(() => {
+      expect(screeningApiMock.listRuns).toHaveBeenCalledTimes(1);
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /运行五层回测/i }));
+
+    await waitFor(() => {
+      expect(apiMock.runByScreeningRun).toHaveBeenCalledTimes(1);
+    });
+
+    expect(await screen.findByText('样本不足，结论仅供观察')).toBeInTheDocument();
+    expect(screen.getByText('本次回测没有入场样本，不能用于判断买入收益或买点有效性。')).toBeInTheDocument();
+    expect(screen.getByText('观察样本只说明“等待/观望是否避开风险”，不是买入后的收益。')).toBeInTheDocument();
+    expect(screen.getByText('收益类指标已降级为观察指标')).toBeInTheDocument();
+    expect(screen.getByText('观察避险')).toBeInTheDocument();
   });
 
   it('elevates ranking effectiveness into the main research narrative', async () => {
@@ -569,9 +636,9 @@ describe('BacktestPage', () => {
     expect(screen.getByText('复核执行')).toBeInTheDocument();
     expect(screen.getByText('建议降权')).toBeInTheDocument();
     expect(screen.getAllByText('趋势突破').length).toBeGreaterThan(0);
-    expect(screen.getByText('信号族 · Entry')).toBeInTheDocument();
+    expect(screen.getByText('信号族 · 入场')).toBeInTheDocument();
     expect(screen.getAllByText('低位123').length).toBeGreaterThan(0);
-    expect(screen.getByText('仅到 display 层级，暂不形成动作。')).toBeInTheDocument();
+    expect(screen.getByText('仅到展示层级，暂不形成动作。')).toBeInTheDocument();
     expect(screen.getByText('当前策略')).toBeInTheDocument();
     expect(screen.getAllByText('运行级').length).toBeGreaterThan(0);
   });
@@ -631,11 +698,11 @@ describe('BacktestPage', () => {
     });
 
     expect(await screen.findByText('研究降级态')).toBeInTheDocument();
-    expect(screen.getByText('Observation 主导')).toBeInTheDocument();
+    expect(screen.getByText('观察样本主导')).toBeInTheDocument();
     expect(screen.getByText('无主策略归因')).toBeInTheDocument();
     expect(screen.getByText('买点语义不足')).toBeInTheDocument();
     expect(screen.getByText('当前仅适合观察研究，不适合买点结论。')).toBeInTheDocument();
-    expect(screen.getAllByText('当前运行以 observation 为主，缺少稳定主策略归因，买点时机标签仍不可用。').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('当前运行以观察样本为主，缺少稳定主策略归因，买点时机标签仍不可用。').length).toBeGreaterThan(0);
   });
 
   it('keeps loaded run context stable while editing rerun draft anchors', async () => {
@@ -703,8 +770,7 @@ describe('BacktestPage', () => {
     fireEvent.click(await screen.findByRole('button', { name: /重新运行回测/i }));
     fireEvent.change(screen.getByRole('combobox', { name: '市场' }), { target: { value: 'us' } });
 
-    expect(screen.getByText('CN')).toBeInTheDocument();
-    expect(screen.queryByText('US')).not.toBeInTheDocument();
+    expect(screen.getAllByText('A股').length).toBeGreaterThan(0);
   });
 
   it('switches research canvas when selecting another strategy', async () => {
@@ -746,9 +812,13 @@ describe('BacktestPage', () => {
     expect(await screen.findByText('主策略归因')).toBeInTheDocument();
     expect(screen.getByText('bottom_divergence_double_breakout')).toBeInTheDocument();
     expect(screen.getAllByText('样本分层').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('core').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('核心样本').length).toBeGreaterThan(0);
     expect(screen.getByText('买点时机')).toBeInTheDocument();
-    expect(screen.getByText('on_time')).toBeInTheDocument();
+    expect(screen.getByText('时机合适')).toBeInTheDocument();
+    expect(screen.getByText('真实交易回放')).toBeInTheDocument();
+    expect(screen.getByText('真实收益')).toBeInTheDocument();
+    expect(screen.getAllByText('5.0%').length).toBeGreaterThan(0);
+    expect(screen.getByText('止盈离场')).toBeInTheDocument();
   });
 
   it('renders strategy cohort insights when only cohort summaries exist', async () => {
@@ -778,7 +848,7 @@ describe('BacktestPage', () => {
     expect(await screen.findByText('策略分布')).toBeInTheDocument();
     expect(screen.getAllByText(/MA100\+123 组合/i).length).toBeGreaterThan(0);
     expect(screen.getByText('研究画布')).toBeInTheDocument();
-    expect(screen.getByText(/P0 Cohort/i)).toBeInTheDocument();
+    expect(screen.getByText('P0 策略群组')).toBeInTheDocument();
   });
 
   it('filters cohort samples by cohort context when multiple cohorts share one primary strategy', async () => {
@@ -829,14 +899,14 @@ describe('BacktestPage', () => {
 
     expect(await screen.findByText('样本结构拆解')).toBeInTheDocument();
     expect(screen.getByText('市场环境分布')).toBeInTheDocument();
-    expect(screen.getByText('balanced: 0')).toBeInTheDocument();
-    expect(screen.getByText('weak: 2')).toBeInTheDocument();
+    expect(screen.getByText('均衡: 0')).toBeInTheDocument();
+    expect(screen.getByText('偏弱: 2')).toBeInTheDocument();
     expect(screen.getByText('买点时机分布')).toBeInTheDocument();
-    expect(screen.getByText('too_early: 1')).toBeInTheDocument();
-    expect(screen.getByText('too_late: 1')).toBeInTheDocument();
+    expect(screen.getByText(/偏早:\s*1/)).toBeInTheDocument();
+    expect(screen.getByText(/偏晚:\s*1/)).toBeInTheDocument();
     expect(screen.getByText('异常样本区')).toBeInTheDocument();
     expect(screen.getByText('002594')).toBeInTheDocument();
-    expect(screen.getByText('noise')).toBeInTheDocument();
+    expect(screen.getByText('噪音样本')).toBeInTheDocument();
   });
 
   it('links research filters to the sample browser', async () => {
@@ -854,7 +924,7 @@ describe('BacktestPage', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: /低位123/i }));
     fireEvent.click(screen.getByRole('button', { name: '时机异常' }));
-    fireEvent.click(screen.getByRole('button', { name: '时机: too_late' }));
+    fireEvent.click(screen.getByRole('button', { name: '时机: 偏晚' }));
 
     expect(await screen.findByText(/002594 比亚迪/i)).toBeInTheDocument();
     expect(screen.queryByText(/300750 宁德时代/i)).not.toBeInTheDocument();
@@ -880,5 +950,10 @@ describe('BacktestPage', () => {
     expect(screen.queryByText(/300750 宁德时代/i)).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '观察信号' })).toHaveClass('ring-1');
     expect(screen.getByText('late_breakout')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '全部样本' }));
+    fireEvent.click(screen.getByRole('button', { name: '全部分层' }));
+    fireEvent.click(screen.getByRole('button', { name: '全部时机' }));
+    fireEvent.click(screen.getByRole('button', { name: '入场信号' }));
+    expect(screen.getByRole('button', { name: '入场信号' })).toHaveClass('ring-1');
   });
 });

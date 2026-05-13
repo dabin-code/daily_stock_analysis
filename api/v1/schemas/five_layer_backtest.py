@@ -124,6 +124,16 @@ class FiveLayerEvaluationItem(BaseModel):
     entry_fill_status: Optional[str] = None
     entry_fill_price: Optional[float] = None
     exit_fill_price: Optional[float] = None
+    planned_entry_price: Optional[float] = None
+    planned_stop_loss_price: Optional[float] = None
+    planned_take_profit_price: Optional[float] = None
+    actual_entry_price: Optional[float] = None
+    actual_entry_date: Optional[str] = None
+    actual_exit_price: Optional[float] = None
+    actual_exit_date: Optional[str] = None
+    exit_reason: Optional[str] = None
+    trade_return_pct: Optional[float] = None
+    trade_replay_status: Optional[str] = None
     limit_blocked: Optional[bool] = None
     gap_adjusted: Optional[bool] = None
 

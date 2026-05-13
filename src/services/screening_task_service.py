@@ -691,7 +691,9 @@ class ScreeningTaskService:
             completion_status = "completed"
             completion_error_summary: Optional[str] = sync_warning_summary
 
-            if strategy_names and strategy_names == ["extreme_strength_combo"]:
+            if runtime_config.ai_top_k <= 0:
+                logger.info("Skipping AI enriching because ai_top_k=0")
+            elif strategy_names and strategy_names == ["extreme_strength_combo"]:
                 # No AI enriching for hot theme screening
                 logger.info("Skipping AI enriching for extreme_strength_combo strategy")
             else:

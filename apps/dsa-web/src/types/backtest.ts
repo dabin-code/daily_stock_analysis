@@ -89,6 +89,16 @@ export interface BacktestResultItem {
   entryFillStatus?: string | null;
   entryFillPrice?: number | null;
   exitFillPrice?: number | null;
+  plannedEntryPrice?: number | null;
+  plannedStopLossPrice?: number | null;
+  plannedTakeProfitPrice?: number | null;
+  actualEntryPrice?: number | null;
+  actualEntryDate?: string | null;
+  actualExitPrice?: number | null;
+  actualExitDate?: string | null;
+  exitReason?: string | null;
+  tradeReturnPct?: number | null;
+  tradeReplayStatus?: string | null;
   limitBlocked?: boolean | null;
   gapAdjusted?: boolean | null;
   forwardReturn1d?: number | null;

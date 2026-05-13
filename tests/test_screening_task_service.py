@@ -283,6 +283,84 @@ def test_screening_task_service_uses_full_market_sync_for_manual_today_run():
     assert sync_kwargs["stock_codes"] is None
 
 
+def test_screening_task_service_skips_ai_analysis_when_ai_top_k_is_zero():
+    db = MagicMock()
+    db.create_screening_run.return_value = "run-no-ai"
+    db.get_screening_run.return_value = {
+        "run_id": "run-no-ai",
+        "mode": "balanced",
+        "status": "completed",
+        "candidate_count": 1,
+        "ai_top_k": 0,
+    }
+
+    universe_service = MagicMock()
+    universe_service.resolve_universe.return_value = pd.DataFrame(
+        [{"code": "600519", "name": "贵州茅台"}]
+    )
+
+    factor_service = MagicMock()
+    factor_service.build_factor_snapshot.return_value = pd.DataFrame(
+        [{"code": "600519", "name": "贵州茅台", "close": 1500.0}]
+    )
+
+    market_data_sync_service = MagicMock()
+    market_data_sync_service.sync_trade_date.return_value = {
+        "trade_date": "2026-03-13",
+        "total": 1,
+        "synced": 1,
+        "skipped": 0,
+        "errors": [],
+    }
+
+    candidate_analysis_service = MagicMock()
+    pipeline_candidates = [
+        SimpleNamespace(
+            code="600519",
+            name="贵州茅台",
+            rank=1,
+            rule_score=91.0,
+            rule_hits=["trend_aligned"],
+            factor_snapshot={"close": 1500.0},
+            matched_strategies=["trend_aligned"],
+            strategy_scores={"trend_aligned": 91.0},
+            setup_type="trend_breakout",
+            entry_maturity="high",
+            trade_stage="focus",
+            market_regime="balanced",
+            risk_level="medium",
+            theme_position="main_theme",
+            candidate_pool_level="focus_list",
+        )
+    ]
+
+    service = ScreeningTaskService(
+        db_manager=db,
+        universe_service=universe_service,
+        factor_service=factor_service,
+        candidate_analysis_service=candidate_analysis_service,
+        market_data_sync_service=market_data_sync_service,
+    )
+    service.config.screening_market_guard_enabled = False
+
+    with patch("src.services.five_layer_pipeline.FiveLayerPipeline") as pipeline_cls:
+        pipeline_cls.return_value.run.return_value = SimpleNamespace(
+            candidates=pipeline_candidates,
+            decision_context=None,
+            pipeline_stats={"selected_after_limit": 1},
+        )
+        result = service.execute_run(
+            trade_date=date(2026, 3, 13),
+            candidate_limit=10,
+            ai_top_k=0,
+        )
+
+    assert result["status"] == "completed"
+    candidate_analysis_service.analyze_top_k.assert_not_called()
+    saved_candidates = db.save_screening_candidates.call_args.kwargs["candidates"]
+    assert saved_candidates[0]["selected_for_ai"] is False
+
+
 def test_resolve_screening_trade_date_rolls_non_trading_day_back_to_previous_session():
     requested_trade_date = date(2026, 3, 15)
     market_now = datetime(2026, 3, 16, 15, 30, tzinfo=ZoneInfo("Asia/Shanghai"))

@@ -323,6 +323,42 @@ class TestGroupSummaryAggregator(unittest.TestCase):
         entry = next(s for s in summaries if s.group_type == "signal_family" and s.group_key == "entry")
         self.assertAlmostEqual(entry.avg_return_pct, 1.5)
 
+    def test_entry_avg_return_prefers_real_trade_return_when_available(self):
+        """Structured replay rows should aggregate actual round-trip PnL."""
+        from src.backtest.aggregators.group_summary_aggregator import aggregate_group
+        from src.backtest.models.backtest_models import FiveLayerBacktestEvaluation
+
+        metrics = aggregate_group(
+            [
+                FiveLayerBacktestEvaluation(
+                    backtest_run_id="run-replay-agg",
+                    trade_date=date(2024, 1, 15),
+                    code="600001",
+                    signal_family="entry",
+                    evaluator_type="entry",
+                    eval_status="evaluated",
+                    forward_return_5d=1.0,
+                    trade_return_pct=8.0,
+                    outcome="win",
+                ),
+                FiveLayerBacktestEvaluation(
+                    backtest_run_id="run-replay-agg",
+                    trade_date=date(2024, 1, 16),
+                    code="600002",
+                    signal_family="entry",
+                    evaluator_type="entry",
+                    eval_status="evaluated",
+                    forward_return_5d=2.0,
+                    trade_return_pct=-4.0,
+                    outcome="loss",
+                ),
+            ],
+            family_filter="entry",
+        )
+
+        self.assertAlmostEqual(metrics["avg_return_pct"], 2.0)
+        self.assertAlmostEqual(metrics["profit_factor"], 2.0)
+
     def test_setup_type_groups(self):
         """Should have groups for non-None setup_types."""
         from src.backtest.aggregators.group_summary_aggregator import GroupSummaryAggregator

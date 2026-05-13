@@ -147,6 +147,14 @@ class TradePlan:
     risk_level: RiskLevel = RiskLevel.MEDIUM
     holding_expectation: Optional[str] = None
     execution_note: Optional[str] = None
+    # 结构化交易回放字段：选股时刻冻结的可执行买卖点。
+    entry_price: Optional[float] = None
+    entry_rule: Optional[str] = None
+    entry_valid_days: Optional[int] = None
+    stop_loss_price: Optional[float] = None
+    take_profit_price: Optional[float] = None
+    time_stop_days: Optional[int] = None
+    exit_rules: Optional[List[str]] = None
 
 
 @dataclass

@@ -1305,6 +1305,7 @@ class DatabaseManager:
                 self._migrate_sqlite_screening_candidates_updated_at_field()
                 self._migrate_sqlite_daily_sector_heat_rank_fields()
                 self._migrate_sqlite_five_layer_backtest_group_summary_fields()
+                self._migrate_sqlite_five_layer_backtest_evaluation_fields()
                 self._migrate_sqlite_stock_daily_adj_factor_fields()
         except Exception as exc:
             logger.exception("Inline database migration failed: %s", exc)
@@ -1586,6 +1587,108 @@ class DatabaseManager:
                     "SET leader_pool_win_share = top_k_hit_rate "
                     "WHERE leader_pool_win_share IS NULL "
                     "AND top_k_hit_rate IS NOT NULL"
+                )
+
+    def _migrate_sqlite_five_layer_backtest_evaluation_fields(self) -> None:
+        """Ensure five-layer evaluations expose the latest entry timing metrics on SQLite."""
+        with self._engine.begin() as conn:
+            existing = {
+                row[1]
+                for row in conn.exec_driver_sql(
+                    "PRAGMA table_info(five_layer_backtest_evaluations)"
+                ).fetchall()
+            }
+            new_columns = {
+                "optimal_entry_deviation": (
+                    "ALTER TABLE five_layer_backtest_evaluations "
+                    "ADD COLUMN optimal_entry_deviation FLOAT"
+                ),
+                "optimal_entry_timing": (
+                    "ALTER TABLE five_layer_backtest_evaluations "
+                    "ADD COLUMN optimal_entry_timing INTEGER"
+                ),
+                "eval_status": (
+                    "ALTER TABLE five_layer_backtest_evaluations "
+                    "ADD COLUMN eval_status VARCHAR(16)"
+                ),
+                "suppression_reason": (
+                    "ALTER TABLE five_layer_backtest_evaluations "
+                    "ADD COLUMN suppression_reason VARCHAR(64)"
+                ),
+                "planned_entry_price": (
+                    "ALTER TABLE five_layer_backtest_evaluations "
+                    "ADD COLUMN planned_entry_price FLOAT"
+                ),
+                "planned_stop_loss_price": (
+                    "ALTER TABLE five_layer_backtest_evaluations "
+                    "ADD COLUMN planned_stop_loss_price FLOAT"
+                ),
+                "planned_take_profit_price": (
+                    "ALTER TABLE five_layer_backtest_evaluations "
+                    "ADD COLUMN planned_take_profit_price FLOAT"
+                ),
+                "actual_entry_price": (
+                    "ALTER TABLE five_layer_backtest_evaluations "
+                    "ADD COLUMN actual_entry_price FLOAT"
+                ),
+                "actual_entry_date": (
+                    "ALTER TABLE five_layer_backtest_evaluations "
+                    "ADD COLUMN actual_entry_date DATE"
+                ),
+                "actual_exit_price": (
+                    "ALTER TABLE five_layer_backtest_evaluations "
+                    "ADD COLUMN actual_exit_price FLOAT"
+                ),
+                "actual_exit_date": (
+                    "ALTER TABLE five_layer_backtest_evaluations "
+                    "ADD COLUMN actual_exit_date DATE"
+                ),
+                "exit_reason": (
+                    "ALTER TABLE five_layer_backtest_evaluations "
+                    "ADD COLUMN exit_reason VARCHAR(32)"
+                ),
+                "trade_return_pct": (
+                    "ALTER TABLE five_layer_backtest_evaluations "
+                    "ADD COLUMN trade_return_pct FLOAT"
+                ),
+                "trade_replay_status": (
+                    "ALTER TABLE five_layer_backtest_evaluations "
+                    "ADD COLUMN trade_replay_status VARCHAR(32)"
+                ),
+            }
+            for col_name, ddl in new_columns.items():
+                if col_name not in existing:
+                    logger.info(
+                        "Applying inline SQLite migration: adding %s to five_layer_backtest_evaluations",
+                        col_name,
+                    )
+                    conn.exec_driver_sql(ddl)
+
+            conn.exec_driver_sql(
+                "UPDATE five_layer_backtest_evaluations "
+                "SET eval_status = 'pending' "
+                "WHERE eval_status IS NULL"
+            )
+            index_names = {
+                row[1]
+                for row in conn.exec_driver_sql(
+                    "PRAGMA index_list(five_layer_backtest_evaluations)"
+                ).fetchall()
+            }
+            if (
+                "ix_five_layer_backtest_evaluations_suppression_reason" not in index_names
+                and "ix_flbe_suppression_reason" not in index_names
+            ):
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "ix_five_layer_backtest_evaluations_suppression_reason "
+                    "ON five_layer_backtest_evaluations(suppression_reason)"
+                )
+            if "ix_five_layer_backtest_evaluations_trade_replay_status" not in index_names:
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "ix_five_layer_backtest_evaluations_trade_replay_status "
+                    "ON five_layer_backtest_evaluations(trade_replay_status)"
                 )
 
     def get_session(self) -> Session:

@@ -18,6 +18,24 @@ function pct(value?: number | null): string {
   return `${value.toFixed(1)}%`;
 }
 
+function price(value?: number | null): string {
+  if (value == null) return '--';
+  return value.toFixed(2);
+}
+
+function numberFromPayload(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function entryMetric(item: BacktestResultItem): string {
+  return pct(item.tradeReturnPct ?? item.forwardReturn5d);
+}
+
 function tryParse(value?: string | null): Record<string, unknown> | null {
   if (!value) return null;
   try {
@@ -73,17 +91,78 @@ function renderAttributionSummary(item: BacktestResultItem): Array<{ label: stri
     },
     {
       label: '样本分层',
-      value: item.sampleBucket ?? '--',
+      value: renderValueLabel(item.sampleBucket),
     },
     {
       label: '买点时机',
-      value: item.entryTimingLabel ?? '--',
+      value: renderValueLabel(item.entryTimingLabel),
     },
     {
       label: 'Low123校验',
       value: item.ma100Low123ValidationStatus ?? '--',
     },
   ];
+}
+
+function renderValueLabel(value?: string | null): string {
+  switch (value) {
+    case 'core':
+      return '核心样本';
+    case 'boundary':
+      return '边界样本';
+    case 'noise':
+      return '噪音样本';
+    case 'on_time':
+      return '时机合适';
+    case 'too_early':
+      return '偏早';
+    case 'too_late':
+      return '偏晚';
+    case 'not_applicable':
+      return '不适用';
+    case 'correct_wait':
+      return '观望正确';
+    case 'missed_opportunity':
+      return '错过机会';
+    case 'missed_watch':
+      return '观察失误';
+    case 'win':
+      return '盈利';
+    case 'loss':
+      return '亏损';
+    default:
+      return value || '--';
+  }
+}
+
+function renderReplayStatus(value?: string | null): string {
+  switch (value) {
+    case 'completed':
+      return '已完成';
+    case 'entry_not_filled':
+      return '未成交';
+    case 'missing_structured_trade_plan':
+      return '缺少结构化计划';
+    case 'no_forward_bars':
+      return '缺少后续行情';
+    default:
+      return value || '--';
+  }
+}
+
+function renderExitReason(value?: string | null): string {
+  switch (value) {
+    case 'take_profit':
+      return '止盈离场';
+    case 'stop_loss':
+      return '止损离场';
+    case 'ambiguous_stop_loss':
+      return '同日触发，按止损离场';
+    case 'time_stop':
+      return '时间止损/到期离场';
+    default:
+      return value || '--';
+  }
 }
 
 function getEvaluationKey(item: BacktestResultItem): string {
@@ -98,14 +177,9 @@ export const EvaluationDetail: React.FC<EvaluationDetailProps> = ({
   targetEvaluation = null,
   researchWarning = null,
 }) => {
-  const [tab, setTab] = useState<'entry' | 'observation'>('entry');
+  const [requestedTab, setRequestedTab] = useState<'entry' | 'observation'>('entry');
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
   const rowRefs = useRef<Record<string, HTMLButtonElement | null>>({});
-
-  const filtered = useMemo(
-    () => evaluations.filter((item) => item.signalFamily === tab),
-    [evaluations, tab],
-  );
   const entryCount = useMemo(
     () => evaluations.filter((item) => item.signalFamily === 'entry').length,
     [evaluations],
@@ -114,36 +188,33 @@ export const EvaluationDetail: React.FC<EvaluationDetailProps> = ({
     () => evaluations.filter((item) => item.signalFamily === 'observation').length,
     [evaluations],
   );
+  const activeTab = useMemo<'entry' | 'observation'>(() => {
+    if (requestedTab === 'entry' && entryCount === 0 && observationCount > 0) {
+      return 'observation';
+    }
+    if (requestedTab === 'observation' && observationCount === 0 && entryCount > 0) {
+      return 'entry';
+    }
+    return requestedTab;
+  }, [entryCount, observationCount, requestedTab]);
+  const filtered = useMemo(
+    () => evaluations.filter((item) => item.signalFamily === activeTab),
+    [activeTab, evaluations],
+  );
+  const targetKey = targetEvaluation ? getEvaluationKey(targetEvaluation) : null;
+  const effectiveExpandedKey = expandedKey ?? targetKey;
 
   useEffect(() => {
-    if (tab === 'entry' && filtered.length === 0 && observationCount > 0) {
-      setTab('observation');
-    }
-    if (tab === 'observation' && filtered.length === 0 && entryCount > 0) {
-      setTab('entry');
-    }
-  }, [entryCount, filtered.length, observationCount, tab]);
-
-  useEffect(() => {
-    if (!targetEvaluation) {
+    if (!targetEvaluation || !targetKey) {
       return;
     }
-    setTab(targetEvaluation.signalFamily === 'observation' ? 'observation' : 'entry');
-    setExpandedKey(getEvaluationKey(targetEvaluation));
-  }, [targetEvaluation]);
-
-  useEffect(() => {
-    if (!targetEvaluation) {
-      return;
-    }
-    const targetKey = getEvaluationKey(targetEvaluation);
     const targetVisible = filtered.some((item) => getEvaluationKey(item) === targetKey);
     if (!targetVisible) {
       return;
     }
     const targetElement = rowRefs.current[targetKey];
     targetElement?.scrollIntoView?.({ block: 'nearest' });
-  }, [filtered, targetEvaluation]);
+  }, [filtered, targetEvaluation, targetKey]);
 
   return (
     <Card title={title} subtitle={subtitle} variant="gradient">
@@ -154,10 +225,10 @@ export const EvaluationDetail: React.FC<EvaluationDetailProps> = ({
       ) : null}
 
       <div className="mb-4 flex gap-2">
-        <button type="button" className={`btn-secondary ${tab === 'entry' ? 'ring-1 ring-cyan/40' : ''}`} onClick={() => setTab('entry')}>
+        <button type="button" className={`btn-secondary ${activeTab === 'entry' ? 'ring-1 ring-cyan/40' : ''}`} onClick={() => setRequestedTab('entry')}>
           入场信号
         </button>
-        <button type="button" className={`btn-secondary ${tab === 'observation' ? 'ring-1 ring-cyan/40' : ''}`} onClick={() => setTab('observation')}>
+        <button type="button" className={`btn-secondary ${activeTab === 'observation' ? 'ring-1 ring-cyan/40' : ''}`} onClick={() => setRequestedTab('observation')}>
           观察信号
         </button>
       </div>
@@ -172,7 +243,7 @@ export const EvaluationDetail: React.FC<EvaluationDetailProps> = ({
             const factorPayload = tryParse(item.factorSnapshotJson);
             const planPayload = tryParse(item.tradePlanJson);
             const itemKey = getEvaluationKey(item);
-            const isExpanded = expandedKey === itemKey;
+            const isExpanded = effectiveExpandedKey === itemKey;
             const isTarget = targetEvaluation ? getEvaluationKey(targetEvaluation) === itemKey : false;
             return (
               <div
@@ -193,10 +264,10 @@ export const EvaluationDetail: React.FC<EvaluationDetailProps> = ({
                   </div>
                   <div className="flex flex-wrap items-center gap-2 text-xs">
                     <Badge variant={item.outcome === 'win' || item.outcome === 'correct_wait' ? 'success' : 'default'}>
-                      {item.outcome ?? '--'}
+                      {renderValueLabel(item.outcome)}
                     </Badge>
                     <span className="font-mono text-secondary-text">
-                      {tab === 'entry' ? pct(item.forwardReturn5d) : pct(item.riskAvoidedPct)}
+                      {activeTab === 'entry' ? entryMetric(item) : pct(item.riskAvoidedPct)}
                     </span>
                   </div>
                 </button>
@@ -228,16 +299,43 @@ export const EvaluationDetail: React.FC<EvaluationDetailProps> = ({
                         <h4 className="mb-3 text-sm font-semibold text-white">交易计划</h4>
                         <div className="space-y-2 rounded-xl bg-white/5 p-3 text-sm">
                           <div className="flex items-center justify-between">
+                            <span className="text-secondary-text">计划买点</span>
+                            <span className="font-mono text-foreground">{price(item.plannedEntryPrice ?? numberFromPayload(planPayload?.entry_price))}</span>
+                          </div>
+                          <div className="flex items-center justify-between">
                             <span className="text-secondary-text">止盈目标</span>
-                            <span className="font-mono text-foreground">{String(planPayload?.take_profit ?? '--')}</span>
+                            <span className="font-mono text-foreground">{price(item.plannedTakeProfitPrice ?? numberFromPayload(planPayload?.take_profit_price))}</span>
                           </div>
                           <div className="flex items-center justify-between">
                             <span className="text-secondary-text">止损线</span>
-                            <span className="font-mono text-foreground">{String(planPayload?.stop_loss ?? '--')}</span>
+                            <span className="font-mono text-foreground">{price(item.plannedStopLossPrice ?? numberFromPayload(planPayload?.stop_loss_price))}</span>
                           </div>
                           <div className="flex items-center justify-between">
                             <span className="text-secondary-text">执行结果</span>
                             <span className="font-mono text-foreground">{item.planSuccess == null ? '--' : item.planSuccess ? '成功' : '失败'}</span>
+                          </div>
+                        </div>
+                        <h4 className="mb-3 mt-4 text-sm font-semibold text-white">真实交易回放</h4>
+                        <div className="space-y-2 rounded-xl bg-white/5 p-3 text-sm">
+                          <div className="flex items-center justify-between">
+                            <span className="text-secondary-text">回放状态</span>
+                            <span className="font-mono text-foreground">{renderReplayStatus(item.tradeReplayStatus)}</span>
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <span className="text-secondary-text">实际买入</span>
+                            <span className="font-mono text-foreground">{price(item.actualEntryPrice)} · {item.actualEntryDate ?? '--'}</span>
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <span className="text-secondary-text">实际卖出</span>
+                            <span className="font-mono text-foreground">{price(item.actualExitPrice)} · {item.actualExitDate ?? '--'}</span>
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <span className="text-secondary-text">离场原因</span>
+                            <span className="font-mono text-foreground">{renderExitReason(item.exitReason)}</span>
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <span className="text-secondary-text">真实收益</span>
+                            <span className="font-mono text-foreground">{pct(item.tradeReturnPct)}</span>
                           </div>
                         </div>
                       </div>

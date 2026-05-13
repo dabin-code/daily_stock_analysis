@@ -23,6 +23,8 @@ The five-layer backtest workflow now exposes a richer optimization and review pa
 - Web backtest results are organized into four layers: system health, strategy comparison, judgment validation, and per-stock drilldown.
 - The Web backtest entry now defaults to research mode anchored on the latest screening run, while date-range replay remains available as an explicit fallback mode.
 - The Web header now separates `运行上下文` and `研究上下文`, so users can directly see the current screening/backtest anchor together with raw/evaluated/aggregatable/entry/observation/suppressed sample baselines.
+- The Web backtest page now shows Chinese guidance for low-sample and observation-only runs, clarifying that observation samples measure risk avoided rather than tradable entry returns.
+- Structured `trade_plan_json` buy/sell prices are now replayed as actual round-trip trades; entry summaries and stock drill-downs prefer `trade_return_pct` when available, while legacy fixed-window returns remain as fallback diagnostics.
 - Run-level ranking-effectiveness output is now promoted into the main research narrative, clearly marked as whole-run evidence rather than current-strategy-only evidence, and shows which dimensions are effective or still inconclusive together with high/low tier sample counts and return gaps.
 - Backtest recommendations are now surfaced in the research canvas as `优先动作 / 继续观察 / 仅展示`, helping users distinguish immediately actionable setup changes from hypothesis-level follow-up and display-only low-confidence groups.
 - The research workbench now enters an explicit degraded-research state when a strategy slice becomes observation-only or loses key attribution/timing semantics, warning that the current view is suitable for observation study rather than buy-point conclusions.
@@ -167,6 +169,14 @@ python scripts/approve_kline_skip.py --market cn --code 000001 --from-date 2026-
 - 如果选择的是当日交易日，需等待北京时间 15:00 后才允许开始选股，避免使用未收盘的日线数据
 - 如果上一次选股任务因进程中断而长期停留在非终态，系统会在后续查询和重试时自动回收该幽灵任务并恢复为可重跑状态
 - 历史任务列表支持逐条删除，可直接移除卡住或无用的选股任务及其候选结果
+- 可用 `scripts/run_historical_random_screening.py` 从本地 `stock_daily` 随机抽取历史交易日并批量生成筛选记录；默认从 `2024-04-19` 到 `2026-05-11` 抽取 100 个交易日，每日候选上限 10，`ai_top_k=0`，不会触发 AI 二次分析。先用 `--dry-run --seed <N>` 预览抽样日期，确认后去掉 `--dry-run` 落库；`--force` 只会重跑同配置的 `historical_random_sample` 记录，遇到同配置人工/定时记录会跳过该日期。
+
+历史随机选股示例：
+
+```bash
+python scripts/run_historical_random_screening.py --dry-run --seed 20260512
+python scripts/run_historical_random_screening.py --seed 20260512
+```
 
 > 历史报告详情会优先展示 AI 返回的原始「狙击点位」文本，避免区间价、条件说明等复杂内容在历史回看时被压缩成单个数字。
 

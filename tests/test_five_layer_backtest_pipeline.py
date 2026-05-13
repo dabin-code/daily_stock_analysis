@@ -467,6 +467,120 @@ class TestFiveLayerBacktestPipeline(unittest.TestCase):
         self.assertIsNotNone(entry.trade_plan_json)
         self.assertIn("take_profit", entry.trade_plan_json)
 
+    def test_pipeline_replays_structured_trade_plan_as_real_trade_result(self):
+        """Structured trade_plan_json should drive actual entry/exit replay metrics."""
+        from src.backtest.services.backtest_service import FiveLayerBacktestService
+        from src.backtest.repositories.evaluation_repo import EvaluationRepository
+        from src.storage import ScreeningRun, ScreeningCandidate, StockDaily
+
+        with self.db.get_session() as session:
+            run_row = ScreeningRun(
+                run_id="sr-structured-replay-001",
+                trade_date=date(2024, 4, 10),
+                market="cn",
+                status="completed",
+            )
+            session.add(run_row)
+            session.flush()
+            session.add(
+                ScreeningCandidate(
+                    run_id="sr-structured-replay-001",
+                    code="600001",
+                    name="结构回放",
+                    rank=1,
+                    rule_score=90.0,
+                    trade_stage="probe_entry",
+                    setup_type="trend_breakout",
+                    entry_maturity="high",
+                    market_regime="balanced",
+                    theme_position="main_theme",
+                    candidate_pool_level="leader_pool",
+                    risk_level="medium",
+                    trade_plan_json=json.dumps(
+                        {
+                            "entry_price": 100.0,
+                            "entry_valid_days": 1,
+                            "stop_loss_price": 95.0,
+                            "take_profit_price": 110.0,
+                            "time_stop_days": 5,
+                        }
+                    ),
+                )
+            )
+            bars = [
+                StockDaily(
+                    code="600001",
+                    date=date(2024, 4, 11),
+                    open=101.0,
+                    high=102.0,
+                    low=99.0,
+                    close=101.0,
+                    pct_chg=1.0,
+                ),
+                StockDaily(
+                    code="600001",
+                    date=date(2024, 4, 12),
+                    open=104.0,
+                    high=111.0,
+                    low=103.0,
+                    close=110.0,
+                    pct_chg=8.9,
+                ),
+                StockDaily(
+                    code="600001",
+                    date=date(2024, 4, 15),
+                    open=110.0,
+                    high=112.0,
+                    low=109.0,
+                    close=111.0,
+                    pct_chg=0.9,
+                ),
+                StockDaily(
+                    code="600001",
+                    date=date(2024, 4, 16),
+                    open=111.0,
+                    high=113.0,
+                    low=110.0,
+                    close=112.0,
+                    pct_chg=0.9,
+                ),
+                StockDaily(
+                    code="600001",
+                    date=date(2024, 4, 17),
+                    open=112.0,
+                    high=114.0,
+                    low=111.0,
+                    close=113.0,
+                    pct_chg=0.9,
+                ),
+            ]
+            session.add_all(bars)
+            session.commit()
+
+        svc = FiveLayerBacktestService(db_manager=self.db)
+        run = svc.run_backtest_pipeline(
+            screening_run_id="sr-structured-replay-001",
+            evaluation_mode="historical_snapshot",
+            execution_model="conservative",
+            eval_window_days=5,
+        )
+        entry = EvaluationRepository(self.db).get_by_run(
+            run.backtest_run_id,
+            signal_family="entry",
+        )[0]
+
+        self.assertEqual(entry.eval_status, "evaluated")
+        self.assertEqual(entry.planned_entry_price, 100.0)
+        self.assertEqual(entry.actual_entry_price, 100.0)
+        self.assertEqual(entry.actual_entry_date, date(2024, 4, 11))
+        self.assertEqual(entry.actual_exit_price, 110.0)
+        self.assertEqual(entry.actual_exit_date, date(2024, 4, 12))
+        self.assertEqual(entry.exit_reason, "take_profit")
+        self.assertEqual(entry.trade_return_pct, 10.0)
+        self.assertEqual(entry.trade_replay_status, "completed")
+        self.assertTrue(entry.plan_success)
+        self.assertEqual(entry.outcome, "win")
+
     def test_pipeline_persists_evidence_json_with_strategy_attribution(self):
         """Entry evaluation should retain matched strategies and attribution for strategy-cohort analysis."""
         from src.backtest.services.backtest_service import FiveLayerBacktestService

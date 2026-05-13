@@ -129,6 +129,22 @@ def _format_anchor_value(label: str, value: object) -> Optional[str]:
         return None
 
 
+def _safe_float(value: object) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
+
+
+def _round_price(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    return round(value, 4)
+
+
 def _build_execution_note(setup_type: SetupType, factor_snapshot: dict) -> str:
     ma20 = factor_snapshot.get("ma20")
     ma100 = factor_snapshot.get("ma100")
@@ -150,6 +166,75 @@ def _build_execution_note(setup_type: SetupType, factor_snapshot: dict) -> str:
     if setup_type in _SWING_SETUPS:
         return f"围绕趋势延续与关键均线支撑执行，{anchor_note}"
     return f"按结构确认和止损锚点执行，{anchor_note}"
+
+
+def _first_take_profit_target(factor_snapshot: dict) -> Optional[float]:
+    exit_plan = factor_snapshot.get("bottom_divergence_exit_plan") or {}
+    targets = exit_plan.get("take_profit_targets") if isinstance(exit_plan, dict) else None
+    if isinstance(targets, list):
+        for target in targets:
+            if not isinstance(target, dict):
+                continue
+            for key in ("target_price", "price", "trigger_price"):
+                parsed = _safe_float(target.get(key))
+                if parsed is not None:
+                    return parsed
+
+    risk_params = factor_snapshot.get("risk_params") or {}
+    if isinstance(risk_params, dict):
+        close = _safe_float(factor_snapshot.get("close"))
+        ratio = _safe_float(risk_params.get("take_profit_ratio"))
+        if close is not None and ratio is not None:
+            return close * (1 + ratio)
+    return None
+
+
+def _build_structured_prices(setup_type: SetupType, factor_snapshot: dict) -> dict:
+    close = _safe_float(factor_snapshot.get("close"))
+    risk_params = factor_snapshot.get("risk_params") or {}
+    if not isinstance(risk_params, dict):
+        risk_params = {}
+
+    if setup_type == SetupType.LOW123_BREAKOUT:
+        entry_price = _safe_float(factor_snapshot.get("pattern_123_entry_price")) or close
+        stop_loss_price = _safe_float(factor_snapshot.get("pattern_123_stop_loss"))
+        entry_rule = "触达低位123结构买点"
+    elif setup_type == SetupType.BOTTOM_DIVERGENCE_BREAKOUT:
+        entry_price = _safe_float(factor_snapshot.get("bottom_divergence_entry_price")) or close
+        stop_loss_price = (
+            _safe_float(factor_snapshot.get("bottom_divergence_stop_loss"))
+            or _safe_float((factor_snapshot.get("bottom_divergence_exit_plan") or {}).get("initial_stop_loss"))
+        )
+        entry_rule = "触达底背离确认买点"
+    elif setup_type == SetupType.TREND_PULLBACK:
+        entry_price = _safe_float(factor_snapshot.get("shrink_pullback_entry_price")) or close
+        stop_loss_price = _safe_float(factor_snapshot.get("shrink_pullback_stop_loss_price"))
+        entry_rule = "触达缩量回踩买点"
+    else:
+        entry_price = close
+        stop_loss_price = _safe_float(risk_params.get("stop_loss"))
+        entry_rule = "触达选股日结构买点"
+
+    if stop_loss_price is None:
+        stop_loss_price = _safe_float(risk_params.get("stop_loss"))
+
+    take_profit_price = _first_take_profit_target(factor_snapshot)
+    exit_rules = []
+    if stop_loss_price is not None:
+        exit_rules.append("跌破结构化止损价离场")
+    if take_profit_price is not None:
+        exit_rules.append("触达结构化止盈价离场")
+    exit_rules.append(_INVALIDATION_RULE)
+
+    return {
+        "entry_price": _round_price(entry_price),
+        "entry_rule": entry_rule if entry_price is not None else None,
+        "entry_valid_days": 1 if entry_price is not None else None,
+        "stop_loss_price": _round_price(stop_loss_price),
+        "take_profit_price": _round_price(take_profit_price),
+        "time_stop_days": 3,
+        "exit_rules": exit_rules,
+    }
 
 
 class TradePlanBuilder:
@@ -220,6 +305,8 @@ class TradePlanBuilder:
             if is_add_on and buy_points:
                 dynamic_add_rule = _build_divergence_add_rule(buy_points)
 
+        structured_prices = _build_structured_prices(setup_type, factor_snapshot)
+
         return TradePlan(
             initial_position=initial_position,
             add_rule=(
@@ -235,4 +322,5 @@ class TradePlanBuilder:
                 "1~2周波段" if setup_type in _SWING_SETUPS else "3~5日短线"
             ),
             execution_note=_build_execution_note(setup_type, factor_snapshot),
+            **structured_prices,
         )

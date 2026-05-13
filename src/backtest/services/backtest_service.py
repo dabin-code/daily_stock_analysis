@@ -21,6 +21,7 @@ from src.backtest.classifiers.signal_classifier import SignalClassifier
 from src.backtest.evaluators.entry_evaluator import EntrySignalEvaluator
 from src.backtest.evaluators.observation_evaluator import ObservationSignalEvaluator
 from src.backtest.execution.execution_model_resolver import ExecutionModelResolver
+from src.backtest.execution.plan_replay_executor import PlanReplayExecutor
 from src.backtest.models.backtest_models import (
     FiveLayerBacktestCalibrationOutput,
     FiveLayerBacktestEvaluation,
@@ -70,6 +71,14 @@ def _dump_json(payload: Any) -> Optional[str]:
         return json.dumps(payload, ensure_ascii=False)
     except (TypeError, ValueError):
         return None
+
+
+def _safe_positive_float(value: Any) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _build_candidate_filter(
@@ -359,7 +368,11 @@ def _build_run_sample_baseline(
     aggregatable_count = 0
 
     for evaluation in evaluations:
-        if evaluation.forward_return_5d is not None or evaluation.risk_avoided_pct is not None:
+        if (
+            evaluation.trade_return_pct is not None
+            or evaluation.forward_return_5d is not None
+            or evaluation.risk_avoided_pct is not None
+        ):
             aggregatable_count += 1
             continue
         reason = evaluation.suppression_reason
@@ -396,7 +409,11 @@ def _parse_enum_value(enum_cls: type, raw_value: Any):
 def _has_stop_loss_anchor(trade_plan: Any) -> bool:
     if not isinstance(trade_plan, dict):
         return False
-    return trade_plan.get("stop_loss") is not None or bool(trade_plan.get("stop_loss_rule"))
+    return (
+        trade_plan.get("stop_loss") is not None
+        or trade_plan.get("stop_loss_price") is not None
+        or bool(trade_plan.get("stop_loss_rule"))
+    )
 
 
 class FiveLayerBacktestService:
@@ -1026,6 +1043,15 @@ class FiveLayerBacktestService:
             return
 
         trade_plan = candidate.get("trade_plan") or {}
+        structured_entry_price = _safe_positive_float(trade_plan.get("entry_price"))
+        if structured_entry_price is not None:
+            self._evaluate_structured_trade_plan(
+                evaluation=evaluation,
+                forward_bars=forward_bars,
+                trade_plan=trade_plan,
+            )
+            return
+
         tp_pct = trade_plan.get("take_profit")
         sl_pct = trade_plan.get("stop_loss")
 
@@ -1085,6 +1111,69 @@ class FiveLayerBacktestService:
             evaluation.eval_status = "suppressed"
             fill_status = exec_result.fill_status or "unknown"
             evaluation.suppression_reason = f"exec_not_filled:{fill_status}"[:64]
+
+    def _evaluate_structured_trade_plan(
+        self,
+        *,
+        evaluation: FiveLayerBacktestEvaluation,
+        forward_bars: List[Any],
+        trade_plan: Dict[str, Any],
+    ) -> None:
+        """Replay the frozen decision-time buy/sell prices as an actual trade."""
+        result = PlanReplayExecutor.replay(
+            trade_plan=trade_plan,
+            forward_bars=forward_bars,
+        )
+
+        evaluation.planned_entry_price = _safe_positive_float(trade_plan.get("entry_price"))
+        evaluation.planned_stop_loss_price = _safe_positive_float(trade_plan.get("stop_loss_price"))
+        evaluation.planned_take_profit_price = _safe_positive_float(trade_plan.get("take_profit_price"))
+        evaluation.trade_replay_status = result.status
+
+        if result.status != "completed" or result.entry_price is None:
+            evaluation.eval_status = "suppressed"
+            evaluation.suppression_reason = f"trade_replay:{result.status}"[:64]
+            return
+
+        evaluation.actual_entry_price = result.entry_price
+        evaluation.actual_entry_date = result.entry_date
+        evaluation.actual_exit_price = result.exit_price
+        evaluation.actual_exit_date = result.exit_date
+        evaluation.exit_reason = result.exit_reason
+        evaluation.trade_return_pct = result.trade_return_pct
+        evaluation.holding_days = result.holding_days
+        evaluation.plan_success = (
+            result.trade_return_pct is not None and result.trade_return_pct > 0
+        )
+        evaluation.outcome = (
+            "win"
+            if result.trade_return_pct is not None and result.trade_return_pct > 0
+            else "loss"
+        )
+        evaluation.entry_fill_status = "filled"
+        evaluation.entry_fill_price = result.entry_price
+        evaluation.entry_fill_date = result.entry_date
+        evaluation.exit_fill_status = "filled" if result.exit_price is not None else None
+        evaluation.exit_fill_price = result.exit_price
+        evaluation.exit_fill_date = result.exit_date
+
+        entry_index = result.entry_index or 0
+        replay_forward_bars = forward_bars[entry_index:]
+        eval_result = EntrySignalEvaluator.evaluate(
+            entry_price=result.entry_price,
+            forward_bars=replay_forward_bars,
+        )
+        evaluation.forward_return_1d = eval_result.forward_return_1d
+        evaluation.forward_return_3d = eval_result.forward_return_3d
+        evaluation.forward_return_5d = eval_result.forward_return_5d
+        evaluation.forward_return_10d = eval_result.forward_return_10d
+        evaluation.mae = eval_result.mae
+        evaluation.mfe = eval_result.mfe
+        evaluation.max_drawdown_from_peak = eval_result.max_drawdown_from_peak
+        evaluation.optimal_entry_deviation = eval_result.optimal_entry_deviation
+        evaluation.optimal_entry_timing = eval_result.optimal_entry_timing
+        evaluation.signal_quality_score = eval_result.signal_quality_score
+        evaluation.eval_status = "evaluated"
 
     def _evaluate_observation(
         self,
