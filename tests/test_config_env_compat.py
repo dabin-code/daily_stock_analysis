@@ -46,6 +46,47 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_screening_schedule_uses_safe_defaults(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            config = Config._load_from_env()
+
+        self.assertFalse(config.screening_schedule_enabled)
+        self.assertEqual(config.screening_schedule_time, "07:00")
+        self.assertFalse(config.screening_schedule_run_immediately)
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_screening_schedule_reads_explicit_env_values(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ) -> None:
+        env = {
+            "SCREENING_SCHEDULE_ENABLED": "true",
+            "SCREENING_SCHEDULE_TIME": "07:05",
+            "SCREENING_SCHEDULE_RUN_IMMEDIATELY": "true",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            config = Config._load_from_env()
+
+        self.assertTrue(config.screening_schedule_enabled)
+        self.assertEqual(config.screening_schedule_time, "07:05")
+        self.assertTrue(config.screening_schedule_run_immediately)
+
+        enabled_field = get_field_definition("SCREENING_SCHEDULE_ENABLED")
+        time_field = get_field_definition("SCREENING_SCHEDULE_TIME")
+
+        self.assertEqual(enabled_field["category"], "screening")
+        self.assertEqual(enabled_field["data_type"], "boolean")
+        self.assertEqual(time_field["data_type"], "time")
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
     def test_schedule_run_immediately_falls_back_to_legacy_run_immediately(
         self,
         _mock_parse_yaml,

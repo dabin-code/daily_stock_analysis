@@ -777,9 +777,16 @@ def main() -> int:
             return 0
 
         # 模式3: 定时任务模式
-        if args.schedule or config.schedule_enabled:
+        screening_schedule_enabled = bool(getattr(config, "screening_schedule_enabled", False))
+        schedule_mode_enabled = args.schedule or config.schedule_enabled or screening_schedule_enabled
+        if schedule_mode_enabled:
             logger.info("模式: 定时任务")
             logger.info(f"每日执行时间: {config.schedule_time}")
+            if screening_schedule_enabled:
+                logger.info(
+                    "全市场筛选每日执行时间: %s",
+                    getattr(config, "screening_schedule_time", "07:00"),
+                )
 
             # Determine whether to run immediately:
             # Command line arg --no-run-immediately overrides config if present.
@@ -787,28 +794,62 @@ def main() -> int:
             should_run_immediately = config.schedule_run_immediately
             if getattr(args, 'no_run_immediately', False):
                 should_run_immediately = False
+            screening_should_run_immediately = bool(
+                getattr(config, "screening_schedule_run_immediately", False)
+            )
+            if getattr(args, 'no_run_immediately', False):
+                screening_should_run_immediately = False
 
-            logger.info(f"启动时立即执行: {should_run_immediately}")
+            if args.screening:
+                logger.info(f"启动时立即执行全市场筛选: {should_run_immediately}")
+            elif args.schedule or config.schedule_enabled:
+                logger.info(f"启动时立即执行分析: {should_run_immediately}")
+            if screening_schedule_enabled and not args.screening:
+                logger.info(
+                    "启动时立即执行全市场筛选: %s",
+                    screening_should_run_immediately,
+                )
 
             from src.scheduler import Scheduler
+            screening_task_registered = False
+
             if args.screening:
                 if should_run_immediately:
                     run_screening_workflow(config=config, args=args)
                     should_run_immediately = False
 
+            scheduler = Scheduler(schedule_time=config.schedule_time)
+
+            if args.screening:
                 def scheduled_task():
                     run_screening_workflow(config=config, args=args)
+                scheduler.add_daily_task(
+                    name="screening",
+                    task=scheduled_task,
+                    schedule_time=config.schedule_time,
+                    run_immediately=should_run_immediately
+                )
+                screening_task_registered = True
             else:
-                def scheduled_task():
-                    run_full_analysis(config, args, stock_codes)
+                if args.schedule or config.schedule_enabled:
+                    def scheduled_task():
+                        run_full_analysis(config, args, stock_codes)
+                    scheduler.add_daily_task(
+                        name="analysis",
+                        task=scheduled_task,
+                        schedule_time=config.schedule_time,
+                        run_immediately=should_run_immediately
+                    )
 
-            scheduler = Scheduler(schedule_time=config.schedule_time)
-            scheduler.add_daily_task(
-                name="screening" if args.screening else "analysis",
-                task=scheduled_task,
-                schedule_time=config.schedule_time,
-                run_immediately=should_run_immediately
-            )
+            if screening_schedule_enabled and not screening_task_registered:
+                def scheduled_screening_task():
+                    run_screening_workflow(config=config, args=args)
+                scheduler.add_daily_task(
+                    name="screening",
+                    task=scheduled_screening_task,
+                    schedule_time=getattr(config, "screening_schedule_time", "07:00"),
+                    run_immediately=screening_should_run_immediately,
+                )
 
             if getattr(config, "board_sync_schedule_enabled", False):
                 scheduler.add_daily_task(
@@ -846,7 +887,7 @@ def main() -> int:
         logger.info("\n程序执行完成")
 
         # 如果启用了服务且是非定时任务模式，保持程序运行
-        keep_running = start_serve and not (args.schedule or config.schedule_enabled)
+        keep_running = start_serve and not schedule_mode_enabled
         if keep_running:
             logger.info("API 服务运行中 (按 Ctrl+C 退出)...")
             try:

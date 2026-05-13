@@ -503,6 +503,9 @@ class Config:
     schedule_enabled: bool = False            # 是否启用定时任务
     schedule_time: str = "18:00"              # 每日推送时间（HH:MM 格式）
     schedule_run_immediately: bool = True     # 启动时是否立即执行一次
+    screening_schedule_enabled: bool = False  # 是否启用全市场筛选定时任务
+    screening_schedule_time: str = "07:00"    # 全市场筛选每日执行时间（HH:MM 格式）
+    screening_schedule_run_immediately: bool = False  # 启动时是否立即执行一次筛选
     board_sync_schedule_enabled: bool = False # 是否启用板块定时同步
     board_sync_schedule_time: str = "15:05"   # 板块定时同步时间（HH:MM 格式）
     board_sync_run_immediately: bool = False  # 启动时是否立即执行一次板块同步
@@ -1072,6 +1075,12 @@ class Config:
             schedule_enabled=os.getenv('SCHEDULE_ENABLED', 'false').lower() == 'true',
             schedule_time=os.getenv('SCHEDULE_TIME', '18:00'),
             schedule_run_immediately=schedule_run_immediately,
+            screening_schedule_enabled=parse_env_bool(os.getenv('SCREENING_SCHEDULE_ENABLED'), default=False),
+            screening_schedule_time=os.getenv('SCREENING_SCHEDULE_TIME', '07:00'),
+            screening_schedule_run_immediately=parse_env_bool(
+                os.getenv('SCREENING_SCHEDULE_RUN_IMMEDIATELY'),
+                default=False,
+            ),
             board_sync_schedule_enabled=os.getenv('BOARD_SYNC_SCHEDULE_ENABLED', 'false').lower() == 'true',
             board_sync_schedule_time=os.getenv('BOARD_SYNC_SCHEDULE_TIME', '15:05'),
             board_sync_run_immediately=board_sync_run_immediately,

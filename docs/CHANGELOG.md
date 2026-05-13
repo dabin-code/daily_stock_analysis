@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Screening schedule notifications
+
+- Added an independent `SCREENING_SCHEDULE_ENABLED` / `SCREENING_SCHEDULE_TIME` / `SCREENING_SCHEDULE_RUN_IMMEDIATELY` schedule for full-market screening, defaulting to a `07:00` trading-day run that reuses the existing screening notification workflow and Feishu webhook delivery
+
 ### Extreme strength stock-pool semantics
 
 - `extreme_strength_combo` 策略明确收敛为 **热点题材股票池 / 排序器（`system_role: stock_pool`）**，不再承担精确买点语义。`setup_resolver` 回归测试锁定 `extreme_strength_combo` 永远不会被解析为 `setup_type` 或 `primary_strategy`

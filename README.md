@@ -73,6 +73,21 @@ Optional scheduled prewarm after the A-share close:
 
 The scheduled prewarm is now best treated as an optional fallback. The primary low-cost path is incremental board sync when `instrument_master` gains new stocks.
 
+## 早盘选股飞书推送
+
+项目支持独立的早盘全市场选股定时任务，适合在常驻进程中每天开盘前生成候选名单并推送到飞书：
+
+- `SCREENING_SCHEDULE_ENABLED=true`
+- `SCREENING_SCHEDULE_TIME=07:00`
+- `SCREENING_SCHEDULE_RUN_IMMEDIATELY=false`
+- `FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/...`
+
+启动常驻进程后，调度器会在交易日 `07:00` 执行一次全市场筛选；若当天不是 A 股交易日，任务会跳过且不推送。选股完成状态为 `completed` 或 `completed_with_ai_degraded` 时，会复用现有通知服务发送筛选推荐名单。通知服务会向所有已配置渠道推送；如果只希望发飞书，请只配置 `FEISHU_WEBHOOK_URL`。只启用该选股任务时，不需要同时开启 `SCHEDULE_ENABLED` 或传入 `--schedule`，否则会按既有语义额外注册普通每日分析任务。
+
+```bash
+python main.py --no-run-immediately
+```
+
 ## K线完整性治理
 
 项目现在支持独立的 K 线完整性治理链路，用于在日线同步后自动校验缺口并执行补偿：
@@ -267,6 +282,9 @@ python scripts/run_historical_random_screening.py --seed 20260512
 | `CUSTOM_WEBHOOK_URLS` | 自定义 Webhook（支持钉钉等，多个用逗号分隔） | 可选 |
 | `CUSTOM_WEBHOOK_BEARER_TOKEN` | 自定义 Webhook 的 Bearer Token（用于需要认证的 Webhook） | 可选 |
 | `WEBHOOK_VERIFY_SSL` | Webhook HTTPS 证书校验（默认 true）。设为 false 可支持自签名证书。警告：关闭有严重安全风险，仅限可信内网 | 可选 |
+| `SCREENING_SCHEDULE_ENABLED` | 启用早盘全市场选股定时任务 | 可选 |
+| `SCREENING_SCHEDULE_TIME` | 选股定时任务执行时间，默认 `07:00` | 可选 |
+| `SCREENING_SCHEDULE_RUN_IMMEDIATELY` | 定时模式启动时是否立即执行一次选股，默认 `false` | 可选 |
 | `SCHEDULE_RUN_IMMEDIATELY` | 定时模式启动时是否立即执行一次分析 | 可选 |
 | `RUN_IMMEDIATELY` | 非定时模式启动时是否立即执行一次分析 | 可选 |
 | `SINGLE_STOCK_NOTIFY` | 单股推送模式：设为 `true` 则每分析完一只股票立即推送 | 可选 |

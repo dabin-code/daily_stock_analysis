@@ -49,6 +49,21 @@ def test_screening_fields_are_explicitly_registered():
     assert ai_top_k["data_type"] == "integer"
     assert ai_top_k["default_value"] == "10"
 
+    schedule_enabled = get_field_definition("SCREENING_SCHEDULE_ENABLED")
+    assert schedule_enabled["category"] == "screening"
+    assert schedule_enabled["data_type"] == "boolean"
+    assert schedule_enabled["default_value"] == "false"
+
+    schedule_time = get_field_definition("SCREENING_SCHEDULE_TIME")
+    assert schedule_time["category"] == "screening"
+    assert schedule_time["data_type"] == "time"
+    assert schedule_time["default_value"] == "07:00"
+
+    schedule_run_immediately = get_field_definition("SCREENING_SCHEDULE_RUN_IMMEDIATELY")
+    assert schedule_run_immediately["category"] == "screening"
+    assert schedule_run_immediately["data_type"] == "boolean"
+    assert schedule_run_immediately["default_value"] == "false"
+
     min_volume_ratio = get_field_definition("SCREENING_MIN_VOLUME_RATIO")
     assert min_volume_ratio["category"] == "screening"
     assert min_volume_ratio["data_type"] == "number"
@@ -65,6 +80,9 @@ def test_screening_fields_appear_in_schema_response():
     assert "SCREENING_DEFAULT_MODE" in keys
     assert "SCREENING_CANDIDATE_LIMIT" in keys
     assert "SCREENING_AI_TOP_K" in keys
+    assert "SCREENING_SCHEDULE_ENABLED" in keys
+    assert "SCREENING_SCHEDULE_TIME" in keys
+    assert "SCREENING_SCHEDULE_RUN_IMMEDIATELY" in keys
     assert "SCREENING_MIN_LIST_DAYS" in keys
     assert "SCREENING_MIN_VOLUME_RATIO" in keys
     assert "SCREENING_MIN_AVG_AMOUNT" not in keys
