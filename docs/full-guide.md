@@ -70,6 +70,7 @@ daily_stock_analysis/
 |------------|------|:----:|
 | `WECHAT_WEBHOOK_URL` | 企业微信 Webhook URL | 可选 |
 | `FEISHU_WEBHOOK_URL` | 飞书 Webhook URL | 可选 |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_CHAT_ID` | 飞书开放平台应用主动推送到群聊 | 可选 |
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot Token（@BotFather 获取） | 可选 |
 | `TELEGRAM_CHAT_ID` | Telegram Chat ID | 可选 |
 | `TELEGRAM_MESSAGE_THREAD_ID` | Telegram Topic ID (用于发送到子话题) | 可选 |
@@ -184,6 +185,7 @@ daily_stock_analysis/
 |--------|------|:----:|
 | `WECHAT_WEBHOOK_URL` | 企业微信机器人 Webhook URL | 可选 |
 | `FEISHU_WEBHOOK_URL` | 飞书机器人 Webhook URL | 可选 |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_CHAT_ID` | 飞书开放平台应用主动推送到群聊；适合无自定义机器人 Webhook 的账号 | 可选 |
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot Token | 可选 |
 | `TELEGRAM_CHAT_ID` | Telegram Chat ID | 可选 |
 | `TELEGRAM_MESSAGE_THREAD_ID` | Telegram Topic ID | 可选 |
@@ -229,7 +231,8 @@ daily_stock_analysis/
 | `FEISHU_ENCRYPT_KEY` | 飞书事件加密 Key；仅开启消息加密或回调模式需要 | 可选 |
 
 > `FEISHU_STREAM_ENABLED=true` 适合本地或 Docker 的 Bot 对话 / 会话内回复场景，机器人可通过 WebSocket 长连接收发消息，无需额外暴露公网回调地址。
-> 如果你的目标是接收定时分析、批量报告等主动推送，仍需继续配置 `FEISHU_WEBHOOK_URL`。
+> 如果你的目标是接收定时分析、批量报告等主动推送，可配置 `FEISHU_WEBHOOK_URL`；没有自定义机器人入口时，也可配置 `FEISHU_APP_ID` + `FEISHU_APP_SECRET` + `FEISHU_CHAT_ID` 走开放平台应用主动推送。
+> 选股任务完成状态为 `completed` 或 `completed_with_ai_degraded` 时，会自动发送筛选推荐名单；该行为适用于定时、CLI 和 API 触发的选股运行。推送内容会尽量对齐 Web 候选详情，包含命中规则明细、买卖点、题材/板块、分层评分、交易计划、风险参数和 AI 复核等信息。
 
 ### 搜索服务配置
 
@@ -537,6 +540,13 @@ crontab -e
 1. 在飞书群聊中添加"自定义机器人"
 2. 复制 Webhook URL
 3. 设置 `FEISHU_WEBHOOK_URL`
+
+如果个人账号没有自定义机器人入口，可改用飞书开放平台自建应用：
+
+1. 确认应用已添加到目标群并具备发送消息权限
+2. 获取应用的 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`
+3. 获取目标群的 `FEISHU_CHAT_ID`（形如 `oc_xxx`）
+4. 同时配置 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`FEISHU_CHAT_ID`
 
 ### Telegram
 

@@ -29,11 +29,9 @@ class ScreeningScheduleServiceTestCase(unittest.TestCase):
     def test_run_once_executes_screening_on_open_market(self, _mock_open_markets) -> None:
         task_service = MagicMock()
         task_service.execute_run.return_value = {"run_id": "run-20260313-cn-balanced", "status": "completed"}
-        notification_service = MagicMock()
         service = ScreeningScheduleService(
             config=self._build_config(),
             screening_task_service=task_service,
-            notification_service=notification_service,
         )
 
         result = service.run_once(force_run=False, market="cn")

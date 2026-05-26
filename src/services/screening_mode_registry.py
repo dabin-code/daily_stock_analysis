@@ -35,6 +35,7 @@ class ResolvedScreeningRuntimeConfig:
     min_volume_ratio: float
     breakout_lookback_days: int
     factor_lookback_days: int
+    min_final_score: float = 0.0
 
     def to_snapshot(self) -> Dict[str, Any]:
         return {
@@ -45,6 +46,7 @@ class ResolvedScreeningRuntimeConfig:
             "screening_min_volume_ratio": self.min_volume_ratio,
             "screening_breakout_lookback_days": self.breakout_lookback_days,
             "screening_factor_lookback_days": self.factor_lookback_days,
+            "screening_min_final_score": self.min_final_score,
         }
 
 
@@ -70,6 +72,9 @@ def resolve_screening_runtime_config(
     base_min_volume_ratio = float(getattr(config, "screening_min_volume_ratio"))
     base_breakout_lookback_days = int(getattr(config, "screening_breakout_lookback_days"))
     base_factor_lookback_days = int(getattr(config, "screening_factor_lookback_days"))
+    base_min_final_score = float(getattr(config, "screening_min_final_score", 0.0) or 0.0)
+    if base_min_final_score < 0:
+        base_min_final_score = 0.0
 
     def _resolve_directional_value(base_value: float, preset_key: str, *, prefer_higher: bool) -> float:
         if preset_key not in preset:
@@ -97,6 +102,12 @@ def resolve_screening_runtime_config(
     )
     resolved_ai_top_k = min(resolved_ai_top_k, resolved_candidate_limit)
 
+    resolved_min_final_score = float(
+        _resolve_directional_value(base_min_final_score, "min_final_score", prefer_higher=True)
+    )
+    if resolved_min_final_score < 0:
+        resolved_min_final_score = 0.0
+
     return ResolvedScreeningRuntimeConfig(
         mode=resolved_mode,
         candidate_limit=resolved_candidate_limit,
@@ -109,4 +120,5 @@ def resolve_screening_runtime_config(
         factor_lookback_days=int(
             _resolve_directional_value(base_factor_lookback_days, "factor_lookback_days", prefer_higher=False)
         ),
+        min_final_score=resolved_min_final_score,
     )

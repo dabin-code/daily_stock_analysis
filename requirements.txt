@@ -1,63 +1,63 @@
 # ===================================
-# A¹É×ÔÑ¡¹ÉÖÇÄÜ·ÖÎöÏµÍ³ - ÒÀÀµÁÐ±í
+# Aè‚¡è‡ªé€‰è‚¡æ™ºèƒ½åˆ†æžç³»ç»Ÿ - ä¾èµ–åˆ—è¡¨
 # ===================================
 
-# ºËÐÄÒÀÀµ
-python-dotenv>=1.0.0        # »·¾³±äÁ¿ÅäÖÃ¹ÜÀí
-tenacity>=8.2.0             # ÖØÊÔ»úÖÆ£¨Ö¸ÊýÍË±Ü£©
-sqlalchemy>=2.0.0           # ORMÊý¾Ý¿â²Ù×÷
-schedule>=1.2.0             # ¶¨Ê±ÈÎÎñµ÷¶È
-exchange-calendars>=4.5.0   # ½»Ò×ÈÕÀú£¨A¹É/¸Û¹É/ÃÀ¹É£¬Issue #373£©
+# æ ¸å¿ƒä¾èµ–
+python-dotenv>=1.0.0        # çŽ¯å¢ƒå˜é‡é…ç½®ç®¡ç†
+tenacity>=8.2.0             # é‡è¯•æœºåˆ¶ï¼ˆæŒ‡æ•°é€€é¿ï¼‰
+sqlalchemy>=2.0.0           # ORMæ•°æ®åº“æ“ä½œ
+schedule>=1.2.0             # å®šæ—¶ä»»åŠ¡è°ƒåº¦
+exchange-calendars>=4.5.0   # äº¤æ˜“æ—¥åŽ†ï¼ˆAè‚¡/æ¸¯è‚¡/ç¾Žè‚¡ï¼ŒIssue #373ï¼‰
 
-# Êý¾ÝÔ´ÒÀÀµ£¨¶àÔ´²ßÂÔ£¬°´ÓÅÏÈ¼¶ÅÅÐò£©
-efinance>=0.5.5             # Priority 0: ¶«·½²Æ¸»Êý¾ÝÔ´£¨×î¸ßÓÅÏÈ¼¶£©https://github.com/Micro-sheep/efinance
-akshare>=1.12.0             # Priority 1: ¶«·½²Æ¸»ÅÀ³æÊý¾ÝÔ´
-tushare>=1.4.0              # Priority 2: ÍÚµØÍÃ Pro API
-pytdx>=1.72                 # Priority 2: Í¨´ïÐÅÐÐÇé·þÎñÆ÷
-baostock>=0.8.0             # Priority 3: Ö¤È¯±¦Êý¾Ý
+# æ•°æ®æºä¾èµ–ï¼ˆå¤šæºç­–ç•¥ï¼ŒæŒ‰ä¼˜å…ˆçº§æŽ’åºï¼‰
+efinance>=0.5.5             # Priority 0: ä¸œæ–¹è´¢å¯Œæ•°æ®æºï¼ˆæœ€é«˜ä¼˜å…ˆçº§ï¼‰https://github.com/Micro-sheep/efinance
+akshare>=1.12.0             # Priority 1: ä¸œæ–¹è´¢å¯Œçˆ¬è™«æ•°æ®æº
+tushare>=1.4.0              # Priority 2: æŒ–åœ°å…” Pro API
+pytdx>=1.72                 # Priority 2: é€šè¾¾ä¿¡è¡Œæƒ…æœåŠ¡å™¨
+baostock>=0.8.0             # Priority 3: è¯åˆ¸å®æ•°æ®
 yfinance>=0.2.0             # Priority 4: Yahoo Finance (Fallback)
 
-#·ÉÊé
-lark-oapi>=1.0.0             # ·ÉÊéAPI
+#é£žä¹¦
+lark-oapi>=1.0.0             # é£žä¹¦API
 
-# Êý¾Ý´¦Àí
-pandas>=2.0.0               # Êý¾Ý·ÖÎö
+# æ•°æ®å¤„ç†
+pandas>=2.0.0               # æ•°æ®åˆ†æž
 pypinyin>=0.50.0            # Name-to-code resolver (pinyin matching)
 openpyxl>=3.1.0             # Excel (.xlsx) parsing for import
-numpy>=1.24.0               # ÊýÖµ¼ÆËã
-json-repair>=0.55.1         # JSON ÐÞ¸´
+numpy>=1.24.0               # æ•°å€¼è®¡ç®—
+json-repair>=0.55.1         # JSON ä¿®å¤
 
-# AI ·ÖÎö
+# AI åˆ†æž
 litellm>=1.80.10            # Unified LLM client (Gemini/Anthropic/OpenAI/DeepSeek etc.)
 tiktoken>=0.8.0,<0.12.0    # BPE tokenizer for LLM token counting (pin <0.12 to avoid plugin registration issues, #537)
 openai>=1.0.0               # OpenAI SDK (transitive dependency of litellm, kept explicit)
 PyYAML>=6.0                 # YAML parser for LITELLM_CONFIG support
 
-# ËÑË÷ÒýÇæ£¨ÓÃÓÚ»ñÈ¡¹ÉÆ±ÐÂÎÅ£©
-tavily-python>=0.3.0        # Tavily ËÑË÷ API£¨Ã¿ÔÂ 1000 ´ÎÃâ·Ñ£©
-google-search-results>=2.4.0  # SerpAPI£¨Ã¿ÔÂ 100 ´ÎÃâ·Ñ£©
+# æœç´¢å¼•æ“Žï¼ˆç”¨äºŽèŽ·å–è‚¡ç¥¨æ–°é—»ï¼‰
+tavily-python>=0.3.0        # Tavily æœç´¢ APIï¼ˆæ¯æœˆ 1000 æ¬¡å…è´¹ï¼‰
+google-search-results>=2.4.0  # SerpAPIï¼ˆæ¯æœˆ 100 æ¬¡å…è´¹ï¼‰
 
-# ÍøÂçÇëÇó
-requests>=2.31.0            # HTTP ÇëÇó
-markdown2>=2.4.0            # Markdown ×ª HTML
-imgkit>=1.2.0              # Markdown ×ªÍ¼Æ¬£¨Ðè°²×° wkhtmltopdf£©
-fake-useragent>=1.4.0       # Ëæ»ú User-Agent ·À·â½û
-httpx[socks]                # HTTP ¿Í»§¶Ë + SOCKS ´úÀíÖ§³Ö£¨OpenAI ¿ÉÑ¡ÒÀÀµ£©
-dingtalk-stream >= 0.24.3    # ¶¤¶¤ Stream SDK
-# Êý¾Ý¿â
-# SQLite ÊÇ Python ÄÚÖÃ£¬ÎÞÐè¶îÍâ°²×°
+# ç½‘ç»œè¯·æ±‚
+requests>=2.31.0            # HTTP è¯·æ±‚
+markdown2>=2.4.0            # Markdown è½¬ HTML
+imgkit>=1.2.0              # Markdown è½¬å›¾ç‰‡ï¼ˆéœ€å®‰è£… wkhtmltopdfï¼‰
+fake-useragent>=1.4.0       # éšæœº User-Agent é˜²å°ç¦
+httpx[socks]                # HTTP å®¢æˆ·ç«¯ + SOCKS ä»£ç†æ”¯æŒï¼ˆOpenAI å¯é€‰ä¾èµ–ï¼‰
+dingtalk-stream >= 0.24.3    # é’‰é’‰ Stream SDK
+# æ•°æ®åº“
+# SQLite æ˜¯ Python å†…ç½®ï¼Œæ— éœ€é¢å¤–å®‰è£…
 
-# Discord »úÆ÷ÈË
-discord.py>=2.0.0              # Discord »úÆ÷ÈË¿ª·¢¿â
+# Discord æœºå™¨äºº
+discord.py>=2.0.0              # Discord æœºå™¨äººå¼€å‘åº“
 
 # Web Content Extraction
 newspaper3k>=0.2.8          # Article extraction
 lxml_html_clean             # Fix for lxml.html.clean ImportError in newer lxml versions
 
-# ±¨¸æÄ£°åÒýÇæ£¨Report Engine P0£©
+# æŠ¥å‘Šæ¨¡æ¿å¼•æ“Žï¼ˆReport Engine P0ï¼‰
 jinja2>=3.1.0               # Jinja2 template engine for report rendering
 
-# FastAPI Web ¿ò¼Ü
-fastapi>=0.109.0            # ÏÖ´ú Python Web ¿ò¼Ü
-uvicorn[standard]>=0.27.0   # ASGI ·þÎñÆ÷
+# FastAPI Web æ¡†æž¶
+fastapi>=0.109.0            # çŽ°ä»£ Python Web æ¡†æž¶
+uvicorn[standard]>=0.27.0   # ASGI æœåŠ¡å™¨
 python-multipart>=0.0.6     # FastAPI File/Form upload support

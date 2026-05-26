@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Screening final-score gate
+
+- Added a final-layer minimum score gate in `ScreeningTaskService.execute_run`: candidates whose post L1-L5 rerank `rule_score` (the persisted `final_score`) falls below `SCREENING_MIN_FINAL_SCORE` are dropped before AI 二筛、persistence、通知 / 报告 / API 全链路。默认阈值 `80` 等价于至少达到 `probe_entry` 阶段或同等多维组合，设置为 `0` 关闭过滤
+- New `SCREENING_MIN_FINAL_SCORE` env / config key registered in `config_registry`，可通过 `.env` 或 Web 设置页调整，并通过 `Config.validate_structured()` 守卫负值
+- `ResolvedScreeningRuntimeConfig` 与 `pipeline_stats` 同步暴露 `min_final_score / below_min_final_score_count / after_min_final_score_count`，便于审计和 UI 展示
+
+### Notifications
+
+- Added Feishu app-based proactive notifications via `FEISHU_APP_ID` + `FEISHU_APP_SECRET` + `FEISHU_CHAT_ID`, so accounts without a custom bot webhook can still receive scheduled reports in a Feishu group
+- Screening runs now auto-send the screening recommendation notification after every successful run (`completed` or `completed_with_ai_degraded`) regardless of whether the run was triggered by schedule, CLI, or API
+- Fixed manually/API-triggered screening runs being marked `skipped` for notifications before auto-send, which prevented Feishu delivery even after the run completed successfully
+- Fixed screening unit tests so they cannot send real Feishu notifications, and made zero-candidate notifications explicitly say that no candidates were produced instead of showing an empty recommendation block
+- Long Feishu notifications now use a collapsed interactive-card panel by default, keeping the run summary visible while hiding detailed screening content until the user expands it
+- Expanded screening recommendation notifications to render every pushed candidate as a detailed Web-like block with matched rules, buy/sell plan, theme/sector context, layered scores, phase explanations, risk parameters, and AI review details
+- Screening auto-push (`ScreeningNotificationService.notify_run`) now generates push content adaptively: by default every candidate keeps its full audit block (matched rules / score breakdown / factor snapshot / audit evidence / AI review), so users see the complete details inside the Feishu collapsible panel; only when the content exceeds the single-message size budget does it gracefully degrade by capping the number of full audit blocks (`audit_top_n` ladder `None → 15 → 10 → 7 → 5 → 3 → 1 → 0`), keeping the result on a single, default-collapsed Feishu card. The complete audit content is still archived to `reports/screening_<run_id>.md`
+- Raised the default `FEISHU_MAX_BYTES` from `20000` to `28000` (Feishu's interactive-card hard limit is ~30KB; we reserve ~2KB for card envelope JSON) so screening notifications with ~10–15 candidates fit in a single message instead of being split into multiple uncollapsed chunks
+- Lowered the Feishu interactive-card default collapse threshold (`feishu_cards.DEFAULT_COLLAPSE_THRESHOLD_BYTES`) from 4000 to 1500 bytes so that even short screening summaries (or compact fallback) are hidden inside the collapsible panel by default and only shown when the user expands it
+
+### Docker deployment
+
+- Raised the default Docker Compose memory limit from `512M` to `2G` to give full-market screening enough headroom during factor snapshot generation
+
 ### Screening schedule notifications
 
 - Added an independent `SCREENING_SCHEDULE_ENABLED` / `SCREENING_SCHEDULE_TIME` / `SCREENING_SCHEDULE_RUN_IMMEDIATELY` schedule for full-market screening, defaulting to a `07:00` trading-day run that reuses the existing screening notification workflow and Feishu webhook delivery
@@ -29,6 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### K-line completeness governance
 
 - Added K-line governance truth-source tables, audit service, repair service, and skip-registry workflow so daily data completeness is tracked explicitly instead of inferred from loose sync heuristics
+- Added controlled auto-approval for small `skip_eligible` symbol-range K-line gaps between daily audit and re-audit, configurable with `KLINE_AUDIT_AUTO_SKIP_*`, while still failing closed for market-wide gaps and blocking/retryable sync errors
+- K-line audit runs now record `completed_at` for degraded/not-passed terminal results so health views no longer look stuck after an audit finishes unsuccessfully
 - Screening ingest now consumes audit-derived truth: blocking/retryable sync failures are no longer silently downgraded, and non-`passed` trade dates fail closed before factor building
 - Added a fast backfill-to-date path for screening: Web users can run `回填至该日`, the API exposes `POST /api/v1/screening/backfill-to-date`, and `scripts/fast_backfill.py --to-date YYYY-MM-DD` reuses the same service logic before target-date governance audit
 - Data-health `repair_gaps` now caps repair attempts at the latest `pass_status=passed` K-line audit date, so intraday/current-date gaps are skipped instead of keeping the repair task stuck in `processing`

@@ -306,6 +306,32 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
 
         self.assertTrue(ok)
         mock_post.assert_called_once()
+
+    @mock.patch("src.notification.get_config")
+    @mock.patch("requests.post")
+    def test_send_to_feishu_long_content_uses_collapsed_card(
+        self, mock_post: mock.MagicMock, mock_get_config: mock.MagicMock
+    ):
+        cfg = _make_config(feishu_webhook_url="https://feishu.example")
+        mock_get_config.return_value = cfg
+        mock_post.return_value = _make_response(200, {"code": 0})
+        content = (
+            "# 2026-05-18 全市场筛选推荐名单\n\n"
+            "> run_id: `run-001` | 候选数: **10**\n\n"
+            "## Top 推荐\n\n"
+            + ("### 候选股票\n\n- 命中规则：趋势对齐\n" * 200)
+        )
+
+        service = NotificationService()
+        ok = service.send(content)
+
+        self.assertTrue(ok)
+        payload = mock_post.call_args.kwargs["json"]
+        elements = payload["card"]["elements"]
+        self.assertEqual(elements[1]["tag"], "collapsible_panel")
+        self.assertFalse(elements[1]["expanded"])
+        self.assertIn("run_id", elements[0]["text"]["content"])
+        self.assertIn("Top 推荐", elements[1]["elements"][0]["text"]["content"])
         
     @mock.patch("src.notification.get_config")
     @mock.patch("requests.post")
@@ -321,6 +347,61 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertAlmostEqual(mock_post.call_count, 4, delta=1)
+        for call_args in mock_post.call_args_list:
+            request = requests.Request(
+                "POST",
+                "https://feishu.example",
+                json=call_args.kwargs["json"],
+            ).prepare()
+            self.assertLessEqual(len(request.body), 2600)
+
+    @mock.patch("src.notification.get_config")
+    @mock.patch("requests.post")
+    def test_send_to_feishu_unicode_chunking_uses_real_json_payload_size(
+        self, mock_post: mock.MagicMock, mock_get_config: mock.MagicMock
+    ):
+        cfg = _make_config(feishu_webhook_url="https://feishu.example", feishu_max_bytes=2000)
+        mock_get_config.return_value = cfg
+        mock_post.return_value = _make_response(200, {"code": 0})
+
+        service = NotificationService()
+        ok = service.send(("贵州茅台😀" * 500))
+
+        self.assertTrue(ok)
+        self.assertGreater(mock_post.call_count, 1)
+        for call_args in mock_post.call_args_list:
+            request = requests.Request(
+                "POST",
+                "https://feishu.example",
+                json=call_args.kwargs["json"],
+            ).prepare()
+            self.assertLessEqual(len(request.body), 2000)
+
+    @mock.patch("src.notification.get_config")
+    def test_send_to_feishu_app_chat_via_notification_service(
+        self, mock_get_config: mock.MagicMock
+    ):
+        cfg = _make_config(
+            feishu_app_id="cli_test",
+            feishu_app_secret="secret",
+            feishu_chat_id="oc_test",
+        )
+        mock_get_config.return_value = cfg
+
+        with mock.patch(
+            "src.notification_sender.feishu_sender._create_feishu_reply_client"
+        ) as mock_create_client:
+            mock_client = mock_create_client.return_value
+            mock_client.send_to_chat.return_value = True
+
+            service = NotificationService()
+            self.assertIn(NotificationChannel.FEISHU, service.get_available_channels())
+
+            ok = service.send("hello feishu app")
+
+        self.assertTrue(ok)
+        mock_create_client.assert_called_once_with("cli_test", "secret")
+        mock_client.send_to_chat.assert_called_once_with("oc_test", "hello feishu app")
 
     @mock.patch("src.notification.get_config")
     @mock.patch("requests.post")

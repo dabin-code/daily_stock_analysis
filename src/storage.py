@@ -1345,15 +1345,13 @@ class DatabaseManager:
                 for row in conn.exec_driver_sql("PRAGMA table_info(screening_runs)").fetchall()
             }
             missing = [name for name in expected_columns if name not in existing]
-            if not missing:
-                return
-
-            logger.info(
-                "Applying inline SQLite migration for screening_runs, missing columns: %s",
-                ", ".join(missing),
-            )
-            for column_name in missing:
-                conn.exec_driver_sql(expected_columns[column_name])
+            if missing:
+                logger.info(
+                    "Applying inline SQLite migration for screening_runs, missing columns: %s",
+                    ", ".join(missing),
+                )
+                for column_name in missing:
+                    conn.exec_driver_sql(expected_columns[column_name])
 
             conn.exec_driver_sql(
                 "UPDATE screening_runs "
@@ -1363,19 +1361,15 @@ class DatabaseManager:
             conn.exec_driver_sql(
                 "UPDATE screening_runs "
                 "SET notification_status='pending' "
-                "WHERE notification_status IS NULL AND trigger_type='scheduled'"
-            )
-            conn.exec_driver_sql(
-                "UPDATE screening_runs "
-                "SET notification_status='skipped' "
-                "WHERE notification_status IS NULL AND COALESCE(trigger_type, 'manual')!='scheduled'"
+                "WHERE notification_status IS NULL"
             )
             conn.exec_driver_sql(
                 "UPDATE screening_runs "
                 "SET notification_attempts=0 "
                 "WHERE notification_attempts IS NULL"
             )
-            logger.info("Inline SQLite migration for screening_runs completed")
+            if missing:
+                logger.info("Inline SQLite migration for screening_runs completed")
 
     def _migrate_sqlite_screening_runs_heartbeat_field(self) -> None:
         """Ensure screening_runs has last_activity_at column on SQLite."""
@@ -1756,6 +1750,10 @@ class DatabaseManager:
         run.rule_version = rule_version
         run.window_start = window_start
         run.window_end = window_end
+        if run_result != "pending":
+            run.completed_at = datetime.now()
+        else:
+            run.completed_at = None
         session.flush()
         session.refresh(run)
         session.expunge(run)
@@ -2862,8 +2860,8 @@ class DatabaseManager:
         if run_id is None:
             run_id = f"run-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
 
-        # Derive notification_status default from trigger_type
-        notification_status = "pending" if trigger_type == "scheduled" else "skipped"
+        # Every newly completed screening run is eligible for auto notification.
+        notification_status = "pending"
 
         record = ScreeningRun(
             run_id=run_id,

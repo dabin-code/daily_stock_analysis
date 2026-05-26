@@ -9,6 +9,7 @@ from src.config import Config, get_config
 from src.core import trading_calendar
 from src.services.kline_audit_service import KlineAuditService
 from src.services.kline_repair_service import KlineRepairService
+from src.services.kline_skip_policy_service import KlineSkipPolicyService
 from src.services.market_data_sync_service import MarketDataSyncService
 from src.storage import DatabaseManager
 
@@ -27,6 +28,7 @@ class KlineGovernanceScheduleService:
         market_data_sync_service: Optional[MarketDataSyncService] = None,
         audit_service: Optional[KlineAuditService] = None,
         repair_service: Optional[KlineRepairService] = None,
+        skip_policy_service: Optional[KlineSkipPolicyService] = None,
         db_manager: Optional[DatabaseManager] = None,
     ) -> None:
         self.config = config or get_config()
@@ -47,6 +49,10 @@ class KlineGovernanceScheduleService:
                 "kline_skip_candidate_failure_threshold",
                 3,
             ),
+        )
+        self.skip_policy_service = skip_policy_service or KlineSkipPolicyService(
+            config=self.config,
+            db_manager=self.db,
         )
 
     def resolve_target_trade_date(
@@ -144,6 +150,12 @@ class KlineGovernanceScheduleService:
             governance_run_id=audit_result.get("run_id"),
             included_statuses={"pending_retry", "candidate_skip"},
         )
+        auto_skip_result = self.skip_policy_service.apply_auto_skip(
+            market=market,
+            source_run_id=audit_result.get("run_id"),
+            trade_date=target_trade_date,
+            sync_result=sync_result,
+        )
         re_audit_result = self.audit_service.audit_trade_date(
             market=market,
             trade_date=target_trade_date,
@@ -166,6 +178,7 @@ class KlineGovernanceScheduleService:
             "sync_result": sync_result,
             "audit_result": audit_result,
             "repair_result": repair_result,
+            "auto_skip_result": auto_skip_result,
             "re_audit_result": re_audit_result,
             "approved_skip_recovery_result": approved_skip_recovery_result,
         }

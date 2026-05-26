@@ -284,7 +284,7 @@ Adjust memory limits in `docker-compose.yml`:
 deploy:
   resources:
     limits:
-      memory: 1G
+      memory: 2G
 ```
 
 ---

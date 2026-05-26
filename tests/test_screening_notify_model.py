@@ -67,15 +67,15 @@ class ScreeningRunNotificationFieldsTestCase(unittest.TestCase):
         run = self.db.get_screening_run(run_id)
         self.assertEqual(run["notification_status"], "pending")
 
-    def test_manual_run_notification_status_defaults_to_skipped(self) -> None:
+    def test_manual_run_notification_status_defaults_to_pending(self) -> None:
         run_id = self._create_run(trigger_type="manual")
         run = self.db.get_screening_run(run_id)
-        self.assertEqual(run["notification_status"], "skipped")
+        self.assertEqual(run["notification_status"], "pending")
 
-    def test_rerun_notification_status_defaults_to_skipped(self) -> None:
+    def test_rerun_notification_status_defaults_to_pending(self) -> None:
         run_id = self._create_run(trigger_type="rerun")
         run = self.db.get_screening_run(run_id)
-        self.assertEqual(run["notification_status"], "skipped")
+        self.assertEqual(run["notification_status"], "pending")
 
     # -- notification_attempts default --
 

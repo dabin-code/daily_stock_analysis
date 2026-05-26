@@ -29,6 +29,8 @@ from src.storage import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
+_AUTO_NOTIFY_TRIGGER_TYPES = {"manual", "scheduled", "rerun", "api", "openclaw"}
+
 # 全局超时（秒）：整个 execute_run 的最大允许时长
 _EXECUTE_RUN_DEADLINE_SECONDS: int = 30 * 60  # 30 分钟
 _CN_MARKET_CLOSE_TIME = dt_time(hour=15, minute=0)
@@ -99,6 +101,7 @@ class ScreeningTaskService:
         candidate_analysis_service: Optional[CandidateAnalysisService] = None,
         market_data_sync_service: Optional[MarketDataSyncService] = None,
         skill_manager: Optional[Any] = None,
+        notification_service: Optional[Any] = None,
     ) -> None:
         self.config = get_config()
         self.db = db_manager or DatabaseManager.get_instance()
@@ -111,6 +114,7 @@ class ScreeningTaskService:
         self.factor_service = factor_service
         self._candidate_analysis_service: Optional[CandidateAnalysisService] = candidate_analysis_service
         self._market_data_sync_service: Optional[MarketDataSyncService] = market_data_sync_service
+        self._notification_service = notification_service
         self._theme_context: Optional[Any] = None
 
     @property
@@ -614,6 +618,39 @@ class ScreeningTaskService:
                     pipeline_stats.get("kept_count"),
                     pipeline_stats.get("l2_filter_mode"),
                 )
+
+            # ── 最终评分门槛（默认 SCREENING_MIN_FINAL_SCORE=80） ──────────
+            # 在 L1-L5 重排完成后、AI 二筛之前，按入库口径的 rule_score
+            # （即 storage 中的 final_score）做最后一道质量过滤，
+            # 设为 0 则关闭该过滤层。
+            min_final_score = float(getattr(runtime_config, "min_final_score", 0.0) or 0.0)
+            below_score_count = 0
+            if min_final_score > 0 and selected:
+                pre_filter_count = len(selected)
+                selected = [
+                    candidate
+                    for candidate in selected
+                    if float(getattr(candidate, "rule_score", 0.0) or 0.0)
+                    >= min_final_score
+                ]
+                below_score_count = pre_filter_count - len(selected)
+                pipeline_stats["min_final_score"] = min_final_score
+                pipeline_stats["below_min_final_score_count"] = below_score_count
+                pipeline_stats["after_min_final_score_count"] = len(selected)
+                if below_score_count:
+                    logger.info(
+                        "screening_run event=min_final_score_filter dropped=%d remaining=%d threshold=%.2f",
+                        below_score_count,
+                        len(selected),
+                        min_final_score,
+                    )
+                # 重排过滤后重新分配 rank，避免下游展示出现空洞。
+                for new_rank, candidate in enumerate(selected, start=1):
+                    try:
+                        candidate.rank = new_rank
+                    except Exception:
+                        # 防御性兼容：少数 mock 候选可能无 rank 字段
+                        pass
             self._log_stage_completed(
                 screening_run_id=run_id,
                 stage=current_stage,
@@ -792,6 +829,11 @@ class ScreeningTaskService:
                 universe_size=len(universe_df.index),
                 candidate_count=len(candidates),
             )
+            self._notify_completed_run(
+                run_id=run_id,
+                status=completion_status,
+                trigger_type=trigger_type,
+            )
             return result
         except Exception as exc:
             self.db.update_screening_run_status(
@@ -840,6 +882,35 @@ class ScreeningTaskService:
 
     def get_candidate_detail(self, run_id: str, code: str) -> Optional[Dict[str, Any]]:
         return self.db.get_screening_candidate_detail(run_id=run_id, code=code)
+
+    def _notify_completed_run(self, run_id: str, status: str, trigger_type: str = "manual") -> None:
+        """Auto-push completed screening results without failing the screening run."""
+        if status not in {"completed", "completed_with_ai_degraded"}:
+            return
+        if trigger_type not in _AUTO_NOTIFY_TRIGGER_TYPES:
+            logger.info(
+                "screening_run auto notification skipped for run_id=%s trigger_type=%s",
+                run_id,
+                trigger_type,
+            )
+            return
+
+        try:
+            notification_service = self._notification_service
+            if notification_service is None:
+                from src.services.screening_notification_service import ScreeningNotificationService
+
+                notification_service = ScreeningNotificationService(
+                    screening_task_service=self,
+                    db_manager=self.db,
+                )
+            notification_service.notify_run(run_id, force=True)
+        except Exception:
+            logger.exception(
+                "screening_run auto notification failed for run_id=%s; "
+                "run result is still returned as completed",
+                run_id,
+            )
 
     def resolve_run_config(
         self,

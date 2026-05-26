@@ -75,7 +75,7 @@ class InlineScreeningRunMigrationTestCase(unittest.TestCase):
 
         self.assertIsNotNone(run)
         self.assertEqual(run["trigger_type"], "manual")
-        self.assertEqual(run["notification_status"], "skipped")
+        self.assertEqual(run["notification_status"], "pending")
         self.assertEqual(run["notification_attempts"], 0)
         self.assertIsNone(run["notification_sent_at"])
         self.assertIsNone(run["notification_error"])

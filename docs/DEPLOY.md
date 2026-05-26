@@ -296,7 +296,7 @@ rm /opt/stock-analyzer/data/*.lock
 deploy:
   resources:
     limits:
-      memory: 1G
+      memory: 2G
 ```
 
 ---

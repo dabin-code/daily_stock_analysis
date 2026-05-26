@@ -174,6 +174,12 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
         self.assertEqual(config.kline_deep_audit_schedule_time, "17:00")
         self.assertEqual(config.kline_retry_max_attempts, 3)
         self.assertEqual(config.kline_skip_candidate_failure_threshold, 3)
+        self.assertTrue(config.kline_audit_auto_skip_enabled)
+        self.assertEqual(config.kline_audit_auto_skip_max_symbols, 20)
+        self.assertEqual(config.kline_audit_auto_skip_max_ratio, 0.005)
+        self.assertEqual(config.kline_audit_auto_skip_min_coverage, 0.99)
+        self.assertEqual(config.kline_audit_auto_skip_reason_classes, "skip_eligible")
+        self.assertEqual(config.kline_audit_auto_skip_reasons, "not_in_bulk_universe,empty_data")
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
@@ -192,6 +198,12 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
             "KLINE_DEEP_AUDIT_SCHEDULE_TIME": "18:30",
             "KLINE_RETRY_MAX_ATTEMPTS": "4",
             "KLINE_SKIP_CANDIDATE_FAILURE_THRESHOLD": "5",
+            "KLINE_AUDIT_AUTO_SKIP_ENABLED": "false",
+            "KLINE_AUDIT_AUTO_SKIP_MAX_SYMBOLS": "7",
+            "KLINE_AUDIT_AUTO_SKIP_MAX_RATIO": "0.002",
+            "KLINE_AUDIT_AUTO_SKIP_MIN_COVERAGE": "0.995",
+            "KLINE_AUDIT_AUTO_SKIP_REASON_CLASSES": "skip_eligible",
+            "KLINE_AUDIT_AUTO_SKIP_REASONS": "not_in_bulk_universe",
         }
 
         with patch.dict(os.environ, env, clear=True):
@@ -206,13 +218,22 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
         self.assertEqual(config.kline_deep_audit_schedule_time, "18:30")
         self.assertEqual(config.kline_retry_max_attempts, 4)
         self.assertEqual(config.kline_skip_candidate_failure_threshold, 5)
+        self.assertFalse(config.kline_audit_auto_skip_enabled)
+        self.assertEqual(config.kline_audit_auto_skip_max_symbols, 7)
+        self.assertEqual(config.kline_audit_auto_skip_max_ratio, 0.002)
+        self.assertEqual(config.kline_audit_auto_skip_min_coverage, 0.995)
+        self.assertEqual(config.kline_audit_auto_skip_reason_classes, "skip_eligible")
+        self.assertEqual(config.kline_audit_auto_skip_reasons, "not_in_bulk_universe")
 
         governance_field = get_field_definition("KLINE_GOVERNANCE_ENABLED")
         deep_audit_time_field = get_field_definition("KLINE_DEEP_AUDIT_SCHEDULE_TIME")
+        auto_skip_field = get_field_definition("KLINE_AUDIT_AUTO_SKIP_ENABLED")
 
         self.assertEqual(governance_field["category"], "system")
         self.assertEqual(governance_field["data_type"], "boolean")
         self.assertEqual(deep_audit_time_field["data_type"], "time")
+        self.assertEqual(auto_skip_field["category"], "system")
+        self.assertEqual(auto_skip_field["data_type"], "boolean")
 
 
 if __name__ == "__main__":

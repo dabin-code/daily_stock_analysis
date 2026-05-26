@@ -33,6 +33,8 @@ class KlineGovernanceScheduleServiceTestCase(unittest.TestCase):
         sync_service = mock.MagicMock()
         audit_service = mock.MagicMock()
         repair_service = mock.MagicMock()
+        skip_policy_service = mock.MagicMock()
+        skip_policy_service.apply_auto_skip.return_value = {"approved_count": 0}
         call_order = []
 
         target_trade_date = date(2026, 4, 17)
@@ -63,9 +65,14 @@ class KlineGovernanceScheduleServiceTestCase(unittest.TestCase):
                 "recovered_gap_count": 0,
             }
 
+        def _run_auto_skip(**kwargs):
+            call_order.append("auto_skip")
+            return {"approved_count": 0}
+
         sync_service.sync_trade_date.side_effect = _run_sync
         audit_service.audit_trade_date.side_effect = _run_audit
         repair_service.repair_gaps.side_effect = _run_repair
+        skip_policy_service.apply_auto_skip.side_effect = _run_auto_skip
         db_manager = mock.MagicMock()
         db_manager.list_kline_audit_gaps.return_value = []
 
@@ -74,13 +81,14 @@ class KlineGovernanceScheduleServiceTestCase(unittest.TestCase):
             market_data_sync_service=sync_service,
             audit_service=audit_service,
             repair_service=repair_service,
+            skip_policy_service=skip_policy_service,
             db_manager=db_manager,
         )
 
         with patch.object(service, "resolve_target_trade_date", return_value=target_trade_date):
             result = service.run_daily_governance()
 
-        self.assertEqual(call_order, ["sync", "audit", "repair", "reaudit", "repair"])
+        self.assertEqual(call_order, ["sync", "audit", "repair", "auto_skip", "reaudit", "repair"])
         sync_service.sync_trade_date.assert_called_once_with(
             trade_date=target_trade_date,
             force=False,
@@ -109,6 +117,12 @@ class KlineGovernanceScheduleServiceTestCase(unittest.TestCase):
         self.assertEqual(result["repair_result"]["repaired_gap_count"], 1)
         self.assertEqual(result["repair_result"]["candidate_skip_gap_count"], 0)
         self.assertEqual(result["repair_result"]["recovered_gap_count"], 0)
+        skip_policy_service.apply_auto_skip.assert_called_once_with(
+            market="cn",
+            source_run_id="audit-run-1",
+            trade_date=target_trade_date,
+            sync_result={"target_trade_date": target_trade_date.isoformat()},
+        )
         self.assertEqual(result["run_result"], "succeeded")
         self.assertEqual(result["pass_status"], "passed")
         self.assertEqual(result["trade_date"], target_trade_date)

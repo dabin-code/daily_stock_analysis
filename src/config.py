@@ -391,8 +391,9 @@ class Config:
     # 企业微信 Webhook
     wechat_webhook_url: Optional[str] = None
     
-    # 飞书 Webhook
+    # 飞书 Webhook / 开放平台应用主动推送
     feishu_webhook_url: Optional[str] = None
+    feishu_chat_id: Optional[str] = None
     
     # Telegram 配置（需要同时配置 Bot Token 和 Chat ID）
     telegram_bot_token: Optional[str] = None  # Bot Token（@BotFather 获取）
@@ -458,7 +459,7 @@ class Config:
     merge_email_notification: bool = False
 
     # 消息长度限制（字节）- 超长自动分批发送
-    feishu_max_bytes: int = 20000  # 飞书限制约 20KB，默认 20000 字节
+    feishu_max_bytes: int = 28000  # 飞书交互卡片单条 payload 硬上限约 30KB，预留 2KB 给卡片包装
     wechat_max_bytes: int = 4000   # 企业微信限制 4096 字节，默认 4000 字节
     discord_max_words: int = 2000  # Discord 限制 2000 字，默认 2000 字
     wechat_msg_type: str = "markdown"  # 企业微信消息类型，默认 markdown 类型
@@ -564,6 +565,12 @@ class Config:
     screening_default_mode: str = "balanced"
     screening_candidate_limit: int = 30
     screening_ai_top_k: int = 10
+    # Final-layer score gate: drop candidates whose post-rerank rule_score
+    # (a.k.a. the persisted final_score) falls below this threshold.
+    # Default 80 enforces a "high-quality only" final selection by requiring
+    # at least probe_entry stage or a comparable multi-dimension combination.
+    # Set to 0 to disable the filter entirely.
+    screening_min_final_score: float = 80.0
     # Engineering preflight thresholds kept for compatibility with the old
     # screening entry. They are not formal L0 trading-system rules.
     screening_min_list_days: int = 120
@@ -582,6 +589,12 @@ class Config:
     kline_deep_audit_schedule_time: str = "17:00"
     kline_retry_max_attempts: int = 3
     kline_skip_candidate_failure_threshold: int = 3
+    kline_audit_auto_skip_enabled: bool = True
+    kline_audit_auto_skip_max_symbols: int = 20
+    kline_audit_auto_skip_max_ratio: float = 0.005
+    kline_audit_auto_skip_min_coverage: float = 0.99
+    kline_audit_auto_skip_reason_classes: str = "skip_eligible"
+    kline_audit_auto_skip_reasons: str = "not_in_bulk_universe,empty_data"
     # bulk 哨兵：Tushare bulk 当日 universe 之外的代码直接标 skip_eligible，
     # 避免对已退市等"显然无源"的代码做无谓逐只兜底，提升整体同步速度
     kline_sync_bulk_sentinel_enabled: bool = True
@@ -932,6 +945,7 @@ class Config:
             stock_list=stock_list,
             feishu_app_id=os.getenv('FEISHU_APP_ID'),
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
+            feishu_chat_id=os.getenv('FEISHU_CHAT_ID'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
             tushare_token=os.getenv('TUSHARE_TOKEN'),
             litellm_model=litellm_model,
@@ -1043,7 +1057,7 @@ class Config:
             report_history_compare_n=int(os.getenv('REPORT_HISTORY_COMPARE_N', '0')),
             analysis_delay=float(os.getenv('ANALYSIS_DELAY', '0')),
             merge_email_notification=os.getenv('MERGE_EMAIL_NOTIFICATION', 'false').lower() == 'true',
-            feishu_max_bytes=int(os.getenv('FEISHU_MAX_BYTES', '20000')),
+            feishu_max_bytes=int(os.getenv('FEISHU_MAX_BYTES', '28000')),
             wechat_max_bytes=wechat_max_bytes,
             wechat_msg_type=wechat_msg_type_lower,
             discord_max_words=int(os.getenv('DISCORD_MAX_WORDS', '2000')),
@@ -1160,6 +1174,7 @@ class Config:
             screening_default_mode=os.getenv('SCREENING_DEFAULT_MODE', 'balanced'),
             screening_candidate_limit=int(os.getenv('SCREENING_CANDIDATE_LIMIT', '30')),
             screening_ai_top_k=int(os.getenv('SCREENING_AI_TOP_K', '10')),
+            screening_min_final_score=float(os.getenv('SCREENING_MIN_FINAL_SCORE', '80')),
             screening_min_list_days=int(os.getenv('SCREENING_MIN_LIST_DAYS', '120')),
             screening_min_volume_ratio=float(os.getenv('SCREENING_MIN_VOLUME_RATIO', '1.2')),
             screening_breakout_lookback_days=int(os.getenv('SCREENING_BREAKOUT_LOOKBACK_DAYS', '20')),
@@ -1184,6 +1199,30 @@ class Config:
             kline_skip_candidate_failure_threshold=max(
                 1,
                 int(os.getenv('KLINE_SKIP_CANDIDATE_FAILURE_THRESHOLD', '3')),
+            ),
+            kline_audit_auto_skip_enabled=parse_env_bool(
+                os.getenv('KLINE_AUDIT_AUTO_SKIP_ENABLED'),
+                default=True,
+            ),
+            kline_audit_auto_skip_max_symbols=max(
+                0,
+                int(os.getenv('KLINE_AUDIT_AUTO_SKIP_MAX_SYMBOLS', '20')),
+            ),
+            kline_audit_auto_skip_max_ratio=max(
+                0.0,
+                float(os.getenv('KLINE_AUDIT_AUTO_SKIP_MAX_RATIO', '0.005')),
+            ),
+            kline_audit_auto_skip_min_coverage=max(
+                0.0,
+                min(1.0, float(os.getenv('KLINE_AUDIT_AUTO_SKIP_MIN_COVERAGE', '0.99'))),
+            ),
+            kline_audit_auto_skip_reason_classes=os.getenv(
+                'KLINE_AUDIT_AUTO_SKIP_REASON_CLASSES',
+                'skip_eligible',
+            ),
+            kline_audit_auto_skip_reasons=os.getenv(
+                'KLINE_AUDIT_AUTO_SKIP_REASONS',
+                'not_in_bulk_universe,empty_data',
             ),
             kline_sync_bulk_sentinel_enabled=parse_env_bool(
                 os.getenv('KLINE_SYNC_BULK_SENTINEL_ENABLED'),
@@ -1707,6 +1746,7 @@ class Config:
         has_notification = bool(
             self.wechat_webhook_url
             or self.feishu_webhook_url
+            or (self.feishu_app_id and self.feishu_app_secret and self.feishu_chat_id)
             or (self.telegram_bot_token and self.telegram_chat_id)
             or (self.email_sender and self.email_password)
             or (self.pushover_user_key and self.pushover_api_token)
@@ -1722,6 +1762,13 @@ class Config:
                 severity="warning",
                 message="未配置通知渠道，将不发送推送通知",
                 field="WECHAT_WEBHOOK_URL",
+            ))
+
+        if self.feishu_stream_enabled and not (self.feishu_app_id and self.feishu_app_secret):
+            issues.append(ConfigIssue(
+                severity="warning",
+                message="FEISHU_STREAM_ENABLED=true 但未配置 FEISHU_APP_ID 或 FEISHU_APP_SECRET，飞书 Stream 模式将不可用",
+                field="FEISHU_STREAM_ENABLED",
             ))
 
         # --- Deprecated field migration hints ---
@@ -1744,6 +1791,16 @@ class Config:
                     f"SCREENING_CANDIDATE_LIMIT ({self.screening_candidate_limit})"
                 ),
                 field="SCREENING_AI_TOP_K",
+            ))
+
+        if self.screening_min_final_score < 0:
+            issues.append(ConfigIssue(
+                severity="error",
+                message=(
+                    f"SCREENING_MIN_FINAL_SCORE ({self.screening_min_final_score}) "
+                    f"不能为负值；设置为 0 表示关闭最终评分过滤。"
+                ),
+                field="SCREENING_MIN_FINAL_SCORE",
             ))
 
         # --- Vision key availability ---

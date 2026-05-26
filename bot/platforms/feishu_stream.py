@@ -51,6 +51,7 @@ except ImportError:
 from bot.models import BotMessage, BotResponse, ChatType
 from src.formatters import format_feishu_markdown, chunk_content_by_max_bytes
 from src.config import get_config
+from src.feishu_cards import build_feishu_interactive_card
 
 
 class FeishuReplyClient:
@@ -82,7 +83,8 @@ class FeishuReplyClient:
     def _send_interactive_card(self, content: str, message_id: Optional[str] = None,
                                chat_id: Optional[str] = None,
                                receive_id_type: str = "chat_id",
-                               at_user: bool = False, user_id: Optional[str] = None) -> bool:
+                               at_user: bool = False, user_id: Optional[str] = None,
+                               collapse_long_content: bool = True) -> bool:
         """
         发送交互卡片消息（支持 Markdown 渲染）
         
@@ -103,19 +105,11 @@ class FeishuReplyClient:
             if at_user and user_id:
                 final_content = f"<at user_id=\"{user_id}\"></at> {content}"
             
-            # 构建交互卡片 payload
-            card_data = {
-                "config": {"wide_screen_mode": True},
-                "elements": [
-                    {
-                        "tag": "div",
-                        "text": {
-                            "tag": "lark_md",
-                            "content": final_content
-                        }
-                    }
-                ]
-            }
+            # 构建交互卡片 payload（长内容默认折叠）
+            card_data = build_feishu_interactive_card(
+                final_content,
+                collapse_long_content=collapse_long_content,
+            )
 
             content_json = json.dumps(card_data)
 
@@ -176,8 +170,8 @@ class FeishuReplyClient:
         # 将文本转换为飞书 Markdown 格式
         formatted_text = format_feishu_markdown(text)
 
-        # 检查是否需要分段发送
-        content_bytes = len(formatted_text.encode('utf-8'))
+        # 检查最终卡片 JSON 是否需要分段发送。
+        content_bytes = self._interactive_card_bytes(formatted_text, collapse_long_content=True)
         if content_bytes > self._max_bytes:
             logger.info(
                 f"[Feishu Stream] 回复消息内容超长({content_bytes}字节)，将分批发送"
@@ -189,6 +183,7 @@ class FeishuReplyClient:
                     message_id=message_id,
                     at_user=at_user,
                     user_id=user_id,
+                    collapse_long_content=False,
                 ),
             )
 
@@ -213,8 +208,8 @@ class FeishuReplyClient:
         # 将文本转换为飞书 Markdown 格式
         formatted_text = format_feishu_markdown(text)
 
-        # 检查是否需要分段发送
-        content_bytes = len(formatted_text.encode('utf-8'))
+        # 检查最终卡片 JSON 是否需要分段发送。
+        content_bytes = self._interactive_card_bytes(formatted_text, collapse_long_content=True)
         if content_bytes > self._max_bytes:
             logger.info(
                 f"[Feishu Stream] 发送消息内容超长({content_bytes}字节)，将分批发送"
@@ -225,6 +220,7 @@ class FeishuReplyClient:
                     chunk,
                     chat_id=chat_id,
                     receive_id_type=receive_id_type,
+                    collapse_long_content=False,
                 ),
             )
         
@@ -242,7 +238,8 @@ class FeishuReplyClient:
         Returns:
             是否全部发送成功
         """
-        chunks = chunk_content_by_max_bytes(content, self._max_bytes, add_page_marker=True)
+        chunk_budget = self._find_chunk_content_budget(content)
+        chunks = chunk_content_by_max_bytes(content, chunk_budget, add_page_marker=True)
         success_count = 0
         for i, chunk in enumerate(chunks):
             if send_func(chunk):
@@ -252,6 +249,30 @@ class FeishuReplyClient:
             if i < len(chunks) - 1:
                 time.sleep(1)
         return success_count == len(chunks)
+
+    def _interactive_card_bytes(
+        self,
+        content: str,
+        *,
+        collapse_long_content: bool,
+    ) -> int:
+        card_data = build_feishu_interactive_card(
+            content,
+            collapse_long_content=collapse_long_content,
+        )
+        return len(json.dumps(card_data).encode("utf-8"))
+
+    def _find_chunk_content_budget(self, content: str) -> int:
+        budget = self._max_bytes
+        while budget > 200:
+            chunks = chunk_content_by_max_bytes(content, budget, add_page_marker=True)
+            if all(
+                self._interactive_card_bytes(chunk, collapse_long_content=False) <= self._max_bytes
+                for chunk in chunks
+            ):
+                return budget
+            budget = int(budget * 0.8)
+        return max(40, budget)
 
 
 class FeishuStreamHandler:

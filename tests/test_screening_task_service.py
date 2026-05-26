@@ -31,6 +31,27 @@ class _SuccessUniverseService:
         return pd.DataFrame([{"code": "600519", "name": "贵州茅台"}])
 
 
+@pytest.fixture(autouse=True)
+def _block_real_screening_notifications(monkeypatch):
+    """Unit tests should never send real screening notifications."""
+    notify_calls = []
+
+    def _fake_notify_run(self, run_id, force=False):
+        notify_calls.append({"run_id": run_id, "force": force})
+        return {
+            "success": True,
+            "notification_status": "sent",
+            "run_id": run_id,
+            "candidate_count": 0,
+        }
+
+    monkeypatch.setattr(
+        "src.services.screening_notification_service.ScreeningNotificationService.notify_run",
+        _fake_notify_run,
+    )
+    return notify_calls
+
+
 def test_screening_task_service_executes_full_pipeline_and_limits_ai_top_k():
     db = MagicMock()
     db.create_screening_run.return_value = "run-001"
@@ -127,6 +148,11 @@ def test_screening_task_service_executes_full_pipeline_and_limits_ai_top_k():
         "skipped": 0,
         "errors": [],
     }
+    notification_service = MagicMock()
+    notification_service.notify_run.return_value = {
+        "success": True,
+        "notification_status": "sent",
+    }
 
     service = ScreeningTaskService(
         db_manager=db,
@@ -135,6 +161,7 @@ def test_screening_task_service_executes_full_pipeline_and_limits_ai_top_k():
         screener_service=screener_service,
         candidate_analysis_service=candidate_analysis_service,
         market_data_sync_service=market_data_sync_service,
+        notification_service=notification_service,
     )
     service.config.screening_market_guard_enabled = False
     pipeline_candidates = [
@@ -214,6 +241,55 @@ def test_screening_task_service_executes_full_pipeline_and_limits_ai_top_k():
     assert saved_candidates[1]["selected_for_ai"] is False
     candidate_analysis_service.analyze_top_k.assert_called_once()
     market_data_sync_service.sync_trade_date.assert_called_once()
+    notification_service.notify_run.assert_called_once_with("run-001", force=True)
+
+
+def test_screening_task_service_does_not_auto_notify_failed_run():
+    notification_service = MagicMock()
+    service = ScreeningTaskService.__new__(ScreeningTaskService)
+    service._notification_service = notification_service
+
+    service._notify_completed_run(run_id="run-failed", status="failed")
+
+    notification_service.notify_run.assert_not_called()
+
+
+def test_screening_task_service_auto_notifies_ai_degraded_run():
+    notification_service = MagicMock()
+    service = ScreeningTaskService.__new__(ScreeningTaskService)
+    service._notification_service = notification_service
+
+    service._notify_completed_run(
+        run_id="run-ai-degraded",
+        status="completed_with_ai_degraded",
+    )
+
+    notification_service.notify_run.assert_called_once_with("run-ai-degraded", force=True)
+
+
+def test_screening_task_service_does_not_auto_notify_historical_random_sample():
+    notification_service = MagicMock()
+    service = ScreeningTaskService.__new__(ScreeningTaskService)
+    service._notification_service = notification_service
+
+    service._notify_completed_run(
+        run_id="run-historical",
+        status="completed",
+        trigger_type="historical_random_sample",
+    )
+
+    notification_service.notify_run.assert_not_called()
+
+
+def test_screening_task_service_auto_notify_failure_does_not_raise():
+    notification_service = MagicMock()
+    notification_service.notify_run.side_effect = RuntimeError("notify failed")
+    service = ScreeningTaskService.__new__(ScreeningTaskService)
+    service._notification_service = notification_service
+
+    service._notify_completed_run(run_id="run-001", status="completed")
+
+    notification_service.notify_run.assert_called_once_with("run-001", force=True)
 
 
 def test_screening_task_service_uses_full_market_sync_for_manual_today_run():
@@ -3472,7 +3548,7 @@ def test_execute_run_keeps_candidate_limit_under_defensive_regime():
             code=f"60051{i}",
             name=f"候选{i}",
             rank=i + 1,
-            final_score=90.0 - i,
+            rule_score=90.0 - i,
             matched_strategies=["volume_breakout"],
             strategy_scores={"volume_breakout": 90.0 - i},
             rule_hits=["trend_aligned"],

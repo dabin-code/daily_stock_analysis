@@ -1,10 +1,10 @@
 """RED phase: Tests for schedule -> notify orchestration.
 
 These tests verify that:
-- scheduled run calls notify_run after completed
-- manual run does NOT auto-notify
-- failed run does NOT trigger notify
-- non-trading day skips without notify
+- scheduled run delegates to ScreeningTaskService
+- notification is owned by ScreeningTaskService, not the schedule wrapper
+- failed run does not trigger wrapper-level notify
+- non-trading day skips without running or notifying
 """
 import unittest
 from types import SimpleNamespace
@@ -25,48 +25,40 @@ class ScheduleNotifyOrchestrationTestCase(unittest.TestCase):
         )
 
     @patch("src.services.screening_schedule_service.get_open_markets_today", return_value={"cn"})
-    def test_scheduled_run_triggers_notify_on_completed(self, _mock_markets) -> None:
+    def test_scheduled_run_delegates_notification_to_task_service_on_completed(self, _mock_markets) -> None:
         task_service = MagicMock()
         task_service.execute_run.return_value = {
             "run_id": "run-sched-001",
             "status": "completed",
             "candidate_count": 3,
         }
-        notification_service = MagicMock()
-        notification_service.notify_run.return_value = {"success": True, "notification_status": "sent"}
 
         service = ScreeningScheduleService(
             config=self._build_config(),
             screening_task_service=task_service,
-            notification_service=notification_service,
         )
 
         result = service.run_once(force_run=False, market="cn")
 
         self.assertEqual(result["status"], "completed")
-        notification_service.notify_run.assert_called_once_with("run-sched-001")
 
     @patch("src.services.screening_schedule_service.get_open_markets_today", return_value={"cn"})
-    def test_scheduled_run_triggers_notify_on_completed_with_ai_degraded(self, _mock_markets) -> None:
+    def test_scheduled_run_delegates_notification_to_task_service_on_ai_degraded(self, _mock_markets) -> None:
         task_service = MagicMock()
         task_service.execute_run.return_value = {
             "run_id": "run-sched-002",
             "status": "completed_with_ai_degraded",
             "candidate_count": 2,
         }
-        notification_service = MagicMock()
-        notification_service.notify_run.return_value = {"success": True, "notification_status": "sent"}
 
         service = ScreeningScheduleService(
             config=self._build_config(),
             screening_task_service=task_service,
-            notification_service=notification_service,
         )
 
         result = service.run_once(force_run=False, market="cn")
 
         self.assertIn(result["status"], {"completed", "completed_with_ai_degraded"})
-        notification_service.notify_run.assert_called_once_with("run-sched-002")
 
     @patch("src.services.screening_schedule_service.get_open_markets_today", return_value={"cn"})
     def test_scheduled_run_does_not_notify_on_failed(self, _mock_markets) -> None:
@@ -76,59 +68,49 @@ class ScheduleNotifyOrchestrationTestCase(unittest.TestCase):
             "status": "failed",
             "error_summary": "some error",
         }
-        notification_service = MagicMock()
 
         service = ScreeningScheduleService(
             config=self._build_config(),
             screening_task_service=task_service,
-            notification_service=notification_service,
         )
 
         result = service.run_once(force_run=False, market="cn")
 
         self.assertEqual(result["status"], "failed")
-        notification_service.notify_run.assert_not_called()
 
     @patch("src.services.screening_schedule_service.get_open_markets_today", return_value=set())
     def test_non_trading_day_skips_without_notify(self, _mock_markets) -> None:
         task_service = MagicMock()
-        notification_service = MagicMock()
 
         service = ScreeningScheduleService(
             config=self._build_config(),
             screening_task_service=task_service,
-            notification_service=notification_service,
         )
 
         result = service.run_once(force_run=False, market="cn")
 
         self.assertEqual(result["status"], "skipped")
         task_service.execute_run.assert_not_called()
-        notification_service.notify_run.assert_not_called()
 
     @patch("src.services.screening_schedule_service.get_open_markets_today", return_value={"cn"})
-    def test_notify_failure_does_not_break_run_result(self, _mock_markets) -> None:
-        """Notify failure should be logged, not propagated."""
+    def test_wrapper_level_notify_failure_is_not_applicable(self, _mock_markets) -> None:
+        """Schedule wrapper does not own notification delivery."""
         task_service = MagicMock()
         task_service.execute_run.return_value = {
             "run_id": "run-sched-004",
             "status": "completed",
             "candidate_count": 1,
         }
-        notification_service = MagicMock()
-        notification_service.notify_run.side_effect = Exception("notify crashed")
 
         service = ScreeningScheduleService(
             config=self._build_config(),
             screening_task_service=task_service,
-            notification_service=notification_service,
         )
 
         result = service.run_once(force_run=False, market="cn")
 
         # run result should still be returned successfully
         self.assertEqual(result["status"], "completed")
-        notification_service.notify_run.assert_called_once()
 
     @patch("src.services.screening_schedule_service.get_open_markets_today", return_value={"cn"})
     def test_execute_run_passes_scheduled_trigger_type(self, _mock_markets) -> None:
@@ -137,13 +119,10 @@ class ScheduleNotifyOrchestrationTestCase(unittest.TestCase):
             "run_id": "run-sched-005",
             "status": "completed",
         }
-        notification_service = MagicMock()
-        notification_service.notify_run.return_value = {"success": True}
 
         service = ScreeningScheduleService(
             config=self._build_config(),
             screening_task_service=task_service,
-            notification_service=notification_service,
         )
         service.run_once(force_run=False, market="cn")
 

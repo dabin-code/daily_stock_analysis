@@ -77,6 +77,25 @@ def test_kline_audit_tables_store_gap_and_trade_date_status(tmp_path):
         assert stored_event.source_run_id == run.run_id
 
 
+def test_kline_audit_run_records_completed_at_for_degraded_terminal_result(tmp_path):
+    db = _build_db(tmp_path)
+
+    run = db.create_kline_audit_run(
+        run_id="audit-run-degraded",
+        market="cn",
+        trade_date=date(2026, 4, 16),
+        run_type="daily",
+        trigger_type="manual",
+        run_result="degraded",
+        pass_status="not_passed",
+        rule_version="2026-04-16",
+        window_start=date(2026, 4, 1),
+        window_end=date(2026, 4, 16),
+    )
+
+    assert run.completed_at is not None
+
+
 def test_skip_registry_supports_symbol_and_date_range_scope(tmp_path):
     db = _build_db(tmp_path)
 

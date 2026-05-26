@@ -39,6 +39,16 @@ _RULE_HIT_ZH: Dict[str, str] = {
 # Number of top candidates that receive the full audit block; the rest get a summary line.
 _AUDIT_TOP_N_DEFAULT = 5
 
+# 自适应推送内容的目标字节上限（UTF-8）。飞书交互卡片单条消息硬上限约 30KB，预留 2KB
+# 给卡片包装（header / collapsible_panel / lark_md 元素的 JSON 结构），目标内容控制在 28KB
+# 以内即可保证单条消息装下，不再触发 _send_feishu_chunked 分页。
+# 注意：实际飞书 sender 还会再按 FEISHU_MAX_BYTES 做一次大小校验，那里的默认值已同步放宽。
+_PUSH_MAX_CONTENT_BYTES = 28000
+
+# 自适应降级时尝试的 audit_top_n 序列：优先保留所有候选的完整审计，超限再逐档削减完整块数。
+# 0 表示所有候选都用一行紧凑摘要（最后兜底，仍能展示在飞书折叠面板里）。
+_PUSH_AUDIT_TOP_N_LADDER: tuple[Optional[int], ...] = (None, 15, 10, 7, 5, 3, 1, 0)
+
 # ---------------------------------------------------------------------------
 # Five-layer decision label mappings (Phase 3B-2)
 # ---------------------------------------------------------------------------
@@ -66,6 +76,31 @@ _SETUP_LABELS: Dict[str, str] = {
     "trend_pullback": "趋势回踩",
     "gap_breakout": "缺口突破",
     "limitup_structure": "涨停结构突破",
+    "none": "无",
+}
+
+_POOL_LABELS: Dict[str, str] = {
+    "leader_pool": "龙头池",
+    "focus_list": "关注池",
+    "watchlist": "观察池",
+}
+
+_THEME_POSITION_LABELS: Dict[str, str] = {
+    "main_theme": "主线题材",
+    "secondary_theme": "次主线题材",
+    "follower_theme": "跟随题材",
+    "fading_theme": "退潮题材",
+    "non_theme": "非题材",
+}
+
+_SIGNAL_LABELS: Dict[str, str] = {
+    "bottom_divergence_breakout": "底背离双突破",
+    "low123_breakout": "低位 123 结构",
+    "breakaway_gap_ma100": "缺口突破 MA100",
+    "limitup_structure": "涨停结构",
+    "structure_low_entry": "结构低吸",
+    "momentum_breakout": "动量突破",
+    "momentum_chase": "动量追涨",
     "none": "无",
 }
 
@@ -105,10 +140,11 @@ def _get_rule_hits(item: Dict[str, Any]) -> List[str]:
     rule_hits = item.get("rule_hits")
     if rule_hits is None:
         raw = item.get("rule_hits_json") or "[]"
-        rule_hits = json.loads(raw) if isinstance(raw, str) else raw
+        rule_hits = _safe_json(raw, []) if isinstance(raw, str) else raw
     elif isinstance(rule_hits, str):
-        rule_hits = json.loads(rule_hits or "[]")
-    return list(rule_hits) if rule_hits else []
+        parsed = _safe_json(rule_hits, None)
+        rule_hits = parsed if isinstance(parsed, list) else [rule_hits]
+    return list(rule_hits) if isinstance(rule_hits, (list, tuple, set)) else []
 
 
 def _get_factor_snapshot(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -116,10 +152,87 @@ def _get_factor_snapshot(item: Dict[str, Any]) -> Dict[str, Any]:
     factor = item.get("factor_snapshot")
     if factor is None:
         raw = item.get("factor_snapshot_json") or "{}"
-        factor = json.loads(raw) if isinstance(raw, str) else raw
+        factor = _safe_json(raw, {}) if isinstance(raw, str) else raw
     elif isinstance(factor, str):
-        factor = json.loads(factor or "{}")
-    return dict(factor) if factor else {}
+        factor = _safe_json(factor, {})
+    return dict(factor) if isinstance(factor, dict) else {}
+
+
+def _safe_json(raw: Any, default: Any) -> Any:
+    if not isinstance(raw, str):
+        return default
+    try:
+        return json.loads(raw or "")
+    except (json.JSONDecodeError, TypeError, ValueError):
+        logger.warning("筛选通知字段 JSON 解析失败，已降级为空值")
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_optional_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _ensure_list(value: Any) -> List[Any]:
+    """Normalize a JSON string / tuple / scalar into a list for display."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        if stripped.startswith("["):
+            try:
+                parsed = json.loads(stripped)
+                return list(parsed) if isinstance(parsed, list) else [parsed]
+            except json.JSONDecodeError:
+                return [value]
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
+
+
+def _format_value(value: Any) -> str:
+    """Format a scalar/list/dict value for compact Markdown display."""
+    if value is None or value == "":
+        return "N/A"
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if isinstance(value, float):
+        return f"{value:.2f}".rstrip("0").rstrip(".")
+    if isinstance(value, (list, tuple, set)):
+        return "、".join(_format_value(v) for v in value if v not in (None, ""))
+    if isinstance(value, dict):
+        return "；".join(
+            f"{k}: {_format_value(v)}"
+            for k, v in value.items()
+            if v not in (None, "", [], {})
+        ) or "N/A"
+    return str(value)
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value not in (None, "", [], {}):
+            return value
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -206,14 +319,20 @@ class ScreeningNotificationService:
             return {"skipped": True, "reason": reason, "run_id": run_id}
 
         # Build notification content
-        candidates = self.screening_task_service.list_candidates(run_id=run_id, limit=10)
-        content = self.build_run_notification(run=run, candidates=candidates)
+        candidates = self.screening_task_service.list_candidates(run_id=run_id, limit=100)
+        # 文件存档保留完整审计块，便于追溯每只候选的规则命中、五层决策、AI 复核等信息。
+        archive_content = self.build_run_notification(run=run, candidates=candidates)
+        # 推送给飞书 / 邮件 / 企业微信等渠道的内容：优先保留所有候选的完整审计块，让用户点开
+        # 飞书折叠面板就能看到每只候选的[评分汇总]/[规则分拆解]/[原始指标]/[审计证据] 等详情。
+        # 当完整审计体积超过单条飞书消息上限（~28KB）时，按 _PUSH_AUDIT_TOP_N_LADDER 自适应
+        # 降级——保留 Top N 完整审计、其余降为单行摘要——直到内容能塞进一条消息为止。
+        push_content = self._build_adaptive_push_content(run=run, candidates=candidates)
         stock_codes = [str(item.get("code")) for item in candidates if item.get("code")]
 
         # Attempt delivery
         try:
-            self.notifier.save_report_to_file(content, filename=f"screening_{run_id}.md")
-            success = self.notifier.send(content, email_stock_codes=stock_codes or None)
+            self.notifier.save_report_to_file(archive_content, filename=f"screening_{run_id}.md")
+            success = self.notifier.send(push_content, email_stock_codes=stock_codes or None)
         except Exception as exc:
             self._mark_notification_failed(run_id, str(exc))
             return {
@@ -239,6 +358,52 @@ class ScreeningNotificationService:
                 "run_id": run_id,
                 "error": "delivery returned false",
             }
+
+    # ------------------------------------------------------------------
+    # Adaptive push content helpers
+    # ------------------------------------------------------------------
+
+    def _build_adaptive_push_content(
+        self,
+        run: Dict[str, Any],
+        candidates: List[Dict[str, Any]],
+        max_bytes: int = _PUSH_MAX_CONTENT_BYTES,
+    ) -> str:
+        """构建能塞进单条飞书消息的推送内容，尽可能保留完整审计详情。
+
+        遍历 ``_PUSH_AUDIT_TOP_N_LADDER`` 中的候选值：
+        - 先尝试 ``None``（所有候选都是完整审计块），让用户在飞书折叠面板里看到全部详情。
+        - 当字节数超过 ``max_bytes`` 时，依次降级为 Top 15 / 10 / 7 / 5 / 3 / 1 完整审计，
+          其余候选退化为单行摘要。
+        - 最坏情况降到 0（全部紧凑摘要）也仍然返回一个能装下的内容。
+
+        本方法只控制 Markdown 原文体积；最终飞书卡片 payload 还会被 ``FeishuSender``
+        按 ``FEISHU_MAX_BYTES`` 再校验一次（已同步放宽默认值），双层兜底避免分页。
+        """
+        last_content = ""
+        for top_n in _PUSH_AUDIT_TOP_N_LADDER:
+            content = self.build_run_notification(
+                run=run,
+                candidates=candidates,
+                audit_top_n=top_n,
+            )
+            last_content = content
+            if len(content.encode("utf-8")) <= max_bytes:
+                if top_n is not None:
+                    logger.info(
+                        "screening notification push content降级 audit_top_n=%s "
+                        "以适配单条飞书消息上限 (%d bytes)",
+                        top_n,
+                        max_bytes,
+                    )
+                return content
+        # 全部级别都超限（极端情况：候选数巨多且摘要也很长）；返回最后一次（最紧凑）的结果。
+        logger.warning(
+            "screening notification push content even at audit_top_n=0 still exceeds %d bytes; "
+            "Feishu sender may fall back to chunked send",
+            max_bytes,
+        )
+        return last_content
 
     # ------------------------------------------------------------------
     # Status persistence helpers
@@ -276,20 +441,20 @@ class ScreeningNotificationService:
         rule_hits = _get_rule_hits(item)
         factor = _get_factor_snapshot(item)
 
-        rule_score = float(item.get("rule_score") or 0.0)
+        rule_score = _safe_float(item.get("rule_score"), 0.0)
         advice = item.get("ai_operation_advice") or ""
         ai_bonus = _AI_BONUS_MAP.get(advice, 0.0)
-        news_count = int(item.get("news_count") or 0)
+        news_count = _safe_int(item.get("news_count"), 0)
         news_bonus = min(news_count, 3)
         final_score = round(rule_score + ai_bonus + news_bonus, 2)
 
         # Extract raw factor values used in score formula
-        close = float(factor.get("close") or 0.0)
-        ma5 = float(factor.get("ma5") or 0.0)
-        ma10 = float(factor.get("ma10") or 0.0)
-        ma20 = float(factor.get("ma20") or 0.0)
-        volume_ratio = float(factor.get("volume_ratio") or 0.0)
-        breakout_ratio = float(factor.get("breakout_ratio") or 0.0)
+        close = _safe_float(factor.get("close"), 0.0)
+        ma5 = _safe_float(factor.get("ma5"), 0.0)
+        ma10 = _safe_float(factor.get("ma10"), 0.0)
+        ma20 = _safe_float(factor.get("ma20"), 0.0)
+        volume_ratio = _safe_float(factor.get("volume_ratio"), 0.0)
+        breakout_ratio = _safe_float(factor.get("breakout_ratio"), 0.0)
 
         rule_breakdown: List[Dict[str, Any]] = []
 
@@ -370,6 +535,225 @@ class ScreeningNotificationService:
             "is_st": factor.get("is_st"),
         }
 
+    @staticmethod
+    def _format_bullet_list(title: str, values: List[Any]) -> List[str]:
+        if not values:
+            return []
+        return [f"- {title}: " + "；".join(_format_value(v) for v in values)]
+
+    def _format_frontend_like_detail_sections(
+        self,
+        item: Dict[str, Any],
+        factor: Dict[str, Any],
+    ) -> List[str]:
+        """Render candidate details using the same field groups as the Web drawer."""
+        lines: List[str] = []
+
+        market_regime = item.get("market_regime")
+        risk_level = item.get("risk_level")
+        market_message = _first_present(
+            item.get("market_message"),
+            factor.get("market_message"),
+        )
+        if market_regime or risk_level or market_message:
+            lines.append("**[L1 大盘环境]**")
+            lines.append(
+                "- 市场状态: "
+                f"{_REGIME_LABELS.get(market_regime or '', market_regime or 'N/A')} | "
+                f"风险: {_format_value(risk_level)}"
+            )
+            if market_message:
+                lines.append(f"- 环境说明: {_format_value(market_message)}")
+            lines.append("")
+
+        primary_theme = _first_present(
+            item.get("theme_tag"),
+            factor.get("primary_theme"),
+            factor.get("theme"),
+        )
+        sector = _first_present(factor.get("sector"), factor.get("board_name"))
+        industry = _first_present(factor.get("industry"), factor.get("sw_industry"))
+        theme_position = item.get("theme_position")
+        l2_fields_present = any(
+            value not in (None, "", [], {})
+            for value in (
+                primary_theme,
+                sector,
+                industry,
+                item.get("theme_score"),
+                item.get("theme_duration"),
+                factor.get("theme_heat_score"),
+                factor.get("leader_score"),
+                factor.get("extreme_strength_score"),
+                factor.get("theme_pool_score"),
+                factor.get("leadership_score"),
+                factor.get("entry_signal_score"),
+                factor.get("timing_penalty"),
+                theme_position,
+            )
+        )
+        if l2_fields_present:
+            lines.append("**[L2 题材/板块]**")
+            lines.append(
+                "- 题材/板块: "
+                f"{_format_value(primary_theme)} | "
+                f"板块: {_format_value(sector)} | "
+                f"行业: {_format_value(industry)}"
+            )
+            lines.append(
+                "- 题材地位: "
+                f"{_THEME_POSITION_LABELS.get(theme_position or '', theme_position or 'N/A')}"
+                f"{f' ({theme_position})' if theme_position else ''} | "
+                f"热度: {_format_value(_first_present(item.get('theme_score'), factor.get('theme_heat_score')))} | "
+                f"持续: {_format_value(item.get('theme_duration'))}"
+            )
+            leader_stocks = _ensure_list(item.get("leader_stocks") or factor.get("leader_stocks"))
+            if leader_stocks:
+                lines.append(f"- 龙头/前排: {_format_value(leader_stocks)}")
+            layered = {
+                "主题池": factor.get("theme_pool_score"),
+                "龙头": factor.get("leadership_score"),
+                "入场信号": factor.get("entry_signal_score"),
+                "时机惩罚": factor.get("timing_penalty"),
+                "总分": factor.get("extreme_strength_score"),
+                "去重净分": factor.get("extreme_strength_score_deduplicated"),
+                "重复加权": factor.get("leader_double_count"),
+            }
+            layered_text = " | ".join(
+                f"{label} {_format_value(value)}"
+                for label, value in layered.items()
+                if value not in (None, "")
+            )
+            if layered_text:
+                lines.append(f"- 分层评分: {layered_text}")
+            catalyst = factor.get("theme_catalyst_summary")
+            if catalyst:
+                lines.append(f"- 催化摘要: {_format_value(catalyst)}")
+            lines.append("")
+
+        candidate_pool = item.get("candidate_pool_level")
+        if candidate_pool:
+            lines.append("**[L3 候选池]**")
+            lines.append(
+                f"- 候选池级别: {_POOL_LABELS.get(candidate_pool, candidate_pool)}"
+            )
+            lines.append("")
+
+        setup = item.get("setup_type")
+        setup_reasons = _ensure_list(item.get("setup_hit_reasons"))
+        timing_reasons = _ensure_list(factor.get("timing_reasons"))
+        phase_explanations = _ensure_list(factor.get("phase_explanations"))
+        stage_label = factor.get("stage_label")
+        primary_signal = factor.get("primary_signal")
+        signal_kind = factor.get("signal_kind")
+        if setup or setup_reasons or timing_reasons or phase_explanations or primary_signal or stage_label:
+            lines.append("**[L4 入场信号]**")
+            lines.append(
+                "- 买点: "
+                f"{_SETUP_LABELS.get(setup or '', setup or 'N/A')} | "
+                f"阶段: {_format_value(stage_label)} | "
+                f"主信号: {_SIGNAL_LABELS.get(primary_signal or '', primary_signal or 'N/A')} | "
+                f"信号类型: {_SIGNAL_LABELS.get(signal_kind or '', signal_kind or 'N/A')}"
+            )
+            lines.extend(self._format_bullet_list("命中原因", setup_reasons))
+            lines.extend(self._format_bullet_list("时机说明", timing_reasons))
+            if phase_explanations:
+                lines.append("- 阶段命中明细:")
+                for phase in phase_explanations:
+                    if isinstance(phase, dict):
+                        marker = "命中" if phase.get("hit") else "未命中"
+                        label = phase.get("label") or phase.get("phase_key") or "阶段"
+                        summary = phase.get("summary") or ""
+                        lines.append(f"  - {label}: {marker}，{summary}")
+                    else:
+                        lines.append(f"  - {_format_value(phase)}")
+            lines.append("")
+
+        trade_stage = item.get("trade_stage")
+        trade_plan = item.get("trade_plan") if isinstance(item.get("trade_plan"), dict) else {}
+        ai_review = item.get("ai_review") if isinstance(item.get("ai_review"), dict) else {}
+        execution_plan = {
+            "initial_position": _first_present(
+                trade_plan.get("initial_position"),
+                item.get("initial_position"),
+                ai_review.get("initial_position"),
+            ),
+            "stop_loss_rule": _first_present(
+                trade_plan.get("stop_loss_rule"),
+                item.get("stop_loss_rule"),
+                ai_review.get("stop_loss_rule"),
+            ),
+            "take_profit_plan": _first_present(
+                trade_plan.get("take_profit_plan"),
+                item.get("take_profit_plan"),
+                ai_review.get("take_profit_plan"),
+            ),
+            "invalidation_rule": _first_present(
+                trade_plan.get("invalidation_rule"),
+                item.get("invalidation_rule"),
+                ai_review.get("invalidation_rule"),
+            ),
+            "holding_expectation": trade_plan.get("holding_expectation"),
+            "execution_note": trade_plan.get("execution_note"),
+            "add_rule": trade_plan.get("add_rule"),
+        }
+        risk_params = factor.get("risk_params") if isinstance(factor.get("risk_params"), dict) else {}
+        if trade_stage or any(execution_plan.values()) or risk_params:
+            lines.append("**[L5 交易计划]**")
+            lines.append(
+                f"- 交易阶段: {_STAGE_LABELS.get(trade_stage or '', trade_stage or 'N/A')}"
+            )
+            if any(execution_plan.get(k) for k in ("initial_position", "stop_loss_rule", "take_profit_plan")):
+                lines.append(
+                    "- 买卖点: "
+                    f"仓位 {_format_value(execution_plan.get('initial_position'))} | "
+                    f"止损 {_format_value(execution_plan.get('stop_loss_rule'))} | "
+                    f"止盈 {_format_value(execution_plan.get('take_profit_plan'))}"
+                )
+                if execution_plan.get("add_rule"):
+                    lines.append(f"- 加仓规则: {_format_value(execution_plan.get('add_rule'))}")
+                if execution_plan.get("invalidation_rule"):
+                    lines.append(f"- 失效规则: {_format_value(execution_plan.get('invalidation_rule'))}")
+                if execution_plan.get("holding_expectation") or execution_plan.get("execution_note"):
+                    lines.append(
+                        "- 执行备注: "
+                        f"持仓 {_format_value(execution_plan.get('holding_expectation'))} | "
+                        f"{_format_value(execution_plan.get('execution_note'))}"
+                    )
+            if risk_params:
+                lines.append(
+                    "- 风险参数: "
+                    f"止损价 {_format_value(risk_params.get('stop_loss'))} | "
+                    f"依据 {_format_value(risk_params.get('stop_loss_basis'))} | "
+                    f"仓位 {_format_value(risk_params.get('position_size'))} | "
+                    f"止盈比例 {_format_value(risk_params.get('take_profit_ratio'))}"
+                )
+            lines.append("")
+
+        ai_reasoning = _first_present(item.get("ai_reasoning"), ai_review.get("ai_reasoning"))
+        ai_confidence = _first_present(item.get("ai_confidence"), ai_review.get("ai_confidence"))
+        ai_trade_stage = _first_present(item.get("ai_trade_stage"), ai_review.get("ai_trade_stage"))
+        if ai_reasoning or ai_confidence is not None or ai_trade_stage:
+            lines.append("**[AI 复核]**")
+            lines.append(
+                "- AI阶段/信心: "
+                f"{_STAGE_LABELS.get(ai_trade_stage or '', ai_trade_stage or 'N/A')} | "
+                f"{_format_value(ai_confidence)}"
+            )
+            if ai_reasoning:
+                lines.append(f"- AI理由: {_format_value(ai_reasoning)}")
+            if item.get("ai_operation_advice"):
+                lines.append(f"- 操作建议: {_format_value(item.get('ai_operation_advice'))}")
+            lines.append("")
+
+        matched = _ensure_list(item.get("matched_strategies"))
+        if matched:
+            lines.append("**[匹配策略]**")
+            lines.append(f"- {_format_value(matched)}")
+            lines.append("")
+
+        return lines
+
     def _format_candidate_audit_block(self, item: Dict[str, Any]) -> List[str]:
         """Format a single candidate as a full audit block (used for Top N).
 
@@ -388,10 +772,13 @@ class ScreeningNotificationService:
 
         # Use item's authoritative final_score when available; fall back to computed value.
         final_score_display = (
-            float(item["final_score"]) if item.get("final_score") is not None
+            _safe_optional_float(item.get("final_score"))
+            if item.get("final_score") is not None
             else breakdown["final_score"]
         )
-        rule_score_display = float(item.get("rule_score") or breakdown["rule_score"])
+        if final_score_display is None:
+            final_score_display = breakdown["final_score"]
+        rule_score_display = _safe_float(item.get("rule_score"), breakdown["rule_score"])
 
         lines: List[str] = [f"### {final_rank}. {name} ({code})", ""]
 
@@ -403,42 +790,11 @@ class ScreeningNotificationService:
         )
         lines.append("")
 
-        # [五层决策] — shown when any five-layer field is present
-        trade_stage = item.get("trade_stage")
-        has_five_layer = trade_stage is not None or item.get("setup_type") is not None
+        has_five_layer = item.get("trade_stage") is not None or item.get("setup_type") is not None
         if has_five_layer:
             lines.append("**[五层决策]**")
-            stage_label = _STAGE_LABELS.get(trade_stage or "", trade_stage or "N/A")
-            lines.append(f"- 交易阶段: **{stage_label}**")
-            setup = item.get("setup_type") or ""
-            setup_label = _SETUP_LABELS.get(setup, setup or "N/A")
-            lines.append(f"- 买点类型: {setup_label}")
-            lines.append(
-                f"- 成熟度: {item.get('entry_maturity', 'N/A')} | "
-                f"风险: {item.get('risk_level', 'N/A')} | "
-                f"新鲜度: {_fmt_percent(item.get('setup_freshness'))}"
-            )
-            lines.append(
-                f"- 题材: {item.get('theme_tag', 'N/A')} | "
-                f"题材地位: {item.get('theme_position', 'N/A')} | "
-                f"候选池: {item.get('candidate_pool_level', 'N/A')}"
-            )
-
-            # Trade plan details for actionable stages
-            trade_plan = item.get("trade_plan")
-            if trade_plan and isinstance(trade_plan, dict):
-                lines.append(
-                    f"- 止损: {trade_plan.get('stop_loss_rule', 'N/A')}"
-                )
-                lines.append(
-                    f"- 仓位: {trade_plan.get('initial_position', 'N/A')} | "
-                    f"持仓期: {trade_plan.get('holding_expectation', 'N/A')}"
-                )
-                if trade_plan.get("execution_note"):
-                    lines.append(f"- 执行备注: {trade_plan['execution_note']}")
-                if trade_plan.get("add_rule"):
-                    lines.append(f"- 加仓: {trade_plan['add_rule']}")
             lines.append("")
+        lines.extend(self._format_frontend_like_detail_sections(item, _get_factor_snapshot(item)))
 
         # [评分汇总]
         lines.append("**[评分汇总]**")
@@ -468,17 +824,23 @@ class ScreeningNotificationService:
         ma5 = snapshot.get("ma5")
         ma10 = snapshot.get("ma10")
         ma20 = snapshot.get("ma20")
-        close_str = f"{float(close):.2f}" if close is not None else "N/A"
-        ma5_str = f"{float(ma5):.2f}" if ma5 is not None else "N/A"
-        ma10_str = f"{float(ma10):.2f}" if ma10 is not None else "N/A"
-        ma20_str = f"{float(ma20):.2f}" if ma20 is not None else "N/A"
+        close_val = _safe_optional_float(close)
+        ma5_val = _safe_optional_float(ma5)
+        ma10_val = _safe_optional_float(ma10)
+        ma20_val = _safe_optional_float(ma20)
+        close_str = f"{close_val:.2f}" if close_val is not None else "N/A"
+        ma5_str = f"{ma5_val:.2f}" if ma5_val is not None else "N/A"
+        ma10_str = f"{ma10_val:.2f}" if ma10_val is not None else "N/A"
+        ma20_str = f"{ma20_val:.2f}" if ma20_val is not None else "N/A"
         lines.append(
             f"- close: {close_str} | ma5/ma10/ma20: {ma5_str} / {ma10_str} / {ma20_str}"
         )
         vr = snapshot.get("volume_ratio")
         br = snapshot.get("breakout_ratio")
-        vr_str = f"{float(vr):.2f}" if vr is not None else "N/A"
-        br_str = f"{float(br):.4f}" if br is not None else "N/A"
+        vr_val = _safe_optional_float(vr)
+        br_val = _safe_optional_float(br)
+        vr_str = f"{vr_val:.2f}" if vr_val is not None else "N/A"
+        br_str = f"{br_val:.4f}" if br_val is not None else "N/A"
         lines.append(f"- volume_ratio: {vr_str} | breakout_ratio: {br_str}")
         lines.append(
             f"- avg_amount: {snapshot['avg_amount_readable']} | "
@@ -505,7 +867,7 @@ class ScreeningNotificationService:
             lines.append("")
 
         # [新闻增强] — shown when news_count > 0 or news_summary is present
-        news_count = int(item.get("news_count") or 0)
+        news_count = _safe_int(item.get("news_count"), 0)
         has_news = news_count > 0 or bool(item.get("news_summary"))
         if has_news:
             lines.append("**[新闻增强]**")
@@ -540,14 +902,15 @@ class ScreeningNotificationService:
         self,
         run: Dict[str, Any],
         candidates: List[Dict[str, Any]],
-        audit_top_n: int = _AUDIT_TOP_N_DEFAULT,
+        audit_top_n: Optional[int] = None,
     ) -> str:
         """Build the full Markdown notification content for a screening run.
 
-        Top ``audit_top_n`` candidates are rendered as full audit blocks that include
-        score breakdown, factor snapshot, AI/news sections, and raw indicator values.
-        Remaining candidates are rendered as compact one-line summaries.
+        By default every candidate passed in is rendered as a full detail block so
+        notifications stay close to the Web candidate drawer. Set ``audit_top_n``
+        to keep the older compact-summary behavior for candidates after N.
         """
+        candidates = list(candidates or [])
         trade_date = run.get("trade_date") or datetime.now().strftime("%Y-%m-%d")
         mode = run.get("mode") or "balanced"
         status = run.get("status") or "completed"
@@ -601,7 +964,7 @@ class ScreeningNotificationService:
         lines.extend(["## Top 推荐", ""])
 
         for idx, item in enumerate(candidates, 1):
-            if idx <= audit_top_n:
+            if audit_top_n is None or idx <= audit_top_n:
                 lines.extend(self._format_candidate_audit_block(item))
             else:
                 lines.extend(self._format_candidate_summary_block(item))

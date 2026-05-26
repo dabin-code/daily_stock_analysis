@@ -615,13 +615,17 @@ class TestBuildRunNotificationAudit(unittest.TestCase):
         self.assertIn("[评分汇总]", content)
         self.assertIn("[规则分拆解]", content)
 
-    def test_audit_top_n_default_is_five(self):
-        """build_run_notification() should default to audit_top_n=5."""
+    def test_audit_top_n_default_renders_all_candidates(self):
+        """build_run_notification() should default to full detail for every candidate."""
         import inspect
         sig = inspect.signature(self.svc.build_run_notification)
         default = sig.parameters.get("audit_top_n")
         self.assertIsNotNone(default, "audit_top_n parameter is missing")
-        self.assertEqual(default.default, 5)
+        self.assertIsNone(default.default)
+
+        candidates = self._make_candidates(7)
+        content = self.svc.build_run_notification(run=self.run, candidates=candidates)
+        self.assertEqual(content.count("[评分汇总]"), 7)
 
     # --- zero candidates ---
 

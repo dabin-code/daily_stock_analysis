@@ -18,6 +18,11 @@ def test_feishu_stream_fields_are_explicitly_registered():
     assert encrypt_field["ui_control"] == "password"
     assert encrypt_field["is_sensitive"] is True
 
+    chat_field = get_field_definition("FEISHU_CHAT_ID")
+    assert chat_field["category"] == "notification"
+    assert chat_field["ui_control"] == "text"
+    assert chat_field["is_sensitive"] is False
+
 
 def test_feishu_stream_fields_appear_in_schema_response():
     schema = build_schema_response()
@@ -29,6 +34,7 @@ def test_feishu_stream_fields_appear_in_schema_response():
     assert "FEISHU_STREAM_ENABLED" in keys
     assert "FEISHU_VERIFICATION_TOKEN" in keys
     assert "FEISHU_ENCRYPT_KEY" in keys
+    assert "FEISHU_CHAT_ID" in keys
 
 
 def test_screening_fields_are_explicitly_registered():
@@ -69,6 +75,12 @@ def test_screening_fields_are_explicitly_registered():
     assert min_volume_ratio["data_type"] == "number"
     assert min_volume_ratio["ui_control"] == "number"
 
+    min_final_score = get_field_definition("SCREENING_MIN_FINAL_SCORE")
+    assert min_final_score["category"] == "screening"
+    assert min_final_score["data_type"] == "number"
+    assert min_final_score["ui_control"] == "number"
+    assert min_final_score["default_value"] == "80"
+
 
 def test_screening_fields_appear_in_schema_response():
     schema = build_schema_response()
@@ -80,6 +92,7 @@ def test_screening_fields_appear_in_schema_response():
     assert "SCREENING_DEFAULT_MODE" in keys
     assert "SCREENING_CANDIDATE_LIMIT" in keys
     assert "SCREENING_AI_TOP_K" in keys
+    assert "SCREENING_MIN_FINAL_SCORE" in keys
     assert "SCREENING_SCHEDULE_ENABLED" in keys
     assert "SCREENING_SCHEDULE_TIME" in keys
     assert "SCREENING_SCHEDULE_RUN_IMMEDIATELY" in keys

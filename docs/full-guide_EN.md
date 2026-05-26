@@ -70,6 +70,7 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 |------------|------|:----:|
 | `WECHAT_WEBHOOK_URL` | WeChat Work Webhook URL | Optional |
 | `FEISHU_WEBHOOK_URL` | Feishu Webhook URL | Optional |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_CHAT_ID` | Feishu app-based proactive group notifications | Optional |
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot Token (get from @BotFather) | Optional |
 | `TELEGRAM_CHAT_ID` | Telegram Chat ID | Optional |
 | `TELEGRAM_MESSAGE_THREAD_ID` | Telegram Topic ID (for sending to topics) | Optional |
@@ -170,6 +171,7 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 |--------|------|:----:|
 | `WECHAT_WEBHOOK_URL` | WeChat Work Bot Webhook URL | Optional |
 | `FEISHU_WEBHOOK_URL` | Feishu Bot Webhook URL | Optional |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_CHAT_ID` | Feishu app-based proactive group notifications when a custom bot webhook is unavailable | Optional |
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot Token | Optional |
 | `TELEGRAM_CHAT_ID` | Telegram Chat ID | Optional |
 | `TELEGRAM_MESSAGE_THREAD_ID` | Telegram Topic ID | Optional |
@@ -194,6 +196,7 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 |--------|------|:----:|
 | `FEISHU_APP_ID` | Feishu App ID | Optional |
 | `FEISHU_APP_SECRET` | Feishu App Secret | Optional |
+| `FEISHU_CHAT_ID` | Feishu group chat ID for proactive notifications | Optional |
 | `FEISHU_FOLDER_TOKEN` | Feishu Cloud Drive Folder Token | Optional |
 
 > Feishu Cloud Document setup steps:
@@ -432,6 +435,15 @@ crontab -e
 1. Add "Custom Bot" in Feishu group chat
 2. Copy Webhook URL
 3. Set `FEISHU_WEBHOOK_URL`
+
+If your account cannot add a custom bot, use a Feishu developer app instead:
+
+1. Add the app to the target group and grant message sending permissions
+2. Get `FEISHU_APP_ID` and `FEISHU_APP_SECRET`
+3. Get the target group `FEISHU_CHAT_ID` (for example, `oc_xxx`)
+4. Configure `FEISHU_APP_ID`, `FEISHU_APP_SECRET`, and `FEISHU_CHAT_ID`
+
+Screening runs automatically send the screening recommendation notification when they finish with `completed` or `completed_with_ai_degraded`, whether they are triggered by schedule, CLI, or API. The pushed content is kept close to the Web candidate detail drawer and includes matched rules, buy/sell plan, theme/sector context, layered scores, phase explanations, risk parameters, and AI review details.
 
 ### Telegram
 

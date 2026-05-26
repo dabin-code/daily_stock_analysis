@@ -352,6 +352,16 @@ class TestValidateStructuredNotification:
         issues = cfg.validate_structured()
         assert not any(i.severity == "warning" and "通知渠道" in i.message for i in issues)
 
+    def test_feishu_app_chat_counts_as_notification_channel(self):
+        cfg = _make_config(
+            wechat_webhook_url=None,
+            feishu_app_id="cli_test_app_id",
+            feishu_app_secret="secret_test_value",
+            feishu_chat_id="oc_test_chat_id",
+        )
+        issues = cfg.validate_structured()
+        assert not any(i.severity == "warning" and "通知渠道" in i.message for i in issues)
+
     def test_feishu_stream_enabled_without_credentials_warns(self):
         cfg = _make_config(
             wechat_webhook_url=None,

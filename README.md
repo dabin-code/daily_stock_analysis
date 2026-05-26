@@ -82,7 +82,7 @@ The scheduled prewarm is now best treated as an optional fallback. The primary l
 - `SCREENING_SCHEDULE_RUN_IMMEDIATELY=false`
 - `FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/...`
 
-启动常驻进程后，调度器会在交易日 `07:00` 执行一次全市场筛选；若当天不是 A 股交易日，任务会跳过且不推送。选股完成状态为 `completed` 或 `completed_with_ai_degraded` 时，会复用现有通知服务发送筛选推荐名单。通知服务会向所有已配置渠道推送；如果只希望发飞书，请只配置 `FEISHU_WEBHOOK_URL`。只启用该选股任务时，不需要同时开启 `SCHEDULE_ENABLED` 或传入 `--schedule`，否则会按既有语义额外注册普通每日分析任务。
+启动常驻进程后，调度器会在交易日 `07:00` 执行一次全市场筛选；若当天不是 A 股交易日，任务会跳过且不推送。任一入口触发的选股任务完成状态为 `completed` 或 `completed_with_ai_degraded` 时，都会复用现有通知服务发送筛选推荐名单。通知内容会尽量对齐 Web 候选详情，包含命中规则明细、买卖点、题材/板块、分层评分、交易计划、风险参数和 AI 复核等信息。通知服务会向所有已配置渠道推送；如果只希望发飞书，请只配置 `FEISHU_WEBHOOK_URL`，或配置 `FEISHU_APP_ID` + `FEISHU_APP_SECRET` + `FEISHU_CHAT_ID` 走飞书开放平台应用主动推送。只启用该选股任务时，不需要同时开启 `SCHEDULE_ENABLED` 或传入 `--schedule`，否则会按既有语义额外注册普通每日分析任务。
 
 ```bash
 python main.py --no-run-immediately
@@ -105,8 +105,14 @@ python main.py --no-run-immediately
 - `KLINE_GOVERNANCE_ENABLED=true`
 - `KLINE_GOVERNANCE_SCHEDULE_TIME=17:00`
 - `KLINE_GOVERNANCE_RUN_IMMEDIATELY=false`
+- `KLINE_AUDIT_AUTO_SKIP_ENABLED=true`
+- `KLINE_AUDIT_AUTO_SKIP_MAX_SYMBOLS=20`
+- `KLINE_AUDIT_AUTO_SKIP_MAX_RATIO=0.005`
+- `KLINE_AUDIT_AUTO_SKIP_MIN_COVERAGE=0.99`
 - `KLINE_DEEP_AUDIT_SCHEDULE_ENABLED=false`
 - `KLINE_DEEP_AUDIT_SCHEDULE_TIME=17:00`
+
+日常治理会在第一次审计和复审之间执行小量异常自动豁免：只有 `sync_result.errors` 全部属于允许的 `skip_eligible` 原因（默认 `not_in_bulk_universe,empty_data`）、缺口数量和比例不超过阈值、且总体覆盖率达标时，才会把对应 `symbol_range_gap` 写入 `kline_skip_registry` 的 `approved_skip`。`market_day_gap`、blocking/retryable 同步错误或大面积缺口仍会阻断复审和后续选股。
 
 手工治理命令：
 
@@ -265,6 +271,7 @@ python scripts/run_historical_random_screening.py --seed 20260512
 |------------|------|:----:|
 | `WECHAT_WEBHOOK_URL` | 企业微信 Webhook URL | 可选 |
 | `FEISHU_WEBHOOK_URL` | 飞书 Webhook URL | 可选 |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_CHAT_ID` | 飞书开放平台应用主动推送到群聊（无自定义机器人 Webhook 时使用） | 可选 |
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot Token（@BotFather 获取） | 可选 |
 | `TELEGRAM_CHAT_ID` | Telegram Chat ID | 可选 |
 | `TELEGRAM_MESSAGE_THREAD_ID` | Telegram Topic ID (用于发送到子话题) | 可选 |
@@ -285,6 +292,7 @@ python scripts/run_historical_random_screening.py --seed 20260512
 | `SCREENING_SCHEDULE_ENABLED` | 启用早盘全市场选股定时任务 | 可选 |
 | `SCREENING_SCHEDULE_TIME` | 选股定时任务执行时间，默认 `07:00` | 可选 |
 | `SCREENING_SCHEDULE_RUN_IMMEDIATELY` | 定时模式启动时是否立即执行一次选股，默认 `false` | 可选 |
+| `SCREENING_MIN_FINAL_SCORE` | 最终选股评分门槛，作用于 L1-L5 重排后的入库 `final_score`；默认 `80`，仅保留高质量候选；设为 `0` 关闭过滤 | 可选 |
 | `SCHEDULE_RUN_IMMEDIATELY` | 定时模式启动时是否立即执行一次分析 | 可选 |
 | `RUN_IMMEDIATELY` | 非定时模式启动时是否立即执行一次分析 | 可选 |
 | `SINGLE_STOCK_NOTIFY` | 单股推送模式：设为 `true` 则每分析完一只股票立即推送 | 可选 |
