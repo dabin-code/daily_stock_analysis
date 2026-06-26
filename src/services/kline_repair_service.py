@@ -65,11 +65,24 @@ class KlineRepairService:
                     "governance_run_id is required when processing approved_skip recovery"
                 )
 
+        # ── 批量预拉取:跨 gap 按交易日聚合,每个交易日仅发一次同步,覆盖所有缺该日的股票 ──
+        # 把原先「每只股票 × 每个交易日」的逐只下载,压缩为「每个去重交易日一次」批量下载。
+        prefetch_eligible = [
+            gap
+            for gap in unresolved_gaps
+            if gap.gap_scope == "symbol_range_gap"
+            and gap.status == "pending_retry"
+            and not self._has_reached_retry_limit(gap)
+        ]
+        prefetched_errors = (
+            self._batch_prefetch_symbol_gaps(prefetch_eligible) if prefetch_eligible else {}
+        )
+
         for gap in unresolved_gaps:
             if gap.status == "pending_retry":
                 if self._has_reached_retry_limit(gap):
                     continue
-                outcome = self._repair_pending_retry_gap(gap)
+                outcome = self._repair_pending_retry_gap(gap, prefetched_errors)
                 if outcome == "healthy":
                     repaired_gap_count += 1
                     recovered_gap_count += 1
@@ -109,8 +122,12 @@ class KlineRepairService:
         )
         return len(attempt_events) >= self.retry_max_attempts
 
-    def _repair_pending_retry_gap(self, gap: KlineAuditGap) -> str:
-        repair_result = self._run_gap_repair(gap)
+    def _repair_pending_retry_gap(
+        self,
+        gap: KlineAuditGap,
+        prefetched_errors: Optional[Dict[str, List[Dict[str, object]]]] = None,
+    ) -> str:
+        repair_result = self._run_gap_repair(gap, prefetched_errors)
         self.db.append_kline_audit_event(
             source_run_id=gap.source_run_id,
             gap_key=gap.gap_key,
@@ -138,7 +155,57 @@ class KlineRepairService:
 
         return "pending_retry"
 
-    def _run_gap_repair(self, gap: KlineAuditGap) -> Dict[str, object]:
+    def _batch_prefetch_symbol_gaps(
+        self,
+        gaps: List[KlineAuditGap],
+    ) -> Dict[str, List[Dict[str, object]]]:
+        """按交易日聚合所有 symbol_range 缺口,每个交易日只发一次批量同步。
+
+        返回 ``{code: [error, ...]}``,供后续 per-gap 核销直接读取该批次的失败诊断,
+        避免对同一(股票,日期)重复下载。
+        """
+        date_to_codes: Dict[date, set[str]] = {}
+        for gap in gaps:
+            if not gap.code:
+                continue
+            for trade_date in self._missing_dates_for_symbol_gap(gap):
+                date_to_codes.setdefault(trade_date, set()).add(gap.code)
+
+        errors_by_code: Dict[str, List[Dict[str, object]]] = {}
+        if not date_to_codes:
+            return errors_by_code
+
+        total_pairs = sum(len(codes) for codes in date_to_codes.values())
+        logger.info(
+            f"[GapRepair] 批量预拉取:{total_pairs} 个(股票,日期)缺口按交易日聚合为 "
+            f"{len(date_to_codes)} 次批量下载(原逐只方式需 {total_pairs} 次)"
+        )
+
+        for trade_date in sorted(date_to_codes):
+            codes = sorted(date_to_codes[trade_date])
+            try:
+                result = self.sync_service.sync_trade_date(
+                    trade_date=trade_date,
+                    stock_codes=codes,
+                    force=True,
+                )
+            except Exception as exc:  # 预拉取失败不致命,残余交给 per-gap 兜底
+                logger.warning(
+                    f"[GapRepair] 预拉取 {trade_date} 失败,转 per-gap 兜底:{exc}"
+                )
+                continue
+            for error in result.get("errors", []):
+                code = error.get("code")
+                if code:
+                    errors_by_code.setdefault(str(code), []).append(error)
+
+        return errors_by_code
+
+    def _run_gap_repair(
+        self,
+        gap: KlineAuditGap,
+        prefetched_errors: Optional[Dict[str, List[Dict[str, object]]]] = None,
+    ) -> Dict[str, object]:
         if gap.gap_scope == "market_day_gap":
             result = self.sync_service.sync_trade_date(
                 trade_date=gap.trade_date,
@@ -147,12 +214,13 @@ class KlineRepairService:
             return {"errors": list(result.get("errors", []))}
 
         if gap.gap_scope == "symbol_range_gap":
+            # 已由批量预拉取覆盖:直接复用该批次为本股票产出的失败诊断,不再重复下载。
+            if prefetched_errors is not None:
+                return {"errors": list(prefetched_errors.get(gap.code or "", []))}
+
+            # 兜底路径(无预拉取上下文,如直接调用):仅同步仍缺失的交易日。
             errors: List[Dict[str, object]] = []
-            for trade_date in self._iter_market_dates(
-                market=gap.market,
-                start=gap.missing_date_from,
-                end=gap.missing_date_to,
-            ):
+            for trade_date in self._missing_dates_for_symbol_gap(gap):
                 result = self.sync_service.sync_trade_date(
                     trade_date=trade_date,
                     stock_codes=[gap.code],
@@ -424,17 +492,31 @@ class KlineRepairService:
             )
             if not expected_dates:
                 return False
-            with self.db.session_scope() as session:
-                rows = session.execute(
-                    select(StockDaily.date).where(
-                        StockDaily.code == gap.code,
-                        StockDaily.date >= expected_dates[0],
-                        StockDaily.date <= expected_dates[-1],
-                    )
-                ).scalars().all()
-            return set(rows) >= set(expected_dates)
+            return not self._missing_dates_for_symbol_gap(gap)
 
         return False
+
+    def _missing_dates_for_symbol_gap(self, gap: KlineAuditGap) -> List[date]:
+        """返回 symbol_range 缺口中本地仍缺失的交易日(已存在的日期被剔除)。"""
+        if not gap.code or gap.missing_date_from is None or gap.missing_date_to is None:
+            return []
+        expected_dates = self._iter_market_dates(
+            market=gap.market,
+            start=gap.missing_date_from,
+            end=gap.missing_date_to,
+        )
+        if not expected_dates:
+            return []
+        with self.db.session_scope() as session:
+            rows = session.execute(
+                select(StockDaily.date).where(
+                    StockDaily.code == gap.code,
+                    StockDaily.date >= expected_dates[0],
+                    StockDaily.date <= expected_dates[-1],
+                )
+            ).scalars().all()
+        present = set(rows)
+        return [trade_date for trade_date in expected_dates if trade_date not in present]
 
     @staticmethod
     def _iter_market_dates(*, market: str, start: date, end: date) -> List[date]:

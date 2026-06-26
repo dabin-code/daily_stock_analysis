@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Hot-theme screening universe locking
+
+- `POST /api/v1/screening/openclaw-theme-run` now locks the screening universe to the constituents of the boards resolved from the incoming `themes`, instead of scanning the whole market. The passed-in theme/board directly determines the candidate pool.
+- Added `ScreeningTaskService._resolve_theme_universe_codes`, which reuses the existing `ThemeNormalizationService` (alias table + board-name recall) to map each theme to `matched_boards`, then resolves board constituents via `batch_get_board_member_codes`.
+- In `execute_run`, when a `theme_context` is provided without explicit `stock_codes`, the resolved constituents become the universe; if no board constituents can be resolved, the run fails fast with a clear `ValueError` (surfaced as HTTP `422`) instead of silently falling back to a full-market scan.
+- `FiveLayerPipeline.run` gained a `lock_universe` flag: when the universe is theme-locked, L2 hot-board heat shrink is skipped (`l2_filter_mode="theme_universe_locked"`) so all board constituents flow straight into strategy screening. Sector-heat annotation (leaders / theme labels) still runs for reporting only.
+
 ### Screening final-score gate
 
 - Added a final-layer minimum score gate in `ScreeningTaskService.execute_run`: candidates whose post L1-L5 rerank `rule_score` (the persisted `final_score`) falls below `SCREENING_MIN_FINAL_SCORE` are dropped before AI 二筛、persistence、通知 / 报告 / API 全链路。默认阈值 `80` 等价于至少达到 `probe_entry` 阶段或同等多维组合，设置为 `0` 关闭过滤

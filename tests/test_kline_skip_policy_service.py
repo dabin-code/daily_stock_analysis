@@ -200,10 +200,27 @@ def test_auto_skip_policy_closes_market_gap_when_other_symbols_are_already_healt
     assert market_gap.status == "healthy"
 
 
-def test_auto_skip_policy_does_not_approve_multi_day_symbol_range(tmp_path):
+def test_auto_skip_policy_approves_multi_day_gap_still_open_today(tmp_path):
+    """停牌跨多日、且截至当日仍未结束(to == trade_date)的缺口应被自动豁免。
+
+    审计窗口 window_end == trade_date,故缺口 missing_date_to 不会超过当日;
+    当某代码当日仍 skip_eligible(not_in_bulk_universe)且其连续缺口正好截止当日时,
+    该连续停牌区间属于「小而可解释」的缺口,应整段豁免——这是对原单日策略的有意放宽。
+    """
     db = _build_db(tmp_path)
-    _create_run_and_gap(db)
-    db.upsert_kline_audit_gap(
+    db.create_kline_audit_run(
+        run_id="audit-1",
+        market="cn",
+        trade_date=date(2026, 5, 13),
+        run_type="daily",
+        trigger_type="scheduled",
+        run_result="degraded",
+        pass_status="not_passed",
+        rule_version="kline_audit_v1",
+        window_start=date(2026, 5, 1),
+        window_end=date(2026, 5, 13),
+    )
+    multi_day_gap = db.upsert_kline_audit_gap(
         market="cn",
         gap_scope="symbol_range_gap",
         code="300069",
@@ -226,18 +243,70 @@ def test_auto_skip_policy_does_not_approve_multi_day_symbol_range(tmp_path):
                     "target_trade_date": "2026-05-13",
                     "reason": "not_in_bulk_universe",
                     "reason_class": "skip_eligible",
+                    "source_attempts": [{"source": "tushare_bulk_sentinel"}],
+                }
+            ],
+            "health_report": {
+                "expected_count": 5309,
+                "available_count": 5308,
+                "missing_count": 1,
+                "reason_class_counts": {"blocking": 0, "retryable": 0, "skip_eligible": 1},
+            },
+        },
+    )
+
+    assert result["approved_count"] == 1
+    registry_row = db.get_kline_skip_registry(
+        market="cn",
+        gap_scope="symbol_range_gap",
+        code="300069",
+        missing_date_from=date(2026, 5, 12),
+        missing_date_to=date(2026, 5, 13),
+    )
+    assert registry_row is not None
+    assert registry_row.status == "approved_skip"
+    approved_gap = db.list_kline_audit_gaps(market="cn", status="approved_skip")[0]
+    assert approved_gap.gap_key == multi_day_gap.gap_key
+
+
+def test_auto_skip_policy_does_not_approve_multi_day_gap_not_ending_today(tmp_path):
+    """历史已结束的停牌缺口(to < trade_date)缺乏当日证据,不应被当日 auto-skip 豁免。"""
+    db = _build_db(tmp_path)
+    _create_run_and_gap(db)  # 当日单日缺口 [05-13, 05-13]
+    historical_gap = db.upsert_kline_audit_gap(
+        market="cn",
+        gap_scope="symbol_range_gap",
+        code="300069",
+        missing_date_from=date(2026, 5, 9),
+        missing_date_to=date(2026, 5, 10),
+        source_run_id="audit-1",
+        status="open",
+    )
+    service = KlineSkipPolicyService(config=_build_config(), db_manager=db)
+
+    result = service.apply_auto_skip(
+        market="cn",
+        source_run_id="audit-1",
+        trade_date=date(2026, 5, 13),
+        sync_result={
+            "total": 5309,
+            "errors": [
+                {
+                    "code": "300069",
+                    "target_trade_date": "2026-05-13",
+                    "reason": "not_in_bulk_universe",
+                    "reason_class": "skip_eligible",
                 }
             ],
         },
     )
 
+    # 仅当日缺口被豁免;历史缺口(to=05-10)保持 open
     assert result["approved_count"] == 1
-    registry_rows = db.list_kline_skip_registry(market="cn")
-    assert len(registry_rows) == 1
-    assert registry_rows[0].missing_date_from == date(2026, 5, 13)
-    multi_day_gap = [
+    untouched = [
         gap
         for gap in db.list_kline_audit_gaps(market="cn")
-        if gap.missing_date_from == date(2026, 5, 12)
+        if gap.missing_date_from == date(2026, 5, 9)
     ][0]
-    assert multi_day_gap.status == "open"
+    assert untouched.gap_key == historical_gap.gap_key
+    assert untouched.status == "open"

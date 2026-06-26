@@ -8,7 +8,9 @@ DSA 提供一个给 OpenClaw 调用的专用接口，用于触发 `extreme_stren
 - 当前只支持 A 股市场，即 `market="cn"`
 - 接口收到请求后，会固定使用 `extreme_strength_combo` 策略执行筛选
 - 请求中的 `trade_date` 会按原值传入筛选任务
-- 题材匹配会结合 OpenClaw 传入的热点题材，以及个股所属板块信息
+- 传入的 `themes` 会被解析为对应板块的成分股，并将本次选股池**锁定**为这些成分股；选股仅在传入题材对应的板块内进行，不再扫描全市场，也不再走热点板块热度计算/收窄流程
+- 题材→板块解析复用内置的 `ThemeNormalizationService`（别名表 + 板块名召回）
+- 若传入题材无法匹配到任何带成分股的板块，接口会返回 `422 validation_error`（不会静默回退到全市场）
 
 ## 请求定义
 
@@ -267,6 +269,6 @@ GET /api/v1/screening/runs/{run_id}/candidates/{code}
 
 1. `strategy_names` 不是请求参数，接口内部固定为 `["extreme_strength_combo"]`
 2. `mode` 不是请求参数，接口内部固定以 `balanced` 模式调用筛选任务
-3. `stock_codes` 不是请求参数，接口内部会跑全市场股票池
+3. `stock_codes` 不是请求参数；接口内部会把传入的 `themes` 解析为板块成分股并锁定为选股池（解析不到则报错 `422`），不再跑全市场股票池
 4. `force_refresh` 当前只是保留位，代码已接收但暂未驱动额外刷新逻辑
 5. 返回的 `status` 不是固定写死的 `queued`，而是实际筛选服务返回值

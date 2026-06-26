@@ -163,6 +163,25 @@ class ScreeningTaskService:
             raise ValueError("自定义注入的筛选服务不支持非 balanced mode，请改为使用默认服务构建")
         requested_trade_date = trade_date or self._get_market_today(market)
         effective_theme_context = theme_context if theme_context is not None else self._theme_context
+        # 题材选股：传入题材且未显式指定股票时，将选股池锁定为题材对应板块的成分股。
+        # 锁定后跳过 L2 热点板块计算与收窄，直接用成分股进入策略筛选。
+        theme_universe_locked = False
+        if (
+            not normalized_stock_codes
+            and effective_theme_context is not None
+            and getattr(effective_theme_context, "themes", None)
+        ):
+            theme_universe_codes = self._resolve_theme_universe_codes(
+                effective_theme_context, market=market,
+            )
+            if not theme_universe_codes:
+                raise ValueError(
+                    "题材未匹配到任何板块成分股，无法按板块锁定选股池"
+                    "（请检查题材/板块名称，或确认板块成分数据已同步）"
+                )
+            normalized_stock_codes = self._normalize_stock_codes(theme_universe_codes)
+            stock_codes = list(normalized_stock_codes)
+            theme_universe_locked = True
         resolved_trade_date = requested_trade_date
         trade_date_warning: Optional[str] = None
         if trade_date is not None:
@@ -604,6 +623,7 @@ class ScreeningTaskService:
                     candidate_limit=effective_limit,
                     db_manager=self.db,
                     skill_manager=self._skill_manager,
+                    lock_universe=theme_universe_locked,
                 )
                 selected = pipeline_result.candidates
                 decision_context = pipeline_result.decision_context
@@ -1285,6 +1305,57 @@ class ScreeningTaskService:
             "accepted_at": getattr(theme_context, "accepted_at", None),
             "themes": themes,
         }
+
+    def _resolve_theme_universe_codes(
+        self,
+        theme_context: Any,
+        market: str = "cn",
+    ) -> List[str]:
+        """将传入题材解析为板块成分股代码集合，用于把选股池锁定到指定板块。
+
+        复用 ThemeNormalizationService（别名表 + 板块召回）得到 matched_boards，
+        再经 batch_get_board_member_codes 反查成分股。返回去重后的代码列表；
+        若题材无法匹配到任何带成分股的板块，返回空列表（由调用方决定如何处理）。
+        """
+        themes = list(getattr(theme_context, "themes", []) or [])
+        if not themes:
+            return []
+
+        from src.services.theme_normalization_service import ThemeNormalizationService
+
+        normalizer = ThemeNormalizationService()
+        try:
+            active_boards = self.db.list_active_boards_with_member_count(market=market)
+            board_vocab = [
+                row["board_name"]
+                for row in active_boards
+                if row.get("board_name")
+            ]
+            if board_vocab:
+                normalizer.set_board_vocabulary(board_vocab)
+        except Exception as exc:
+            logger.warning("theme universe: failed to load board vocabulary: %s", exc)
+
+        matched_boards: List[str] = []
+        for theme in themes:
+            raw_name = getattr(theme, "name", "") or ""
+            keywords = list(getattr(theme, "keywords", []) or [])
+            result = normalizer.normalize_theme(raw_theme=raw_name, keywords=keywords)
+            for board in result.get("matched_boards", []) or []:
+                if board not in matched_boards:
+                    matched_boards.append(board)
+
+        if not matched_boards:
+            logger.info("theme universe: no boards matched for provided themes")
+            return []
+
+        member_map = self.db.batch_get_board_member_codes(matched_boards, market=market)
+        codes = sorted({code for codes in member_map.values() for code in codes})
+        logger.info(
+            "theme universe locked: themes=%d matched_boards=%d members=%d",
+            len(themes), len(matched_boards), len(codes),
+        )
+        return codes
 
     @staticmethod
     def _build_initial_normalized_themes(theme_context: Any) -> List[Dict[str, Any]]:

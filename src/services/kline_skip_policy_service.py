@@ -64,7 +64,11 @@ class KlineSkipPolicyService:
                 continue
             if gap.source_run_id != source_run_id or str(gap.code or "").strip().upper() not in eligible_codes:
                 continue
-            if gap.missing_date_from != trade_date or gap.missing_date_to != trade_date:
+            # 审计窗口 window_end == trade_date,故 missing_date_to 不会晚于当日。
+            # 只要缺口截止当日(仍在停牌),就整段豁免该连续区间——当日已有 skip_eligible
+            # 证据,且整体受 ratio/coverage/max_symbols 护栏约束。截止日早于当日的历史缺口
+            # 缺乏当日证据,不在此处豁免(留待其对应交易日的治理或人工审批)。
+            if gap.missing_date_from is None or gap.missing_date_to != trade_date:
                 continue
             self.db.upsert_kline_skip_registry(
                 market=market,

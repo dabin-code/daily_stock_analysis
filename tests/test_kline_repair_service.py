@@ -183,6 +183,7 @@ def test_repair_service_stops_retrying_pending_gap_after_retry_limit():
             "repaired_gap_count": 0,
             "candidate_skip_gap_count": 0,
             "recovered_gap_count": 0,
+            "skipped_gap_count": 0,
         }
         assert len(sync_service.calls) == 0
         assert len(pending_retry_gaps) == 1
@@ -229,6 +230,7 @@ def test_repair_service_promotes_gap_to_candidate_skip_after_threshold():
                     "trade_date": "2026-04-10",
                     "errors": [
                         {
+                            "code": "000001",
                             "reason": "empty_data",
                             "reason_class": "skip_eligible",
                             "source_attempts": [
@@ -250,6 +252,7 @@ def test_repair_service_promotes_gap_to_candidate_skip_after_threshold():
                     "trade_date": "2026-04-11",
                     "errors": [
                         {
+                            "code": "000001",
                             "reason": "empty_data",
                             "reason_class": "skip_eligible",
                             "source_attempts": [
@@ -643,6 +646,78 @@ def test_repair_service_skips_gaps_after_max_trade_date():
         assert result["repaired_gap_count"] == 0
         assert sync_service.calls == []
         assert pending_gaps[0].gap_key == gap.gap_key
+    finally:
+        DatabaseManager.reset_instance()
+        Config.reset_instance()
+        os.environ.pop("DATABASE_PATH", None)
+        temp_dir.cleanup()
+
+
+class _BatchRecordingSyncService:
+    """记录每次 sync_trade_date 调用，并为请求的股票落库，模拟成功的批量拉取。"""
+
+    def __init__(self, db: DatabaseManager) -> None:
+        self.db = db
+        self.calls = []
+
+    def sync_trade_date(self, trade_date, stock_codes=None, force=False, **kwargs):
+        codes = list(stock_codes) if stock_codes else None
+        self.calls.append({"trade_date": trade_date, "stock_codes": codes, "force": force})
+        for code in codes or []:
+            self.db.save_daily_data(_build_daily_rows([trade_date]), code, data_source="test")
+        return {
+            "trade_date": trade_date.isoformat(),
+            "errors": [],
+            "health_report": {"is_healthy": True},
+        }
+
+
+def test_repair_service_batches_symbol_gaps_by_trade_date():
+    """多只股票缺同一批交易日时，应按交易日聚合：每个交易日只发一次同步，覆盖所有缺口股票。"""
+    from src.services.kline_repair_service import KlineRepairService
+
+    temp_dir = tempfile.TemporaryDirectory()
+    try:
+        db_path = os.path.join(temp_dir.name, "test_kline_repair_batch.db")
+        os.environ["DATABASE_PATH"] = db_path
+        Config.reset_instance()
+        DatabaseManager.reset_instance()
+        db = DatabaseManager.get_instance()
+        _create_run(db, "repair-run-batch")
+
+        missing_from = date(2026, 4, 13)  # 周一
+        missing_to = date(2026, 4, 15)    # 周三
+        codes = ["000001", "000002", "000003"]
+        for code in codes:
+            db.upsert_kline_audit_gap(
+                market="cn",
+                gap_scope="symbol_range_gap",
+                code=code,
+                missing_date_from=missing_from,
+                missing_date_to=missing_to,
+                source_run_id="repair-run-batch",
+                status="pending_retry",
+            )
+
+        sync_service = _BatchRecordingSyncService(db)
+        service = KlineRepairService(db_manager=db, sync_service=sync_service)
+
+        result = service.repair_gaps(market="cn", governance_run_succeeded=False)
+
+        session_dates = KlineRepairService._iter_market_dates(
+            market="cn", start=missing_from, end=missing_to
+        )
+        assert len(session_dates) >= 1
+
+        # 核心断言：每个交易日只调用一次（按日聚合），而非每只股票各调一次
+        assert len(sync_service.calls) == len(session_dates)
+        for call in sync_service.calls:
+            assert set(call["stock_codes"]) == set(codes)
+
+        # 所有缺口都应被修复为 healthy
+        assert result["repaired_gap_count"] == len(codes)
+        healthy = db.list_kline_audit_gaps(market="cn", status="healthy")
+        assert {g.code for g in healthy} == set(codes)
     finally:
         DatabaseManager.reset_instance()
         Config.reset_instance()

@@ -154,6 +154,7 @@ class FiveLayerPipeline:
         candidate_limit: int,
         db_manager: Any,
         skill_manager: Optional[Any] = None,
+        lock_universe: bool = False,
     ) -> PipelineResult:
         stats: Dict[str, Any] = {
             "universe_before": len(snapshot_df),
@@ -280,7 +281,15 @@ class FiveLayerPipeline:
         l2_filter_mode = "full_universe"
         theme_member_candidate_count = 0
 
-        if main_theme_boards:
+        if lock_universe:
+            # 题材选股已在 universe 层锁定为指定板块成分股，
+            # 此处跳过热点板块收窄，让全部成分股进入策略筛选。
+            l2_filter_mode = "theme_universe_locked"
+            logger.info(
+                "pipeline L2: universe locked to provided boards (%d stocks), skip theme shrink",
+                len(snapshot_df),
+            )
+        elif main_theme_boards:
             member_codes = self._get_theme_member_codes(db_manager, main_theme_boards)
             if member_codes:
                 mask = snapshot_df["code"].isin(member_codes)
