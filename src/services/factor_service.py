@@ -744,8 +744,15 @@ class FactorService:
             if p1 > 0:
                 higher_low_pct = round((p3 - p1) / p1 * 100.0, 4)
 
-        # Joint detector
-        joint = Low123TrendlineDetector.detect(group)
+        # Joint detector — thresholds are configurable via env/config so they
+        # can be tuned without code changes / image rebuilds.
+        _cfg = get_config()
+        joint = Low123TrendlineDetector.detect(
+            group,
+            max_p1_p2_bars=_cfg.low123_max_p1_p2_bars,
+            max_breakout_gap=_cfg.low123_max_breakout_gap,
+            break_tolerance=_cfg.low123_break_tolerance,
+        )
         state = joint.get("state", "rejected")
         is_breakout_ready = state == "breakout_ready"
         is_watching = state == "watching"
@@ -815,7 +822,12 @@ class FactorService:
                 "bottom_divergence_validation_status": "insufficient_data",
             }
 
-        result = BottomDivergenceBreakoutDetector.detect(group)
+        _cfg = get_config()
+        result = BottomDivergenceBreakoutDetector.detect(
+            group,
+            max_breakout_gap=_cfg.bottom_divergence_max_breakout_gap,
+            break_tolerance=_cfg.bottom_divergence_break_tolerance,
+        )
         state = result.get("state", "rejected")
         confirmation_days = FactorService._compute_bottom_divergence_confirmation_days(group, result)
         entry_context = FactorService._compute_bottom_divergence_entry_context(

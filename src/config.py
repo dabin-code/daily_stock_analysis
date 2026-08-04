@@ -483,6 +483,20 @@ class Config:
     ma100_breakout_confirm_days: int = 3
     ma100_support_tolerance: float = 0.02
 
+    # === 低位123结构检测配置 ===
+    # P1→P2 最大跨度（根数）：超过视为松散结构而剔除
+    low123_max_p1_p2_bars: int = 30
+    # P2突破距 P3 的最大间隔（根数）：超过视为陈旧突破，降级为观察而非买点
+    low123_max_breakout_gap: int = 20
+    # 破位容差比例（0~1）：P3后最低价跌破 P1*(1-tol) 才算破位，默认严格跌破
+    low123_break_tolerance: float = 0.0
+
+    # === 底背离双突破检测配置 ===
+    # 双突破距 B 的最大间隔（根数）：超过视为陈旧突破，不计双突破确认
+    bottom_divergence_max_breakout_gap: int = 30
+    # 破位容差比例（0~1）：B 后最低价跌破 min(A,B)*(1-tol) 视为结构失效，默认严格跌破
+    bottom_divergence_break_tolerance: float = 0.0
+
     # === 回测配置 ===
     backtest_enabled: bool = True
     backtest_eval_window_days: int = 10
@@ -584,6 +598,9 @@ class Config:
     kline_governance_schedule_time: str = "17:00"
     kline_governance_run_immediately: bool = False
     kline_audit_lookback_days: int = 30
+    # 数据健康「回填/修复缺口」逐日补跑治理时，最多向前补齐的交易日数量。
+    # 用于把审计通过日从最近通过日推进到目标日，避免通过日缺失时回溯过多。
+    kline_governance_max_catch_up_sessions: int = 30
     kline_deep_audit_lookback_days: int = 365
     kline_deep_audit_schedule_enabled: bool = False
     kline_deep_audit_schedule_time: str = "17:00"
@@ -1074,6 +1091,15 @@ class Config:
             data_fetch_days=int(os.getenv('DATA_FETCH_DAYS', '200')),
             ma100_breakout_confirm_days=int(os.getenv('MA100_BREAKOUT_CONFIRM_DAYS', '3')),
             ma100_support_tolerance=float(os.getenv('MA100_SUPPORT_TOLERANCE', '0.02')),
+            low123_max_p1_p2_bars=int(os.getenv('LOW123_MAX_P1_P2_BARS', '30')),
+            low123_max_breakout_gap=int(os.getenv('LOW123_MAX_BREAKOUT_GAP', '20')),
+            low123_break_tolerance=float(os.getenv('LOW123_BREAK_TOLERANCE', '0.0')),
+            bottom_divergence_max_breakout_gap=int(
+                os.getenv('BOTTOM_DIVERGENCE_MAX_BREAKOUT_GAP', '30')
+            ),
+            bottom_divergence_break_tolerance=float(
+                os.getenv('BOTTOM_DIVERGENCE_BREAK_TOLERANCE', '0.0')
+            ),
             backtest_enabled=os.getenv('BACKTEST_ENABLED', 'true').lower() == 'true',
             backtest_eval_window_days=int(os.getenv('BACKTEST_EVAL_WINDOW_DAYS', '10')),
             backtest_min_age_days=int(os.getenv('BACKTEST_MIN_AGE_DAYS', '14')),
@@ -1189,6 +1215,10 @@ class Config:
                 default=False,
             ),
             kline_audit_lookback_days=max(1, int(os.getenv('KLINE_AUDIT_LOOKBACK_DAYS', '30'))),
+            kline_governance_max_catch_up_sessions=max(
+                0,
+                int(os.getenv('KLINE_GOVERNANCE_MAX_CATCH_UP_SESSIONS', '30')),
+            ),
             kline_deep_audit_lookback_days=max(1, int(os.getenv('KLINE_DEEP_AUDIT_LOOKBACK_DAYS', '365'))),
             kline_deep_audit_schedule_enabled=parse_env_bool(
                 os.getenv('KLINE_DEEP_AUDIT_SCHEDULE_ENABLED'),

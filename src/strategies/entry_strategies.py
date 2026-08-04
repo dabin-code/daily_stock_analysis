@@ -40,6 +40,7 @@ from src.indicators.pattern_detector import PatternDetector
 from src.indicators.multi_timeframe_analyzer import MultiTimeframeAnalyzer
 from src.indicators.low_123_trendline_detector import Low123TrendlineDetector
 from src.indicators.bottom_divergence_breakout_detector import BottomDivergenceBreakoutDetector
+from src.config import get_config
 
 
 class EntryStrategyC:
@@ -466,7 +467,13 @@ class EntryStrategyB:
                 "reason": "insufficient data",
             }
 
-        joint = Low123TrendlineDetector.detect(df)
+        _cfg = get_config()
+        joint = Low123TrendlineDetector.detect(
+            df,
+            max_p1_p2_bars=_cfg.low123_max_p1_p2_bars,
+            max_breakout_gap=_cfg.low123_max_breakout_gap,
+            break_tolerance=_cfg.low123_break_tolerance,
+        )
         state = joint.get("state", "rejected")
         triggered = state == "breakout_ready"
 
@@ -550,7 +557,12 @@ class EntryStrategyE:
                 "reason": "insufficient data",
             }
 
-        result = BottomDivergenceBreakoutDetector.detect(df)
+        _cfg = get_config()
+        result = BottomDivergenceBreakoutDetector.detect(
+            df,
+            max_breakout_gap=_cfg.bottom_divergence_max_breakout_gap,
+            break_tolerance=_cfg.bottom_divergence_break_tolerance,
+        )
         state = result.get("state", "rejected")
         actionable_entry = cls._is_actionable_entry(df, result)
         triggered = state == "confirmed" and actionable_entry

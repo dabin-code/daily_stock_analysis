@@ -220,29 +220,58 @@ class DataHealthTaskService:
 
         if operation_type == "repair_gaps":
             self._promote_open_gaps_for_repair(market=market)
-            return self.repair_service.repair_gaps(
+            repair_result = self.repair_service.repair_gaps(
                 market=market,
                 governance_run_succeeded=False,
                 included_statuses={"pending_retry", "candidate_skip"},
                 max_trade_date=self._resolve_repair_max_trade_date(market=market),
             )
+            # 修复缺口本身只补数据/标记 healthy，不会翻转审计通过状态。
+            # 逐日补跑治理，让每个交易日各自获得当日豁免证据，把审计通过日推进到最新日，
+            # 否则最新交易日始终 not_passed，选股拿不到可用交易日。
+            catch_up_result = self._run_catch_up_governance(market=market)
+            return {
+                "repair_result": repair_result,
+                "catch_up_result": catch_up_result,
+            }
 
         if operation_type == "retry_failed":
             if trade_date is not None:
-                return self.sync_service.sync_trade_date(
+                sync_result = self.sync_service.sync_trade_date(
                     trade_date=trade_date,
                     stock_codes=stock_codes,
                     force=True,
                 )
+                catch_up_result = self._run_catch_up_governance(market=market)
+                return {
+                    "sync_result": sync_result,
+                    "catch_up_result": catch_up_result,
+                }
             self._promote_open_gaps_for_repair(market=market)
-            return self.repair_service.repair_gaps(
+            repair_result = self.repair_service.repair_gaps(
                 market=market,
                 governance_run_succeeded=False,
                 included_statuses={"pending_retry", "candidate_skip"},
                 max_trade_date=self._resolve_repair_max_trade_date(market=market),
             )
+            catch_up_result = self._run_catch_up_governance(market=market)
+            return {
+                "repair_result": repair_result,
+                "catch_up_result": catch_up_result,
+            }
 
         raise ValueError(f"unsupported operation: {operation_type}")
+
+    def _run_catch_up_governance(self, *, market: str) -> Optional[Dict[str, Any]]:
+        """逐日补跑治理以推进审计通过日；治理服务不支持或失败时不影响修复结果。"""
+        catch_up = getattr(self.governance_service, "run_daily_governance_with_catch_up", None)
+        if not callable(catch_up):
+            return None
+        try:
+            return catch_up(market=market)
+        except Exception as exc:  # 补跑失败不应吞掉已完成的修复结果
+            logger.warning("catch-up governance after repair failed: market=%s error=%s", market, exc)
+            return {"status": "catch_up_failed", "error": str(exc) or exc.__class__.__name__}
 
     def _mark_processing(self, task_id: str) -> None:
         with self._lock:

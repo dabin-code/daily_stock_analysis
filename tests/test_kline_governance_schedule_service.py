@@ -309,6 +309,82 @@ class KlineGovernanceScheduleServiceTestCase(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "daily governance truth is unavailable"):
                 service.run_deep_audit()
 
+    def test_run_daily_governance_with_catch_up_runs_each_missing_session_then_target(self) -> None:
+        db_manager = mock.MagicMock()
+        db_manager.get_latest_passed_kline_audit_trade_date.return_value = SimpleNamespace(
+            trade_date=date(2026, 6, 26)
+        )
+        service = KlineGovernanceScheduleService(
+            config=self._build_config(kline_governance_max_catch_up_sessions=30),
+            market_data_sync_service=mock.MagicMock(),
+            audit_service=mock.MagicMock(),
+            repair_service=mock.MagicMock(),
+            skip_policy_service=mock.MagicMock(),
+            db_manager=db_manager,
+        )
+
+        governance_calls = []
+
+        def _run_daily(*, trade_date, market):
+            governance_calls.append(trade_date)
+            return {"trade_date": trade_date, "run_result": "succeeded", "pass_status": "passed"}
+
+        with patch.object(service, "run_daily_governance", side_effect=_run_daily), patch(
+            "src.services.kline_governance_schedule_service.KlineAuditService._is_market_session",
+            side_effect=lambda *, market, trade_date: trade_date.weekday() < 5,
+        ):
+            result = service.run_daily_governance_with_catch_up(
+                trade_date=date(2026, 7, 2),
+                market="cn",
+            )
+
+        # 06-26 通过后，逐日补跑 06-29/06-30/07-01（跳过周末），最后跑目标日 07-02
+        self.assertEqual(
+            governance_calls,
+            [date(2026, 6, 29), date(2026, 6, 30), date(2026, 7, 1), date(2026, 7, 2)],
+        )
+        self.assertEqual(
+            result["catch_up_dates"],
+            ["2026-06-29", "2026-06-30", "2026-07-01"],
+        )
+        self.assertEqual(len(result["catch_up_results"]), 3)
+        self.assertEqual(result["pass_status"], "passed")
+        self.assertEqual(result["trade_date"], date(2026, 7, 2))
+
+    def test_run_daily_governance_with_catch_up_respects_session_cap(self) -> None:
+        db_manager = mock.MagicMock()
+        # 没有任何通过日：起点缺失时靠 cap 限制回溯范围
+        db_manager.get_latest_passed_kline_audit_trade_date.return_value = None
+        service = KlineGovernanceScheduleService(
+            config=self._build_config(kline_governance_max_catch_up_sessions=2),
+            market_data_sync_service=mock.MagicMock(),
+            audit_service=mock.MagicMock(),
+            repair_service=mock.MagicMock(),
+            skip_policy_service=mock.MagicMock(),
+            db_manager=db_manager,
+        )
+
+        governance_calls = []
+
+        def _run_daily(*, trade_date, market):
+            governance_calls.append(trade_date)
+            return {"trade_date": trade_date, "run_result": "succeeded", "pass_status": "passed"}
+
+        with patch.object(service, "run_daily_governance", side_effect=_run_daily), patch(
+            "src.services.kline_governance_schedule_service.KlineAuditService._is_market_session",
+            side_effect=lambda *, market, trade_date: trade_date.weekday() < 5,
+        ):
+            service.run_daily_governance_with_catch_up(
+                trade_date=date(2026, 7, 2),
+                market="cn",
+            )
+
+        # cap=2：最多补跑 2 个交易日（07-01、06-30），再加目标日 07-02
+        self.assertEqual(
+            governance_calls,
+            [date(2026, 6, 30), date(2026, 7, 1), date(2026, 7, 2)],
+        )
+
     def test_kline_governance_schedule_does_not_reuse_previous_session_on_closed_day(self) -> None:
         service = KlineGovernanceScheduleService(config=self._build_config())
         calendar = mock.MagicMock()

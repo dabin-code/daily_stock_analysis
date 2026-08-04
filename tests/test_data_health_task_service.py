@@ -108,7 +108,7 @@ def test_data_health_task_dispatches_repair_and_audit_operations():
         market="cn",
     )
 
-    assert repair_task["result"]["repaired_gap_count"] == 2
+    assert repair_task["result"]["repair_result"]["repaired_gap_count"] == 2
     assert repair.calls == [
         {
             "market": "cn",
@@ -249,6 +249,39 @@ def test_repair_gaps_uses_latest_passed_audit_date_as_cutoff():
             "max_trade_date": date(2026, 5, 11),
         }
     ]
+
+
+def test_repair_gaps_triggers_catch_up_governance_to_advance_passed_date():
+    repair = _RepairService()
+    db = _fake_db()
+    db.get_latest_passed_kline_audit_trade_date.return_value = SimpleNamespace(
+        trade_date=date(2026, 5, 11)
+    )
+
+    class _CatchUpGovernance:
+        def __init__(self):
+            self.catch_up_calls = []
+            self.config = SimpleNamespace(kline_audit_lookback_days=30)
+
+        def run_daily_governance_with_catch_up(self, *, market):
+            self.catch_up_calls.append(market)
+            return {"trade_date": "2026-05-12", "pass_status": "passed"}
+
+    governance = _CatchUpGovernance()
+    service = DataHealthTaskService(
+        backfill_service=_BackfillService(),
+        governance_service=governance,
+        repair_service=repair,
+        db_manager=db,
+        run_inline=True,
+    )
+
+    task = service.submit_operation(operation_type="repair_gaps", market="cn")
+
+    assert task["status"] == "completed"
+    assert task["result"]["repair_result"]["repaired_gap_count"] == 2
+    assert task["result"]["catch_up_result"]["pass_status"] == "passed"
+    assert governance.catch_up_calls == ["cn"]
 
 
 def test_inflight_dedup_keeps_different_operation_scopes_distinct():

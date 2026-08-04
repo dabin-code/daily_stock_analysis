@@ -577,6 +577,221 @@ class Test603032StyleRegression:
         assert result["point3"]["price"] > result["point1"]["price"]
 
 
+def _lower_high_after_true_p2() -> pd.DataFrame:
+    """
+    603980 吉华集团风格：P1 见底后反弹至真实高点（真 P2），随后下跌途中出现
+    一个较低的反弹高点（伪 P2），末根 K 线收盘站上伪 P2 但远未收复真 P2。
+
+    旧逻辑按"最新摆动点优先"选点：伪 P2 被选中 → 收盘 > 伪 P2 → 误报
+    breakout_ready 最佳买点。同时下跌中继段自身（P1'=真P3, P2'=伪P2, P3'=伪P3）
+    也可能被拼成一个"更新"的伪结构抢占选点。
+
+    正确行为：P2 必须是 P1→P3 区间的最高点（真 P2=bar37），P3 必须是
+    P2 之后至 P3 之间的最低点（真 P3=bar44），当前收盘未破真 P2 → watching。
+
+    bar30  P1  = 86.0  (low 85.5)   底部
+    bar37  真P2 = 100.0 (high 100.5) 反弹最高点
+    bar44  真P3 = 88.0  (low 87.5)   回撤最低点
+    bar49  伪P2 = 94.0  (high 94.5)  下跌中继反弹高点（低于真 P2）
+    bar55  伪P3 = 89.0  (low 88.6)   高于真 P3
+    bar56+ 收盘 95→96.5：> 伪P2(94.5)，但 < 真P2(100.5)
+    """
+    n = 60
+    prices = np.zeros(n)
+    prices[:30] = _zigzag_downtrend(130, 92, 30, amplitude=4.0)
+    prices[30] = 86.0
+    prices[31:38] = np.linspace(88, 100, 7)
+    prices[37] = 100.0
+    prices[38:45] = np.linspace(98, 88, 7)
+    prices[44] = 88.0
+    prices[45:50] = np.linspace(89.5, 94, 5)
+    prices[49] = 94.0
+    prices[50:56] = np.linspace(93, 89, 6)
+    prices[55] = 89.0
+    prices[56:] = [95.0, 95.5, 96.0, 96.5]
+
+    highs = prices * 1.005
+    lows = prices * 0.995
+    highs[37] = 100.5
+    lows[30] = 85.5
+    highs[49] = 94.5
+    lows[44] = 87.5
+    lows[55] = 88.6
+
+    return _make_df(prices, highs=highs, lows=lows)
+
+
+class Test603980StyleRegression:
+    """603980 风格：P2/P3 必须取段内极值，不得用较低的中继反弹高点作 P2。"""
+
+    def test_no_false_breakout_on_lower_high_recovery(self):
+        """收盘只站上伪 P2 时不得报 breakout_ready，应为 watching。"""
+        df = _lower_high_after_true_p2()
+        result = Low123TrendlineDetector.detect(df)
+        assert result["found"] is True
+        assert result["state"] == "watching"
+        assert result["breakout_point2_confirmed"] is False
+        assert result["entry_price"] is None
+
+    def test_p2_is_highest_high_between_p1_and_p3(self):
+        """P2 必须是 P1 之后反弹段的最高点（bar37=100.5），而非伪 P2（bar49）。"""
+        df = _lower_high_after_true_p2()
+        result = Low123TrendlineDetector.detect(df)
+        assert result["point2"]["idx"] == 37
+        assert result["point2"]["price"] == pytest.approx(100.5)
+
+    def test_p3_is_lowest_low_after_p2(self):
+        """P3 必须是 P2 之后的回撤最低点（bar44=87.5），而非伪 P3（bar55）。"""
+        df = _lower_high_after_true_p2()
+        result = Low123TrendlineDetector.detect(df)
+        assert result["point3"]["idx"] == 44
+        assert result["point3"]["price"] == pytest.approx(87.5)
+
+    def test_p1_must_be_lowest_low_of_recent_window(self):
+        """下跌中继段不得自立门户：P1'=bar44(87.5) 之前 60 根内存在更低点
+        bar30(85.5)，该伪结构必须被剔除。"""
+        df = _lower_high_after_true_p2()
+        result = Low123TrendlineDetector.detect(df)
+        assert result["point1"]["idx"] == 30
+
+
+def _structure_then_crash_below_p1_then_rerally() -> pd.DataFrame:
+    """
+    000566 海南海药风格：低位123形成后暴跌至远低于 P1，两个月后另一波不相关
+    的反弹重新收复旧 P2 价位。旧结构已破位失效，不应被"复活"为 breakout_ready。
+
+    P1(bar30,86) → P2(bar39,97) → P3(bar44,89) → 崩盘至 70(<P1) → 反弹上破 P2。
+    """
+    n = 90
+    prices = np.zeros(n)
+    prices[:30] = _zigzag_downtrend(130, 90, 30, amplitude=4.0)
+    prices[30] = 86            # P1
+    prices[31:40] = np.linspace(86, 97, 9)
+    prices[39] = 97            # P2
+    prices[40:45] = np.linspace(97, 89, 5)
+    prices[44] = 89            # P3
+    prices[45:48] = [92, 91, 90]          # 小反弹，确认 bar44 为摆动低点
+    prices[48:56] = np.linspace(90, 70, 8)  # 崩盘跌破 P1(86)
+    prices[56:] = np.linspace(70, 100, n - 56)  # 后期不相关反弹上破旧 P2(97)
+
+    highs = prices * 1.005
+    lows = prices * 0.995
+    highs[39] = 97.5
+    lows[30] = 85.5
+    lows[44] = 88.5
+
+    return _make_df(prices, highs=highs, lows=lows)
+
+
+def _long_span_p1_to_p2() -> pd.DataFrame:
+    """
+    600156 华升股份风格：P1 与 P2 相隔约 40 根 K 线（两个多月），属于松散拼凑
+    的伪123结构，应被 P1→P2 跨度上限剔除。
+
+    P1(bar20,86) → 缓慢爬升 41 根 → P2(bar61,97) → P3(bar66,90) → 上破。
+    """
+    n = 90
+    prices = np.zeros(n)
+    prices[:20] = _zigzag_downtrend(120, 90, 20, amplitude=4.0)
+    prices[20] = 86            # P1
+    prices[21:62] = np.linspace(86, 97, 41)
+    prices[61] = 97            # P2（距 P1 达 41 根）
+    prices[62:67] = np.linspace(97, 90, 5)
+    prices[66] = 90            # P3
+    prices[67] = 99            # 上破 P2
+    prices[68:] = np.linspace(99, 101, n - 68)
+
+    highs = prices * 1.005
+    lows = prices * 0.995
+    highs[61] = 97.5
+    lows[20] = 85.5
+    lows[66] = 89.5
+
+    return _make_df(prices, highs=highs, lows=lows)
+
+
+class TestStructureInvalidation:
+    """P3 之后跌破 P1 → 结构破位失效，不得复活为 breakout_ready。"""
+
+    def test_crash_below_p1_is_rejected(self):
+        df = _structure_then_crash_below_p1_then_rerally()
+        result = Low123TrendlineDetector.detect(df)
+        assert result["found"] is False
+        assert result["state"] == "rejected"
+        assert result["rejection_reason"] == "structure_broken_below_p1"
+
+    def test_crash_below_p1_no_entry(self):
+        df = _structure_then_crash_below_p1_then_rerally()
+        result = Low123TrendlineDetector.detect(df)
+        assert result["entry_price"] is None
+        assert result["stop_loss_price"] is None
+
+
+class TestLongSpanRejection:
+    """P1→P2 跨度过大 → 松散结构应被剔除。"""
+
+    def test_long_span_is_rejected(self):
+        df = _long_span_p1_to_p2()
+        result = Low123TrendlineDetector.detect(df)
+        assert result["found"] is False
+        assert result["state"] == "rejected"
+
+    def test_tight_span_still_accepted_when_relaxed(self):
+        """放宽跨度上限后，同一份数据应能重新识别为 breakout_ready。"""
+        df = _long_span_p1_to_p2()
+        result = Low123TrendlineDetector.detect(df, max_p1_p2_bars=60)
+        assert result["found"] is True
+        assert result["state"] == "breakout_ready"
+
+
+def _stale_late_p2_breakout() -> pd.DataFrame:
+    """
+    结构成立后长期在 P2 之下爬升（不破位 P1、跨度也正常），直到很晚才收复 P2。
+    P3→突破间隔远超 max_breakout_gop，应降级为 watching 而非 breakout_ready。
+
+    P1(bar30,86) → P2(bar39,97) → P3(bar44,89) → 缓慢升至 <97 → bar90 才上破 P2。
+    """
+    n = 100
+    prices = np.zeros(n)
+    prices[:30] = _zigzag_downtrend(130, 90, 30, amplitude=4.0)
+    prices[30] = 86            # P1
+    prices[31:40] = np.linspace(86, 97, 9)
+    prices[39] = 97            # P2
+    prices[40:45] = np.linspace(97, 89, 5)
+    prices[44] = 89            # P3
+    prices[45:48] = [91, 90.5, 90]        # 确认 bar44 为摆动低点
+    prices[48:90] = np.linspace(90, 96, 42)  # 长期在 P2(97) 之下单调爬升
+    prices[90] = 98            # 很晚才上破 P2（距 P3 达 46 根）
+    prices[91:] = np.linspace(98, 100, n - 91)
+
+    highs = prices * 1.005
+    lows = prices * 0.995
+    highs[39] = 97.5
+    lows[30] = 85.5
+    lows[44] = 88.5
+
+    return _make_df(prices, highs=highs, lows=lows)
+
+
+class TestStaleBreakoutFreshness:
+    """P2突破距 P3 过久 → 陈旧突破降级，不报最佳买点。"""
+
+    def test_stale_breakout_downgraded_to_watching(self):
+        df = _stale_late_p2_breakout()
+        result = Low123TrendlineDetector.detect(df)
+        assert result["found"] is True
+        assert result["state"] == "watching"
+        assert result["breakout_point2_confirmed"] is False
+        assert result["entry_price"] is None
+
+    def test_relaxed_gap_restores_breakout_ready(self):
+        """放宽突破时效上限后，同一份数据应恢复为 breakout_ready。"""
+        df = _stale_late_p2_breakout()
+        result = Low123TrendlineDetector.detect(df, max_breakout_gap=60)
+        assert result["state"] == "breakout_ready"
+        assert result["breakout_point2_confirmed"] is True
+
+
 class TestDeprecatedCompatibilityParams:
     def test_warns_when_legacy_retrace_params_are_overridden(self):
         df = _deep_retrace_breakout_ready()

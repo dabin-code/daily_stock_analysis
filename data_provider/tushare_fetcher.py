@@ -105,6 +105,8 @@ class TushareFetcher(BaseFetcher):
         self._api: Optional[object] = None  # Tushare API 实例
         self.date_list: Optional[List[str]] = None  # 交易日列表缓存（倒序，最新日期在前）
         self._date_list_end: Optional[str] = None  # 缓存对应的截止日期，用于跨日刷新
+        # 前复权熔断：adj_factor 接口限频/无权限时暂停 qfq 尝试，避免逐股重试拖垮全市场取数
+        self._adj_factor_cooldown_until: float = 0.0
 
         # 尝试初始化 API
         self._init_api()
@@ -415,7 +417,12 @@ class TushareFetcher(BaseFetcher):
                     start_date=ts_start,
                     end_date=ts_end,
                 )
-            
+                # 关键修复：daily() 返回不复权价格，除权除息日会产生价格断层，
+                # 使 MACD / 均线 / 摆动点 / 趋势线 / 背离等技术指标严重失真
+                # （典型误判：除权造成的假暴跌 + 名义价回补被识别为"底背离突破"）。
+                # 此处统一转换为前复权（qfq），与 Efinance/Akshare 数据源口径一致。
+                df = self._apply_qfq_adjustment(df, ts_code, ts_start, ts_end)
+
             return df
             
         except Exception as e:
@@ -428,6 +435,99 @@ class TushareFetcher(BaseFetcher):
             
             raise DataFetchError(f"Tushare 获取数据失败: {e}") from e
     
+    def _apply_qfq_adjustment(
+        self,
+        df: pd.DataFrame,
+        ts_code: str,
+        start_date: str,
+        end_date: str,
+    ) -> pd.DataFrame:
+        """将 Tushare 不复权日线转换为前复权（qfq）价格。
+
+        前复权公式（锚定窗口内最新交易日）::
+
+            qfq_price[t] = raw_price[t] * adj_factor[t] / adj_factor[latest]
+
+        设计要点：
+        - 仅调整价格列（open/high/low/close/pre_close），volume/amount 保持不变，
+          与主流行情软件及 Akshare/Efinance qfq 口径一致。
+        - pct_chg 为 Tushare 已按除权调整的真实涨跌幅，保持不变。
+        - 锚定"窗口内最新交易日"：当 end_date 为近期/今日时等价于常规前复权；
+          回测取历史窗口时则得到该时点的 point-in-time 前复权，避免未来函数。
+        - 若 adj_factor 接口不可用或返回空（如账号权限不足），记录告警并回退为
+          不复权数据，保证取数主流程不中断（数据源降级不应拖垮分析流程）。
+
+        Args:
+            df: Tushare daily() 返回的原始 DataFrame（含 trade_date 及价格列）
+            ts_code: Tushare 格式代码（如 000001.SZ）
+            start_date: 起始日期（YYYYMMDD）
+            end_date: 结束日期（YYYYMMDD）
+
+        Returns:
+            前复权处理后的 DataFrame；无法复权时返回原始不复权 DataFrame。
+        """
+        if df is None or df.empty or 'trade_date' not in df.columns:
+            return df
+
+        # 熔断期内直接跳过 adj_factor（如免费账号 adj_factor 限频 1次/小时），
+        # 回退不复权数据，避免逐股重试造成延迟与日志刷屏。
+        now_ts = time.time()
+        if now_ts < self._adj_factor_cooldown_until:
+            return df
+
+        try:
+            self._check_rate_limit()
+            adj = self._api.adj_factor(
+                ts_code=ts_code,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        except Exception as e:  # noqa: BLE001 - 复权失败必须优雅降级
+            # 限频/无权限类错误：进入 1 小时熔断，期间统一回退不复权
+            msg = str(e)
+            if any(k in msg for k in ('频率', '权限', '积分', '每小时', '每分钟', 'limit', 'permission')):
+                self._adj_factor_cooldown_until = now_ts + 3600
+                logger.warning(
+                    f"Tushare adj_factor 受限（限频/无权限），后续 1 小时回退不复权数据: {e}"
+                )
+            else:
+                logger.warning(
+                    f"Tushare adj_factor 获取失败，{ts_code} 回退为不复权数据: {e}"
+                )
+            return df
+
+        if adj is None or adj.empty or 'adj_factor' not in adj.columns:
+            logger.warning(
+                f"Tushare adj_factor 为空，{ts_code} 回退为不复权数据"
+            )
+            return df
+
+        df = df.copy()
+        adj = adj[['trade_date', 'adj_factor']].copy()
+        adj['adj_factor'] = pd.to_numeric(adj['adj_factor'], errors='coerce')
+        df = df.merge(adj, on='trade_date', how='left')
+        # 个别缺口用相邻因子填充，避免除权因子缺失导致整行被丢弃
+        df['adj_factor'] = df['adj_factor'].ffill().bfill()
+
+        # 锚定窗口内最新交易日（trade_date 为 YYYYMMDD 字符串，按字典序即时间序）
+        latest_factor = df.sort_values('trade_date')['adj_factor'].iloc[-1]
+        if pd.isna(latest_factor) or float(latest_factor) <= 0:
+            logger.warning(
+                f"Tushare adj_factor 锚定值非法，{ts_code} 回退为不复权数据"
+            )
+            return df.drop(columns=['adj_factor'], errors='ignore')
+
+        latest_factor = float(latest_factor)
+        ratio = df['adj_factor'] / latest_factor
+        price_cols = [
+            c for c in ('open', 'high', 'low', 'close', 'pre_close')
+            if c in df.columns
+        ]
+        for col in price_cols:
+            df[col] = (pd.to_numeric(df[col], errors='coerce') * ratio).round(2)
+
+        return df.drop(columns=['adj_factor'], errors='ignore')
+
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         """
         标准化 Tushare 数据

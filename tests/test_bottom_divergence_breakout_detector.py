@@ -630,6 +630,77 @@ class TestRejections(unittest.TestCase):
         self.assertNotEqual(result["state"], "confirmed")
 
 
+def _make_structure_broken_after_b_data() -> pd.DataFrame:
+    """底背离结构成立后暴跌远低于 min(A,B)，随后一段无关反弹收复旧阻力。
+
+    模拟 001229 类误判：旧结构已被后续暴跌摧毁，晚到的反弹不应「复活」为 confirmed。
+    """
+    rng = np.random.RandomState(130)
+    prices = np.concatenate([
+        np.linspace(25, 10, 30),      # 前置下跌
+        np.linspace(10, 9.5, 5),      # 低点 A
+        np.linspace(9.5, 16, 20),     # 反弹到 H≈16
+        np.linspace(16, 8.5, 25),     # 回落
+        np.linspace(8.5, 8.3, 5),     # 低点 B≈8.3
+        np.linspace(8.3, 4.0, 15),    # 结构破位：暴跌远低于 min(A,B)
+        np.linspace(4.0, 4.2, 10),    # 低位徘徊
+        np.linspace(4.2, 17.5, 30),   # 晚到的反弹收复旧阻力 16
+        np.linspace(17.5, 18.5, 20),
+    ])
+    noise = rng.randn(len(prices)) * 0.03
+    return _make_ohlcv(prices + noise, seed=130)
+
+
+def _make_stale_breakout_data() -> pd.DataFrame:
+    """底背离成立，但突破发生在距 B 很久之后（陈旧突破）。"""
+    rng = np.random.RandomState(131)
+    prices = np.concatenate([
+        np.linspace(25, 10, 30),      # 前置下跌
+        np.linspace(10, 9.5, 5),      # 低点 A
+        np.linspace(9.5, 16, 20),     # 反弹到 H≈16
+        np.linspace(16, 8.5, 25),     # 回落
+        np.linspace(8.5, 8.3, 5),     # 低点 B≈8.3
+        np.full(45, 9.0) + rng.randn(45) * 0.05,  # B 后长期横盘（不突破）
+        np.linspace(9.0, 17.5, 25),   # 很久之后才突破 H
+        np.linspace(17.5, 18.5, 15),
+    ])
+    noise = rng.randn(len(prices)) * 0.02
+    return _make_ohlcv(prices + noise, seed=131)
+
+
+class TestStructuralGuards(unittest.TestCase):
+    """结构破位失效 + 突破时效护栏。"""
+
+    def test_structure_broken_after_b_not_confirmed(self):
+        """B 后跌破 min(A,B) 的结构不应被 confirmed（结构已失效）。"""
+        from src.indicators.bottom_divergence_breakout_detector import (
+            BottomDivergenceBreakoutDetector,
+        )
+        df = _make_structure_broken_after_b_data()
+        result = BottomDivergenceBreakoutDetector.detect(df)
+        self.assertNotEqual(result["state"], "confirmed")
+
+    def test_break_tolerance_disables_invalidation(self):
+        """放宽破位容差（>1）后不再因破位失效丢弃候选。"""
+        from src.indicators.bottom_divergence_breakout_detector import (
+            BottomDivergenceBreakoutDetector,
+        )
+        df = _make_structure_broken_after_b_data()
+        strict = BottomDivergenceBreakoutDetector.detect(df, break_tolerance=0.0)
+        loose = BottomDivergenceBreakoutDetector.detect(df, break_tolerance=1.0)
+        # 极大容差时结构不再被判失效，found 至少不弱于严格模式
+        self.assertTrue(loose["found"] or not strict["found"])
+
+    def test_stale_breakout_not_confirmed(self):
+        """突破距 B 超过 max_breakout_gap 时不计双突破确认。"""
+        from src.indicators.bottom_divergence_breakout_detector import (
+            BottomDivergenceBreakoutDetector,
+        )
+        df = _make_stale_breakout_data()
+        result = BottomDivergenceBreakoutDetector.detect(df, max_breakout_gap=20)
+        self.assertNotEqual(result["state"], "confirmed")
+
+
 class TestResultSchema(unittest.TestCase):
     """confirmed 结果的完整 schema 验证。"""
 

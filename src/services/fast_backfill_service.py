@@ -203,10 +203,16 @@ class FastBackfillService:
         return rows_saved
 
     def _run_target_governance(self, target_trade_date: date, market: str) -> Dict[str, Any]:
-        result = self.governance_service.run_daily_governance(
-            trade_date=target_trade_date,
-            market=market,
-        )
+        # 优先逐日补跑治理：把审计通过日从最近通过日推进到目标日，避免中间被跳过的
+        # 交易日停牌缺口长期滞留窗口内、使目标日始终 not_passed 而无法选股。
+        catch_up = getattr(self.governance_service, "run_daily_governance_with_catch_up", None)
+        if callable(catch_up):
+            result = catch_up(trade_date=target_trade_date, market=market)
+        else:
+            result = self.governance_service.run_daily_governance(
+                trade_date=target_trade_date,
+                market=market,
+            )
         return {
             "trade_date": result.get("trade_date").isoformat()
             if hasattr(result.get("trade_date"), "isoformat")

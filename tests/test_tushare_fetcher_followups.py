@@ -79,6 +79,96 @@ class TestTushareFetcherFollowUps(unittest.TestCase):
         self.assertEqual(bottom, [{"name": "消费", "change_pct": -0.6}])
         self.assertEqual(rate_limit_mock.call_count, 2)
 
+    def _make_daily_df(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "ts_code": ["001229.SZ", "001229.SZ"],
+                "trade_date": ["20260109", "20260108"],
+                "open": [11.0, 10.0],
+                "high": [12.0, 10.5],
+                "low": [10.5, 9.5],
+                "close": [11.0, 10.0],
+                "pre_close": [10.0, 9.8],
+                "pct_chg": [10.0, 2.0],
+                "vol": [100.0, 80.0],
+                "amount": [1100.0, 800.0],
+            }
+        )
+
+    def test_apply_qfq_adjustment_scales_prices_and_keeps_volume(self) -> None:
+        fetcher = self._make_fetcher()
+        fetcher._api.adj_factor.return_value = pd.DataFrame(
+            {
+                "ts_code": ["001229.SZ", "001229.SZ"],
+                "trade_date": ["20260109", "20260108"],
+                "adj_factor": [2.0, 1.0],
+            }
+        )
+
+        with patch.object(fetcher, "_check_rate_limit"):
+            out = fetcher._apply_qfq_adjustment(
+                self._make_daily_df(), "001229.SZ", "20260108", "20260109"
+            )
+
+        out = out.set_index("trade_date")
+        # 锚定最新日 20260109 (factor=2.0)：20260108 行按 1.0/2.0=0.5 缩放
+        self.assertAlmostEqual(out.loc["20260108", "close"], 5.0)
+        self.assertAlmostEqual(out.loc["20260108", "open"], 5.0)
+        self.assertAlmostEqual(out.loc["20260108", "high"], 5.25)
+        self.assertAlmostEqual(out.loc["20260108", "low"], 4.75)
+        # 最新日 factor 比值=1.0，价格不变
+        self.assertAlmostEqual(out.loc["20260109", "close"], 11.0)
+        # volume / pct_chg 保持原值
+        self.assertAlmostEqual(out.loc["20260108", "vol"], 80.0)
+        self.assertAlmostEqual(out.loc["20260108", "pct_chg"], 2.0)
+        # 不残留辅助列
+        self.assertNotIn("adj_factor", out.columns)
+
+    def test_apply_qfq_adjustment_falls_back_when_adj_factor_empty(self) -> None:
+        fetcher = self._make_fetcher()
+        fetcher._api.adj_factor.return_value = pd.DataFrame()
+
+        with patch.object(fetcher, "_check_rate_limit"):
+            out = fetcher._apply_qfq_adjustment(
+                self._make_daily_df(), "001229.SZ", "20260108", "20260109"
+            )
+
+        # adj_factor 为空时回退为不复权原始数据
+        row = out.set_index("trade_date").loc["20260108"]
+        self.assertAlmostEqual(row["close"], 10.0)
+
+    def test_apply_qfq_adjustment_falls_back_when_adj_factor_raises(self) -> None:
+        fetcher = self._make_fetcher()
+        fetcher._api.adj_factor.side_effect = RuntimeError("no permission")
+
+        with patch.object(fetcher, "_check_rate_limit"):
+            out = fetcher._apply_qfq_adjustment(
+                self._make_daily_df(), "001229.SZ", "20260108", "20260109"
+            )
+
+        row = out.set_index("trade_date").loc["20260108"]
+        self.assertAlmostEqual(row["close"], 10.0)
+
+    def test_apply_qfq_adjustment_trips_cooldown_on_rate_limit(self) -> None:
+        fetcher = self._make_fetcher()
+        fetcher._api.adj_factor.side_effect = RuntimeError("抱歉，您每小时最多访问该接口 1 次（频率超限）")
+
+        with patch.object(fetcher, "_check_rate_limit"):
+            first = fetcher._apply_qfq_adjustment(
+                self._make_daily_df(), "001229.SZ", "20260108", "20260109"
+            )
+            # 首次限频错误应触发熔断
+            self.assertGreater(fetcher._adj_factor_cooldown_until, 0.0)
+            # 熔断期内再次调用应直接跳过 adj_factor（不再新增调用）
+            second = fetcher._apply_qfq_adjustment(
+                self._make_daily_df(), "001229.SZ", "20260108", "20260109"
+            )
+
+        self.assertEqual(fetcher._api.adj_factor.call_count, 1)
+        # 两次均回退为不复权原始数据
+        self.assertAlmostEqual(first.set_index("trade_date").loc["20260108", "close"], 10.0)
+        self.assertAlmostEqual(second.set_index("trade_date").loc["20260108", "close"], 10.0)
+
     def test_get_chip_distribution_rate_limits_all_tushare_calls(self) -> None:
         fetcher = self._make_fetcher()
         fetcher._api.trade_cal.return_value = pd.DataFrame(

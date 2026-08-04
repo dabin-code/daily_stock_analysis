@@ -49,6 +49,8 @@ _CONTEXT_WINDOW = 50        # 上下文门控回溯窗口
 _MIN_DECLINE_PCT = 0.15     # A 前上下文内需有 ≥15% 跌幅（过滤横盘震荡）
 _LOW_POSITION_PCT = 0.30    # A 须在近60 bar 价格区间最低30%分位
 _MIN_DIF_NEGATIVE_RATIO = 0.005  # DIF 须低于 -price*0.5%（过滤零轴噪音）
+_MAX_BREAKOUT_GAP = 30      # 双突破距 B 的最大间隔 bars：超过视为陈旧突破，不计双突破确认
+_BREAK_TOLERANCE = 0.0      # 破位容差比例（0~1）：B 后最低价跌破 min(A,B)*(1-tol) 视为结构失效
 
 # ---------------------------------------------------------------------------
 # 六种有效形态定义
@@ -267,11 +269,13 @@ def _fit_downtrend_line(
     b_idx: int,
     swing_order: int = _SWING_ORDER,
     tolerance_pct: float = _TRENDLINE_TOLERANCE,
+    max_breakout_gap: int = _MAX_BREAKOUT_GAP,
 ) -> Dict[str, Any]:
     """
     拟合与 A/B 结构相关的下降趋势线。
 
     使用 [A-20, B+10] 范围内的 swing highs，要求斜率为负、至少 2 个触点。
+    突破搜索窗口限制在 B 之后 ``max_breakout_gap`` 根内，超出视为陈旧突破。
     """
     empty = {
         "found": False,
@@ -318,9 +322,10 @@ def _fit_downtrend_line(
         return empty
 
     # 寻找突破点: B 之后第一个 close > trendline 投影值的 bar
+    # 突破时效：仅在 B 之后 max_breakout_gap 根内搜索，超出视为陈旧突破。
     breakout_bar = None
     projected_at_breakout = None
-    search_after_b = min(len(close), b_idx + 50)
+    search_after_b = min(len(close), b_idx + 1 + max_breakout_gap)
     for i in range(b_idx + 1, search_after_b):
         proj = _line_value(slope, intercept, i)
         if float(close.iloc[i]) > proj:
@@ -369,6 +374,8 @@ class BottomDivergenceBreakoutDetector:
         min_decline_pct: float = _MIN_DECLINE_PCT,
         low_position_pct: float = _LOW_POSITION_PCT,
         min_dif_negative_ratio: float = _MIN_DIF_NEGATIVE_RATIO,
+        max_breakout_gap: int = _MAX_BREAKOUT_GAP,
+        break_tolerance: float = _BREAK_TOLERANCE,
     ) -> Dict[str, Any]:
         """
         主检测入口。
@@ -446,6 +453,8 @@ class BottomDivergenceBreakoutDetector:
                 min_decline_pct=min_decline_pct,
                 low_position_pct=low_position_pct,
                 min_dif_negative_ratio=min_dif_negative_ratio,
+                max_breakout_gap=max_breakout_gap,
+                break_tolerance=break_tolerance,
             )
             if result is None:
                 continue
@@ -457,7 +466,13 @@ class BottomDivergenceBreakoutDetector:
                 "structure_ready": 30,
                 "divergence_only": 20,
             }
-            effective = score + state_priority.get(result["state"], 0)
+            # 新鲜度加权：同状态下更靠近当前 K 线的结构优先，避免陈旧结构
+            # 因偶然突破旧阻力而压过更贴近当前走势的新结构。
+            # 权重 < 1，小于任意两个 state_priority 档位差（最小差 10），
+            # 因此仅在同状态内起决定作用，不会跨状态误升级。
+            b_idx = cand["b_idx"]
+            recency_bonus = 0.9 * (b_idx / max(1, n - 1))
+            effective = score + recency_bonus + state_priority.get(result["state"], 0)
             if effective > best_score:
                 best_score = effective
                 best_result = result
@@ -555,6 +570,8 @@ class BottomDivergenceBreakoutDetector:
         min_decline_pct: float,
         low_position_pct: float,
         min_dif_negative_ratio: float,
+        max_breakout_gap: int = _MAX_BREAKOUT_GAP,
+        break_tolerance: float = _BREAK_TOLERANCE,
     ) -> Optional[Dict[str, Any]]:
         """评估单个 A/B 候选，返回完整结果或 None。"""
         a_idx = cand["a_idx"]
@@ -564,6 +581,18 @@ class BottomDivergenceBreakoutDetector:
         h_idx = cand["h_idx"]
         h_price = cand["h_price"]
         n = len(close)
+
+        # --- 结构破位失效护栏 ---
+        # 底背离结构的最低支撑是 min(A, B)。若 B 之后价格再创新低、
+        # 跌破该支撑（容差 break_tolerance），则该结构已被后续下跌摧毁，
+        # 即使更晚出现一段无关反弹重新收复旧阻力，也不能算本结构的有效突破。
+        # 典型误判：结构成立后暴跌至远低于 B，数月后另一波反弹收复旧阻力位，
+        # 旧结构被错误「复活」为 confirmed。
+        if b_idx < n - 1:
+            structure_floor = min(a_price, b_price) * (1.0 - break_tolerance)
+            post_b_low = float(low_col.iloc[b_idx + 1:].min())
+            if post_b_low < structure_floor:
+                return None
 
         # --- 计算前置跌幅（用于过滤 + 命中原因） ---
         ctx_start = max(0, a_idx - context_window)
@@ -668,11 +697,15 @@ class BottomDivergenceBreakoutDetector:
         }
 
         # --- 双突破检查 ---
+        # 突破时效护栏：双突破须在 B 之后 max_breakout_gap 根内完成，
+        # 否则视为陈旧突破（结构成立后长期未突破、很晚才收复阻力），
+        # 不计为有效突破，避免被误报为最佳买点。
+        breakout_search_end = min(n, b_idx + 1 + max_breakout_gap)
+
         # 1. 水平阻力线突破
         horizontal_resistance = h_price
         h_breakout_bar = None
-        search_end = min(n, b_idx + 50)
-        for i in range(b_idx + 1, search_end):
+        for i in range(b_idx + 1, breakout_search_end):
             if float(close.iloc[i]) > horizontal_resistance:
                 h_breakout_bar = i
                 break
@@ -683,6 +716,7 @@ class BottomDivergenceBreakoutDetector:
             df, a_idx, b_idx,
             swing_order=swing_order,
             tolerance_pct=trendline_tolerance,
+            max_breakout_gap=max_breakout_gap,
         )
         tl_breakout_confirmed = dtl["breakout_confirmed"]
         tl_breakout_bar = dtl.get("breakout_bar_index")

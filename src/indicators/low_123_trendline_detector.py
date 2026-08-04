@@ -8,7 +8,7 @@
 设计文档：docs/superpowers/specs/2026-03-24-low-123-trendline-design.md
 
 输出状态说明：
-  rejected       — 前置条件不满足（无先行下跌 / 非低位）
+  rejected       — 前置条件不满足（无先行下跌 / 非低位 / P3后破位跌破P1）
   structure_only — 123结构已形成，但最新收盘价仍未站上 P3
   watching       — 123结构已形成，且最新收盘价 > P3 但尚未突破 P2
   breakout_ready — 最新收盘价已突破 P2，次日重点观察买入
@@ -33,6 +33,9 @@ _LOOKBACK = 80                 # 候选搜索的最大回溯根数
 _LOW_POS_WINDOW = 60           # 判断"低位"时使用的观察窗口
 _LOW_POS_RANK = 0.30           # P1 须处于窗口价格区间最低 30% 分位以内
 _MIN_BOUNCE_PCT = 0.025        # P1→P2 最小反弹幅度（2.5%）
+_MAX_P1_P2_BARS = 30           # P1→P2 最大跨度（根数）：超过则视为松散结构，非同一轮低位123
+_MAX_P3_TO_BREAKOUT_BARS = 20  # P2突破距 P3 的最大间隔（根数）：超过则视为陈旧突破，不计为有效买点
+_BREAK_TOLERANCE = 0.0         # 破位容差比例：P3后最低价跌破 P1*(1-tol) 才算破位，默认严格跌破
 # 历史兼容参数：低位123不再以 P2→P3 回撤深度作为硬门槛，
 # 仅保留 P3 > P1 的结构要求。detect() 仍保留这两个参数以兼容旧调用。
 _MAX_RETRACE_PCT = 0.85
@@ -197,6 +200,35 @@ def _fit_structure_trendline(
     }
 
 
+def _is_structure_broken_after_p3(
+    df: pd.DataFrame,
+    p1_val: float,
+    p3_idx: int,
+    last_idx: int,
+    break_tolerance: float = 0.0,
+) -> bool:
+    """
+    判断结构是否在 P3 之后已破位失效。
+
+    低位123一旦形成，P1 是整个结构的最低支撑。若 P3 之后价格再创新低、
+    最低价跌破 P1（容差 break_tolerance），则该结构已被后续下跌摧毁，即使
+    更晚出现一段与之无关的反弹重新站上 P2，也不能算作本结构的有效突破。
+
+    典型误判：3-4 月形成的123，随后暴跌至远低于 P1，两个月后另一波反弹
+    收复旧 P2 价位，旧结构被错误"复活"为 breakout_ready。
+
+    break_tolerance：破位容差比例（0~1）。最低价须跌破 P1*(1-tolerance)
+    才算破位，默认 0 表示严格跌破 P1 即失效。
+    """
+    if p3_idx >= last_idx:
+        return False
+    low_col = df["low"] if "low" in df.columns else df["close"]
+    seg = low_col.iloc[p3_idx + 1: last_idx + 1]
+    if len(seg) == 0:
+        return False
+    return float(seg.min()) < p1_val * (1.0 - break_tolerance)
+
+
 def _find_breakout_bar(
     close: pd.Series,
     threshold: float,
@@ -216,6 +248,7 @@ def _generate_candidates(
     min_bounce_pct: float,
     max_retrace_pct: float,
     min_retrace_pct: float,
+    max_p1_p2_bars: int = _MAX_P1_P2_BARS,
 ) -> List[Dict[str, Any]]:
     """
     在回溯窗口内生成所有满足条件的 P1/P2/P3 候选三元组。
@@ -226,6 +259,17 @@ def _generate_candidates(
     关键逻辑：对每个 P1，从最新 P2 候选开始遍历，只有在找到合法 P3 后
     才锁定该 P2。这样可避免末端的突破高点"抢占" P2 槽位，导致真正的
     反弹高点被跳过。
+
+    段内极值约束（603980 风格误判的修复核心）——摆动点必须同时是所在
+    区段的极值，不能仅凭"最新"入选：
+      - P2 必须是 (P1, P2] 段的最高价：若 P1→P2 之间存在更高的高点，
+        说明该 P2 只是真实反弹高点之后的下跌中继反弹，不能作为 P2；
+      - (P1, P2) 段内最低价不得跌破 P1：否则 P1 不是本轮结构的真实底部；
+      - P3 必须是 (P2, P3] 段的最低价：若 P2→P3 之间存在更低的低点，
+        真正的回撤低点在别处，当前摆动低点不是 P3。
+
+    结构紧凑性：P1→P2 跨度超过 ``max_p1_p2_bars`` 的高点会被跳过，
+    避免把相隔数月的摆动低点与摆动高点硬凑成同一轮低位123。
     """
     last_idx = len(df) - 1
     cutoff = max(0, last_idx - lookback + 1)
@@ -245,11 +289,22 @@ def _generate_candidates(
         for h in reversed(highs):
             if h <= p1_idx:
                 break  # 后续高点均在 P1 之前，终止
+            if h - p1_idx > max_p1_p2_bars:
+                continue  # P1→P2 跨度过大，非同一轮结构，跳过该高点
             p2_val = float(high_col.iloc[h])
             if p2_val <= p1_val:
                 continue
             bounce_pct = (p2_val - p1_val) / p1_val
             if bounce_pct < min_bounce_pct:
+                continue
+
+            interior = slice(p1_idx + 1, h)
+            # P2 必须是 P1→P2 段的最高点：中途存在更高高点时，
+            # 该 P2 只是下跌中继的反弹高点，跳过。
+            if h - p1_idx > 1 and float(high_col.iloc[interior].max()) > p2_val:
+                continue
+            # P1→P2 段内不得跌破 P1：否则 P1 不是本轮结构的真实底部。
+            if h - p1_idx > 1 and float(low_col.iloc[interior].min()) < p1_val:
                 continue
 
             # 寻找该 P2 候选之后最新的合法 P3
@@ -259,6 +314,10 @@ def _generate_candidates(
                     break  # 该 P2 之后无低点，尝试下一个 P2
                 p3_val = float(low_col.iloc[l])
                 if p3_val <= p1_val:
+                    continue
+                # P3 必须是 P2→P3 段的最低点：中途存在更低的回撤低点时，
+                # 当前摆动低点不是真正的 P3，跳过。
+                if p3_val > float(low_col.iloc[h + 1: l + 1].min()):
                     continue
                 candidates.append({
                     "p1_idx": p1_idx, "p1_val": p1_val,
@@ -364,6 +423,9 @@ class Low123TrendlineDetector:
         max_retrace_pct: float = _MAX_RETRACE_PCT,
         min_retrace_pct: float = _MIN_RETRACE_PCT,
         sync_window: int = _SYNC_WINDOW,
+        max_p1_p2_bars: int = _MAX_P1_P2_BARS,
+        max_breakout_gap: int = _MAX_P3_TO_BREAKOUT_BARS,
+        break_tolerance: float = _BREAK_TOLERANCE,
     ) -> Dict[str, Any]:
         """
         识别最近一组有效的"低位123 + 趋势线"结构。
@@ -377,6 +439,11 @@ class Low123TrendlineDetector:
             max_retrace_pct: 兼容旧调用，当前不参与结构合法性过滤。
             min_retrace_pct: 兼容旧调用，当前不参与结构合法性过滤。
             sync_window: P2 突破与趋势线突破的同步容忍窗口（根数）。
+            max_p1_p2_bars: P1→P2 最大跨度（根数），超过视为松散结构而剔除。
+            max_breakout_gap: P2突破距 P3 的最大间隔（根数），超过视为陈旧突破，
+                不计为有效买点（结构降级为 watching/structure_only）。
+            break_tolerance: 破位容差比例（0~1），P3后最低价跌破 P1*(1-tol) 才算
+                破位失效，默认 0 表示严格跌破 P1 即失效。
 
         返回：
             符合设计文档 §5.6 的结构化字典。
@@ -402,10 +469,12 @@ class Low123TrendlineDetector:
 
         close = df["close"]
         last_idx = len(df) - 1
+        low_col = df["low"] if "low" in df.columns else close
 
         # 第一步：生成所有 P1/P2/P3 候选三元组
         candidates = _generate_candidates(
             df, lookback, min_bounce_pct, max_retrace_pct, min_retrace_pct,
+            max_p1_p2_bars,
         )
         if not candidates:
             return _rejected("no_123_structure")
@@ -423,20 +492,40 @@ class Low123TrendlineDetector:
                 cand["reject_reason"] = "not_low_level_position"
                 continue
 
+            # P1 必须是近期窗口内的最低点：若 P1 之前不远处存在更低的低价，
+            # 真正的底部在别处，当前结构只是下跌中继段拼出的伪123。
+            win_start = max(0, p1_idx - low_pos_window)
+            if p1_idx > win_start and float(
+                low_col.iloc[win_start: p1_idx].min()
+            ) < cand["p1_val"]:
+                cand["reject_reason"] = "p1_not_lowest_low"
+                continue
+
+            # 破位失效：P3 之后最低价跌破 P1，结构已被后续下跌摧毁。
+            if _is_structure_broken_after_p3(
+                df, cand["p1_val"], cand["p3_idx"], last_idx, break_tolerance,
+            ):
+                cand["reject_reason"] = "structure_broken_below_p1"
+                continue
+
             cand["reject_reason"] = None
             valid_candidates.append(cand)
 
         # 所有候选均未通过时，返回最具信息量的拒绝原因
         if not valid_candidates:
             all_reasons = [c.get("reject_reason") for c in reversed(candidates)]
+            if any(r == "structure_broken_below_p1" for r in all_reasons):
+                return _rejected("structure_broken_below_p1")
             if any(r == "not_low_level_position" for r in all_reasons):
                 return _rejected("not_low_level_position")
+            if any(r == "p1_not_lowest_low" for r in all_reasons):
+                return _rejected("p1_not_lowest_low")
             return _rejected("no_prior_downtrend")
 
         # 第三步：只评估最近一组有效候选。
         latest_candidate = valid_candidates[0]
         return cls._evaluate_candidate(
-            df, close, last_idx, latest_candidate, sync_window,
+            df, close, last_idx, latest_candidate, sync_window, max_breakout_gap,
         )
 
     # -----------------------------------------------------------------------
@@ -448,6 +537,7 @@ class Low123TrendlineDetector:
         last_idx: int,
         cand: Dict[str, Any],
         sync_window: int,
+        max_breakout_gap: int = _MAX_P3_TO_BREAKOUT_BARS,
     ) -> Dict[str, Any]:
         """对单个候选三元组进行趋势线拟合、突破检测和状态判定。"""
         p1_idx, p1_val = cand["p1_idx"], cand["p1_val"]
@@ -467,6 +557,12 @@ class Low123TrendlineDetector:
         # 检测 P2 突破
         bo_p2_bar = _find_breakout_bar(close, p2_val, p3_idx, last_idx)
         bo_p2 = bo_p2_bar is not None
+
+        # 突破时效：距 P3 过久的突破视为陈旧结构，不计为有效 P2 突破。
+        # 这可避免"结构成立后长期未突破，很晚才收复 P2"被误报为最佳买点。
+        if bo_p2_bar is not None and (bo_p2_bar - p3_idx) > max_breakout_gap:
+            bo_p2 = False
+            bo_p2_bar = None
 
         # 检测趋势线突破（P3 之后第一根收盘 > 趋势线投影值的 K 线）
         bo_tl = False

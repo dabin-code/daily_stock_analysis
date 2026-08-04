@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 低位123检测改为段内极值选点（修复下跌中继反弹高点被误判为 P2）
+
+- Fixed `Low123TrendlineDetector` 用"最新摆动点优先"的方式挑选 P1/P2/P3，导致把真实反弹高点之后的**下跌中继反弹高点误选为 P2** 的问题。典型误判：603980 于 2026-07-28 收盘 6.50 站上伪 P2（07-17 反弹高点 6.40）即被报为 `breakout_ready` 最佳买点，而真实结构的 P2（06-24 高点 7.02）远未突破；此前多轮外围补丁（跨度上限、突破时效、破位失效）均未触及该选点根因。
+- Changed 候选生成新增三条**段内极值约束**：①P2 必须是 P1→P2 段的最高价（中途存在更高高点则该 P2 只是中继反弹）；②P1→P2 段内最低价不得跌破 P1（否则 P1 不是本轮底部）；③P3 必须是 P2→P3 段的最低价（中途存在更低回撤低点则当前摆动低点不是 P3）。
+- Added P1 阶段新低校验：P1 之前 `low_pos_window`（默认 60 根）内存在更低低价时判为伪结构并剔除（新增拒绝原因 `p1_not_lowest_low`），防止下跌中继段自立门户拼出"更新"的伪123抢占选点。
+- 修复后 603980 识别为 P1=06-12(5.30) → P2=06-24(7.02) → P3=07-09(5.71)，状态 `watching`（未破真 P2），不再误报买点。无新增配置项，现有 `LOW123_*` 配置继续生效。
+
+### 底背离双突破检测新增结构护栏（修复陈旧 / 已失效结构被误判为最佳买点）
+
+- Fixed `BottomDivergenceBreakoutDetector` 把早已作废或陈旧的底背离结构误判为 `confirmed`（最佳买点）的问题。根因：检测器只在 A 点之前做前置校验，从不检查 B 点之后的走势；双突破搜索窗口固定为 `b_idx+50` 无有效时效约束；候选排序仅按 `state_priority` + 强度，使「陈旧但已 confirmed」的老结构压过更贴近当前走势的新结构。典型误判：001229 于 2026-06-09 除权后（叠加不复权数据断层）旧结构被「复活」为 confirmed。
+- Added 结构破位失效护栏：B 之后最低价跌破 `min(A,B)*(1-BOTTOM_DIVERGENCE_BREAK_TOLERANCE)` 时，该候选判为结构失效并剔除（与 `Low123TrendlineDetector` 的 `structure_broken_below_p1` 同源思路）。
+- Added 突破时效护栏：水平阻力线 / 下降趋势线的双突破须在 B 之后 `BOTTOM_DIVERGENCE_MAX_BREAKOUT_GAP`（默认 30 根）内完成，超出视为陈旧突破，不计双突破确认，避免「结构成立后长期未突破、很晚才收复阻力」被误报为买点。
+- Changed 候选排序引入新鲜度加权（权重 < 1，仅在同状态内决定优先级，不跨状态误升级），同强度 / 同状态下更贴近当前 K 线的结构优先。
+- New `BOTTOM_DIVERGENCE_MAX_BREAKOUT_GAP`（默认 30）/ `BOTTOM_DIVERGENCE_BREAK_TOLERANCE`（默认 0）env / config keys，可通过 `.env` 调整；`src/services/factor_service.py` 与 `src/strategies/entry_strategies.py` 的检测调用统一读取该配置。
+
+### Tushare 日线统一前复权（修复除权除息导致的技术形态误判）
+
+- Fixed `TushareFetcher` 返回**不复权**日线价格，导致含除权除息事件的个股技术指标严重失真的问题。根因：`daily()` 接口返回不复权价，除权日会在价格序列中制造巨大「假断层」，污染 MACD / 均线 / 摆动点 / 趋势线 / 背离等所有基于价格的形态识别；且当配置 `TUSHARE_TOKEN` 时 Tushare 为最高优先级数据源，与 `EfinanceFetcher`（`fqt=1`）/`AkshareFetcher`（`adjust="qfq"`）的前复权口径不一致。典型误判：001229 于 2026-06-09 除权（`pct_chg=+3.41%` 但不复权名义价从 37.66「跌」到 27.60），除权后名义价自然回补被 `BottomDivergenceBreakoutDetector` 识别为「底背离双突破 confirmed」；修复后该假断层消失，状态降为 `late_or_weak`，不再命中。
+- Added `TushareFetcher._apply_qfq_adjustment`：普通股票 `daily()` 取数后追加一次 `adj_factor()`，按「锚定窗口内最新交易日」的前复权公式 `qfq = raw * adj_factor / adj_factor[latest]` 转换 open/high/low/close/pre_close；volume/amount/pct_chg 保持原值，与主流行情软件及其它数据源口径一致。回测取历史窗口时得到 point-in-time 前复权，避免未来函数。
+- adj_factor 接口不可用或返回空（如账号权限不足）时记录告警并**优雅回退**为不复权数据，保证取数主流程不中断；ETF（`fund_daily`）路径不变。
+- 针对免费 Tushare 账号 `adj_factor` 接口限频（1 次/小时）场景，新增**熔断冷却**：命中限频 / 无权限类错误后暂停 qfq 尝试 1 小时并统一回退不复权，避免全市场逐股重试造成延迟与日志刷屏（限频账号下等价于不复权，但叠加底背离 / 低位123 的结构护栏仍可拦截除权断层类误判）。
+- 注意：该改动使 Tushare 数据源的日线价格口径由不复权切换为前复权，会影响基于 Tushare 的回测基准与报告展示价格；若持久化的 K 线库中混有历史不复权 Tushare 数据，建议评估是否需要重建缓存以统一口径。
+
+### Low-123 detector structural guards (fixes stale / loose structures mis-flagged as best entry)
+
+- Fixed `Low123TrendlineDetector` 把早已作废的低位 123 结构误判为 `breakout_ready`（最佳买点）的问题。根因：检测器只在 P1 之前做前置校验，从不检查 P3 之后的走势，且 P2 突破窗口无时效上限、P1→P2 跨度无约束。典型误判：某结构在 P3 后暴跌至远低于 P1，两个月后一段不相关的反弹重新收复旧 P2 价位，旧结构被错误「复活」为最佳买点。
+- Added 三道结构护栏：①破位失效——P3 之后最低价跌破 P1（容差 `LOW123_BREAK_TOLERANCE`）时判为 `rejected`（`structure_broken_below_p1`）；②P1→P2 跨度上限（`LOW123_MAX_P1_P2_BARS`，默认 30 根）剔除相隔过久的松散伪结构；③P2 突破距 P3 的时效上限（`LOW123_MAX_BREAKOUT_GAP`，默认 20 根），超过则视为陈旧突破，结构降级为 `watching`/`structure_only` 而非买点。
+- New `LOW123_MAX_P1_P2_BARS` / `LOW123_MAX_BREAKOUT_GAP` / `LOW123_BREAK_TOLERANCE` env / config keys（默认 30 / 20 / 0），可通过 `.env` 调整，无需改代码或重建镜像；`src/services/factor_service.py` 与 `src/strategies/entry_strategies.py` 的检测调用统一读取该配置。
+
+### Data health backfill / gap repair now advances the audit pass date (fixes screening blocked after repair)
+
+- Fixed 数据健康「回填到目标日 / 修复缺口 / 重试失败股票」修完缺口后最新交易日仍 `not_passed`、选股拿不到可用交易日的问题。根因：单日治理的 auto-skip 只能豁免「当日」停牌/无源缺口，一旦某些交易日的日常治理被跳过（例如程序未在那些交易日运行），这些日期的停牌缺口会长期滞留在最新交易日的审计窗口内，使最新交易日始终无法通过审计。
+- Added `KlineGovernanceScheduleService.run_daily_governance_with_catch_up`：从最近一次审计通过日起，按交易日顺序逐日补跑 `run_daily_governance`（sync → audit → repair → auto-skip → re-audit），让每个被跳过的交易日各自获得当日证据并被正确豁免，从而把审计通过日推进到目标日。
+- `FastBackfillService`（数据健康「回填到目标日」）改为优先走逐日补跑治理；`DataHealthTaskService` 的 `repair_gaps` / `retry_failed` 操作在修复缺口后追加一次逐日补跑治理以推进通过日（补跑失败不影响已完成的修复结果）。
+- 新增配置 `KLINE_GOVERNANCE_MAX_CATCH_UP_SESSIONS`（默认 `30`）控制逐日补跑最多向前补齐的交易日数量，避免通过日缺失/相距过远时回溯过多导致大量全市场同步。
+- `repair_gaps` / `retry_failed` 后台任务结果结构调整为 `{"repair_result"/"sync_result": ..., "catch_up_result": ...}`。
+
 ### Hot-theme screening universe locking
 
 - `POST /api/v1/screening/openclaw-theme-run` now locks the screening universe to the constituents of the boards resolved from the incoming `themes`, instead of scanning the whole market. The passed-in theme/board directly determines the candidate pool.

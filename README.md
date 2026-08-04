@@ -99,12 +99,14 @@ python main.py --no-run-immediately
 - 深度审计任务是独立 job，用于长窗口复核历史缺口与 `candidate_skip` 恢复情况，不会替代日常治理
 - 智能选股页提供 `回填至该日` 操作，可按所选交易日快速批量回填本地全市场日线数据，并在完成后触发目标日治理审计
 - Web 新增“数据健康”控制台，可查看本地股票池口径、K 线覆盖起止日期、日期覆盖率、审计通过日、K 线缺口和后台治理任务，并通过 `/api/v1/data-health/*` 提交回填、重试、修复、重新审计等操作
+- 「回填到目标日 / 修复缺口 / 重试失败股票」会从最近一次审计通过日起逐日补跑治理（sync → audit → repair → auto-skip → re-audit），让被跳过交易日的停牌缺口各自获得当日豁免证据，从而把审计通过日推进到目标日、恢复选股；逐日补跑上限由 `KLINE_GOVERNANCE_MAX_CATCH_UP_SESSIONS`（默认 `30`）控制
 
 推荐环境变量：
 
 - `KLINE_GOVERNANCE_ENABLED=true`
 - `KLINE_GOVERNANCE_SCHEDULE_TIME=17:00`
 - `KLINE_GOVERNANCE_RUN_IMMEDIATELY=false`
+- `KLINE_GOVERNANCE_MAX_CATCH_UP_SESSIONS=30`
 - `KLINE_AUDIT_AUTO_SKIP_ENABLED=true`
 - `KLINE_AUDIT_AUTO_SKIP_MAX_SYMBOLS=20`
 - `KLINE_AUDIT_AUTO_SKIP_MAX_RATIO=0.005`
@@ -176,7 +178,9 @@ python scripts/approve_kline_skip.py --market cn --code 000001 --from-date 2026-
 - OpenClaw 热点题材触发的 `extreme_strength_combo` 现在会固定走策略引擎，按请求 `trade_date` 执行，并结合个股所属板块做热点题材硬门槛匹配
 - L2 本地热点板块识别已从“绝对综合分 + 固定阈值”切换为“市场相对排名驱动”：`hot/warm` 由 `board_strength_score / board_strength_rank / percentile` 决定，`stage` 与 `quality_flags` 仅负责生命周期解释和主线优先级排序
 - `ma100_low123_combined` 只把最新 K 线位于 P3-P2 之间，或最新 K 线刚突破 P2 的低位 123 结构视为最佳入场区；突破后已走远的候选会被剔除，刚突破 P2 会通过 `ma100_low123_entry_timing_score` 获得额外加分
+- 低位 123 检测新增三道结构护栏，避免陈旧 / 松散结构被误判为「最佳买点」：①P3 之后最低价跌破 P1 判为破位失效（`structure_broken_below_p1`）；②P1→P2 跨度过大剔除松散伪结构；③P2 突破距 P3 过久视为陈旧突破，降级为观察而非买点。三项阈值可通过 `LOW123_MAX_P1_P2_BARS`（默认 30）、`LOW123_MAX_BREAKOUT_GAP`（默认 20）、`LOW123_BREAK_TOLERANCE`（默认 0）配置
 - `bottom_divergence_double_breakout` 保留“双突破已确认”语义，并新增 `bottom_divergence_actionable_entry` 作为买点门控；主策略只接受真正底部反转类底背离，且要求双突破仍处在刚确认或贴近确认价的入场窗口，已明显远离确认价的候选会标记为 `extended_not_entry`
+- 底背离双突破检测新增结构护栏，避免陈旧 / 已失效结构被误判为「最佳买点」：①B 点之后最低价跌破 `min(A,B)` 判为结构失效并剔除；②双突破须在 B 之后 `BOTTOM_DIVERGENCE_MAX_BREAKOUT_GAP`（默认 30）根内完成，超出视为陈旧突破不计确认；③候选排序引入新鲜度加权，同状态下更贴近当前 K 线的结构优先。破位容差可通过 `BOTTOM_DIVERGENCE_BREAK_TOLERANCE`（默认 0）配置
 - 候选详情中的 `phase_results` 已统一为正式五阶段键，并新增 `phase_explanations` 供前端直接展示阶段解释；OpenClaw `options.candidate_limit/ai_top_k` 也会在接口层做准确校验
 - OpenClaw `extreme_strength_combo` 候选详情现会把原始规则表达式转成中文展示，并将命中的技术形态单独收敛到独立板块；因子快照中的对象/数组值也会展开为可读文本，避免出现 `[object Object]`
 - `extreme_strength_combo` 已明确收敛为“热点题材股票池 / 排序器”角色：候选详情现拆分出 `题材池分 / 龙头分 / 入场信号分 / 时机惩罚` 四桶，并展示 `阶段标签`（`池子层 / 仅观察 / 突破当日 / 回踩确认 / 已走远·勿追`）与 `主信号类型`（`低位结构入场 / 动量突破 / 动量追涨`）；阶段 3 优先展示 `primary_signal`，让结构型右侧买点不再被事件型强势覆盖；当阶段为 `已走远·勿追` 时 L3 候选池会把 `leader_pool` 降级为 `focus_list`，`phase4_entry_readiness` 也会硬闸关闭，避免扎堆追高

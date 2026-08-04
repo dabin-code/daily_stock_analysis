@@ -183,6 +183,107 @@ class KlineGovernanceScheduleService:
             "approved_skip_recovery_result": approved_skip_recovery_result,
         }
 
+    def run_daily_governance_with_catch_up(
+        self,
+        *,
+        trade_date: Optional[date] = None,
+        market: str = "cn",
+        max_catch_up_sessions: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """从最近一次审计通过日逐日补跑治理，直到目标交易日。
+
+        单日治理的 auto-skip 只能豁免「当日」停牌/无源缺口（依赖当日 sync 证据）。
+        若某些交易日的日常治理被跳过（例如程序未在那些交易日运行），这些日期的
+        停牌缺口会长期滞留在最新交易日的审计窗口内，使最新交易日始终 not_passed，
+        导致选股拿不到可用交易日。
+
+        本方法按交易日顺序，对「最近通过日之后、目标日之前」的每个交易日逐日补跑
+        ``run_daily_governance``，让每个交易日各自获得当日证据并被正确豁免，最后再
+        跑目标交易日，从而把审计通过日推进到目标日。
+        """
+        try:
+            target_trade_date = self.resolve_target_trade_date(
+                trade_date=trade_date,
+                market=market,
+            )
+        except RuntimeError as exc:
+            if trade_date is None and "non-trading day" in str(exc):
+                return {
+                    "trade_date": None,
+                    "run_result": "skipped",
+                    "pass_status": "skipped",
+                    "reason": "non_trading_day",
+                }
+            raise
+
+        catch_up_dates = self._resolve_catch_up_sessions(
+            market=market,
+            target_trade_date=target_trade_date,
+            max_catch_up_sessions=max_catch_up_sessions,
+        )
+
+        catch_up_results: list[Dict[str, Any]] = []
+        for session_date in catch_up_dates:
+            catch_up_results.append(
+                self.run_daily_governance(trade_date=session_date, market=market)
+            )
+
+        final_result = self.run_daily_governance(
+            trade_date=target_trade_date,
+            market=market,
+        )
+        final_result["catch_up_dates"] = [item.isoformat() for item in catch_up_dates]
+        final_result["catch_up_results"] = catch_up_results
+        return final_result
+
+    def _resolve_catch_up_sessions(
+        self,
+        *,
+        market: str,
+        target_trade_date: date,
+        max_catch_up_sessions: Optional[int],
+    ) -> list[date]:
+        """收集目标日之前、最近通过日之后的交易日（升序），供逐日补跑。
+
+        - 上限由 ``max_catch_up_sessions`` 或配置 ``kline_governance_max_catch_up_sessions``
+          控制，避免通过日缺失/相距过远时回溯过多导致大量全市场同步。
+        - 目标日本身不包含在返回列表中（由调用方单独补跑）。
+        """
+        cap = max_catch_up_sessions
+        if cap is None:
+            cap = int(getattr(self.config, "kline_governance_max_catch_up_sessions", 30))
+        cap = max(0, int(cap))
+        if cap == 0:
+            return []
+
+        last_passed_date: Optional[date] = None
+        if hasattr(self.db, "get_latest_passed_kline_audit_trade_date"):
+            record = self.db.get_latest_passed_kline_audit_trade_date(market=market)
+            if record is not None:
+                candidate = (
+                    record.get("trade_date")
+                    if isinstance(record, dict)
+                    else getattr(record, "trade_date", None)
+                )
+                if isinstance(candidate, date):
+                    last_passed_date = candidate
+
+        sessions: list[date] = []
+        cursor = target_trade_date - timedelta(days=1)
+        # 防御：即便通过日缺失，也最多回溯有限日历天，避免死循环/超长回溯。
+        max_calendar_lookback = cap * 12 + 366
+        guard = 0
+        while len(sessions) < cap and guard < max_calendar_lookback:
+            guard += 1
+            if last_passed_date is not None and cursor <= last_passed_date:
+                break
+            if KlineAuditService._is_market_session(market=market, trade_date=cursor):
+                sessions.append(cursor)
+            cursor -= timedelta(days=1)
+
+        sessions.reverse()
+        return sessions
+
     def run_deep_audit(
         self,
         *,
