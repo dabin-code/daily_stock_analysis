@@ -1,3 +1,5 @@
+import pytest
+
 from src.config import Config
 from src.services.screening_mode_registry import resolve_screening_runtime_config
 
@@ -109,3 +111,15 @@ def test_resolve_screening_runtime_config_clamps_ai_top_k_to_candidate_limit():
 
     assert runtime.candidate_limit == 8
     assert runtime.ai_top_k == 8
+
+
+def test_resolve_screening_runtime_config_rejects_invalid_base_config():
+    config = _make_config(screening_candidate_limit=10000)
+
+    with pytest.raises(ValueError, match="SCREENING_CANDIDATE_LIMIT"):
+        resolve_screening_runtime_config(
+            config=config,
+            mode=None,
+            candidate_limit=None,
+            ai_top_k=None,
+        )

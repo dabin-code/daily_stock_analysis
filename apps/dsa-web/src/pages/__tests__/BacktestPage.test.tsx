@@ -504,6 +504,77 @@ describe('BacktestPage', () => {
     expect(screen.queryByText('研究降级态')).not.toBeInTheDocument();
   });
 
+  const setLayeredSetupPayload = (primaryStrategies: Array<string | null>) => {
+    const layeredResponse = {
+      ...runResponse,
+      summaries: [
+        ...runResponse.summaries.filter((item) => item.groupType !== 'setup_type'),
+        {
+          groupType: 'setup_type',
+          groupKey: 'bottom_divergence_layered_entry',
+          sampleCount: 7,
+          avgReturnPct: 2.8,
+          winRatePct: 57.1,
+          profitFactor: 1.4,
+        },
+      ],
+    };
+    apiMock.runByScreeningRun.mockResolvedValue(layeredResponse);
+    apiMock.getResults.mockResolvedValue({
+      ...resultsResponse,
+      total: primaryStrategies.length,
+      items: primaryStrategies.map((primaryStrategy, index) => ({
+        ...resultsResponse.items[0],
+        id: 99 + index,
+        code: `00133${index}`,
+        name: '四川黄金',
+        snapshotSetupType: 'bottom_divergence_layered_entry',
+        primaryStrategy,
+        matchedStrategies: primaryStrategy ? [primaryStrategy] : [],
+      })),
+    });
+  };
+
+  const renderLayeredSetup = async () => {
+    render(<BacktestPage />);
+
+    await waitFor(() => {
+      expect(screeningApiMock.listRuns).toHaveBeenCalledTimes(1);
+    });
+    fireEvent.click(screen.getByRole('button', { name: /运行五层回测/i }));
+    await screen.findAllByText('底背离分层入场');
+  };
+
+  it('does not infer setup attribution from 200 uniquely attributed evaluations', async () => {
+    setLayeredSetupPayload(Array.from(
+      { length: 200 },
+      () => 'bottom_divergence_layered_entry_v2',
+    ));
+
+    await renderLayeredSetup();
+
+    expect(screen.queryByText(/主策略：底背离分层入场 v2/)).not.toBeInTheDocument();
+    expect(screen.queryByText('bottom_divergence_layered_entry_v2', { selector: 'button' })).not.toBeInTheDocument();
+    expect(screen.getByText('策略主归因')).toBeInTheDocument();
+    expect(screen.getAllByText('bottom_divergence_layered_entry_v2').length).toBeGreaterThan(0);
+  });
+
+  it('does not infer mixed setup attribution from 200 paginated evaluations', async () => {
+    setLayeredSetupPayload(Array.from(
+      { length: 200 },
+      (_, index) => (
+        index % 2 === 0
+          ? 'bottom_divergence_double_breakout'
+          : 'bottom_divergence_layered_entry_v2'
+      ),
+    ));
+
+    await renderLayeredSetup();
+
+    expect(screen.queryByText(/主策略：混合策略/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/主策略：底背离/)).not.toBeInTheDocument();
+  });
+
   it('shows dual run and research context after loading a run', async () => {
     render(<BacktestPage />);
 

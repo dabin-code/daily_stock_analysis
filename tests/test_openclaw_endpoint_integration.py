@@ -3,6 +3,7 @@
 
 import pytest
 from datetime import date
+from unittest.mock import MagicMock, patch
 from src.services.screening_task_service import ScreeningTaskService
 from src.services.theme_context_ingest_service import ExternalTheme, OpenClawThemeContext
 from src.agent.skills.base import SkillManager
@@ -11,12 +12,15 @@ from src.agent.skills.base import SkillManager
 class TestOpenClawEndpointIntegration:
     """Test that OpenClaw endpoint correctly filters strategies end-to-end."""
 
-    def test_openclaw_run_only_returns_extreme_strength_combo(self):
-        """RED: OpenClaw run should only return candidates with extreme_strength_combo strategy."""
+    def test_openclaw_run_fails_closed_without_theme_memberships(self):
+        """OpenClaw must not silently fall back to the full market."""
         # Setup
         skill_manager = SkillManager()
         skill_manager.load_builtin_strategies()
-        service = ScreeningTaskService(skill_manager=skill_manager)
+        service = ScreeningTaskService(
+            db_manager=MagicMock(),
+            skill_manager=skill_manager,
+        )
 
         # Create theme context (simulating OpenClaw input)
         theme_context = OpenClawThemeContext(
@@ -39,31 +43,19 @@ class TestOpenClawEndpointIntegration:
         # Inject theme context
         service._theme_context = theme_context
 
-        # Execute run with only extreme_strength_combo strategy
-        result = service.execute_run(
-            trade_date=None,
-            stock_codes=None,
-            mode="balanced",
-            candidate_limit=50,
-            ai_top_k=10,
-            market="cn",
-            trigger_type="openclaw",
-            strategy_names=["extreme_strength_combo"],
-        )
-
-        # Verify run was created
-        assert result["run_id"] is not None
-        run_id = result["run_id"]
-
-        # Retrieve candidates from database
-        candidates = service.db.list_screening_candidates(run_id=run_id, limit=100)
-
-        # Verify all candidates only have extreme_strength_combo
-        if candidates:
-            for candidate in candidates:
-                matched_strategies = candidate.get("matched_strategies", [])
-                assert matched_strategies == ["extreme_strength_combo"], \
-                    f"Candidate {candidate['code']} has wrong strategies: {matched_strategies}"
-
-        # Cleanup
-        service.db.delete_screening_run(run_id)
+        with patch.object(
+            service,
+            "_resolve_theme_universe_codes",
+            return_value=[],
+        ):
+            with pytest.raises(ValueError, match="题材未匹配到任何板块成分股"):
+                service.execute_run(
+                    trade_date=None,
+                    stock_codes=None,
+                    mode="balanced",
+                    candidate_limit=50,
+                    ai_top_k=10,
+                    market="cn",
+                    trigger_type="openclaw",
+                    strategy_names=["extreme_strength_combo"],
+                )

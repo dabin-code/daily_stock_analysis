@@ -2,17 +2,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional
 
 import pytest
 
+from src.agent.skills.base import load_skill_from_yaml
 from src.schemas.trading_types import (
     MarketRegime,
     SetupType,
     StrategyFamily,
     ThemePosition,
 )
-from src.services.setup_resolver import SetupResolution, SetupResolver
+from src.services.setup_resolver import SetupResolver
+from src.services.strategy_screening_engine import build_rules_from_skills
 
 
 # ── Stub ───────────────────────────────────────────────────────────────────
@@ -29,6 +32,7 @@ class _StubRule:
 def _make_rules() -> List[_StubRule]:
     return [
         _StubRule("bottom_divergence_double_breakout", "entry_core", "reversal", ["balanced", "aggressive"], "bottom_divergence_breakout"),
+        _StubRule("bottom_divergence_layered_entry_v2", "entry_core", "reversal", ["balanced", "aggressive"], "bottom_divergence_layered_entry"),
         _StubRule("bottom_volume", "observation", "reversal", ["balanced", "aggressive", "defensive"]),
         _StubRule("bull_trend", "stock_pool", "trend", ["balanced", "aggressive", "defensive"]),
         _StubRule("dragon_head", "theme_score", "auxiliary", ["balanced", "aggressive"]),
@@ -86,6 +90,18 @@ class TestSingleEntryCore:
         assert result.strategy_family == StrategyFamily.TREND
         assert result.primary_strategy == "ma100_60min_combined"
         assert "single_entry_core" in result.reason
+
+    def test_v2_layered_entry_resolves_to_distinct_setup(self, resolver: SetupResolver):
+        result = resolver.resolve(
+            allowed_strategies=["bottom_divergence_layered_entry_v2"],
+            strategy_scores={"bottom_divergence_layered_entry_v2": 75.0},
+            market_regime=MarketRegime.BALANCED,
+            theme_position=ThemePosition.MAIN_THEME,
+        )
+
+        assert result.setup_type == SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY
+        assert result.setup_type != SetupType.BOTTOM_DIVERGENCE_BREAKOUT
+        assert result.primary_strategy == "bottom_divergence_layered_entry_v2"
 
 
 # ── Environment priority tests ─────────────────────────────────────────────
@@ -227,6 +243,48 @@ class TestTieBreak:
         )
         # ma100_60min_combined < shrink_pullback alphabetically
         assert result.primary_strategy == "ma100_60min_combined"
+
+    def test_v1_and_v2_same_family_resolve_by_score(self, resolver: SetupResolver):
+        result = resolver.resolve(
+            allowed_strategies=[
+                "bottom_divergence_double_breakout",
+                "bottom_divergence_layered_entry_v2",
+            ],
+            strategy_scores={
+                "bottom_divergence_double_breakout": 60.0,
+                "bottom_divergence_layered_entry_v2": 85.0,
+            },
+            market_regime=MarketRegime.DEFENSIVE,
+            theme_position=ThemePosition.NON_THEME,
+        )
+
+        assert result.setup_type == SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY
+        assert result.primary_strategy == "bottom_divergence_layered_entry_v2"
+
+
+class TestLayeredEntryYaml:
+    def test_yaml_loads_as_opt_in_entry_core_with_exact_screening_contract(self):
+        path = Path(__file__).parents[1] / "strategies" / "bottom_divergence_layered_entry_v2.yaml"
+        skill = load_skill_from_yaml(path)
+        rule = build_rules_from_skills([skill])[0]
+
+        assert skill.enabled is False
+        assert rule.strategy_name == "bottom_divergence_layered_entry_v2"
+        assert rule.system_role == "entry_core"
+        assert rule.strategy_family == "reversal"
+        assert rule.setup_type == "bottom_divergence_layered_entry"
+        assert [
+            (condition.field, condition.op, condition.value)
+            for condition in rule.filters
+        ] == [("bottom_divergence_v2_candidate", "==", True)]
+        assert [
+            (weight.field, weight.weight, weight.cap)
+            for weight in rule.scoring
+        ] == [
+            ("bottom_divergence_v2_early_strength", 30.0, 1),
+            ("bottom_divergence_v2_near_zone_score", 30.0, 1),
+            ("bottom_divergence_v2_major_zone_score", 40.0, 1),
+        ]
 
 
 # ── Contributing strategies ────────────────────────────────────────────────

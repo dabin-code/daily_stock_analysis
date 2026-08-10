@@ -286,9 +286,9 @@ class TestValidateStructuredScreening:
         Config._instance = None
         cfg = Config._load_from_env()
         assert cfg.screening_candidate_limit == 30
-        assert cfg.screening_ai_top_k == 5
+        assert cfg.screening_ai_top_k == 10
         assert cfg.screening_min_volume_ratio == 1.2
-        assert cfg.screening_ingest_failure_threshold == 0.02
+        assert cfg.screening_ingest_failure_threshold == 0.20
 
     @patch.dict(
         "os.environ",
@@ -300,12 +300,23 @@ class TestValidateStructuredScreening:
         clear=True,
     )
     @patch("src.config.load_dotenv")
-    def test_screening_numeric_fields_are_clamped_to_registry_range(self, _mock_dotenv):
+    def test_screening_out_of_range_values_are_preserved_and_reported(self, _mock_dotenv):
         Config._instance = None
         cfg = Config._load_from_env()
-        assert cfg.screening_candidate_limit == 200
-        assert cfg.screening_ai_top_k == 50
-        assert cfg.screening_min_volume_ratio == 10.0
+        assert cfg.screening_candidate_limit == 10000
+        assert cfg.screening_ai_top_k == 500
+        assert cfg.screening_min_volume_ratio == 99.0
+        assert cfg._screening_parse_errors == ()
+        error_fields = {
+            issue.field
+            for issue in cfg.validate_structured()
+            if issue.severity == "error"
+        }
+        assert {
+            "SCREENING_CANDIDATE_LIMIT",
+            "SCREENING_AI_TOP_K",
+            "SCREENING_MIN_VOLUME_RATIO",
+        }.issubset(error_fields)
 
     @patch.dict(
         "os.environ",
@@ -319,8 +330,18 @@ class TestValidateStructuredScreening:
     def test_invalid_screening_numeric_fields_fallback_to_defaults(self, _mock_dotenv):
         Config._instance = None
         cfg = Config._load_from_env()
-        assert cfg.screening_ai_top_k == 5
+        assert cfg.screening_ai_top_k == 10
         assert cfg.screening_min_volume_ratio == 1.2
+        assert cfg._screening_parse_errors
+        error_fields = {
+            issue.field
+            for issue in cfg.validate_structured()
+            if issue.severity == "error"
+        }
+        assert {
+            "SCREENING_AI_TOP_K",
+            "SCREENING_MIN_VOLUME_RATIO",
+        }.issubset(error_fields)
 
     @patch.dict(
         "os.environ",
@@ -334,6 +355,167 @@ class TestValidateStructuredScreening:
         Config._instance = None
         cfg = Config._load_from_env()
         assert cfg.screening_default_mode == "balanced"
+        assert any(
+            issue.severity == "error"
+            and issue.field == "SCREENING_DEFAULT_MODE"
+            for issue in cfg.validate_structured()
+        )
+
+
+# ---------------------------------------------------------------------------
+# Bottom-divergence v2 config
+# ---------------------------------------------------------------------------
+
+class TestBottomDivergenceV2Config:
+    def test_bottom_divergence_v2_defaults_are_disabled_and_zero_cost(self):
+        cfg = _make_config()
+
+        assert cfg.bottom_divergence_v2_enabled is False
+        assert cfg.bottom_divergence_v2_cluster_pct == 0.015
+        assert cfg.bottom_divergence_v2_atr_gap_multiplier == 0.5
+        assert cfg.bottom_divergence_v2_zone_score_min == 0.45
+        assert cfg.bottom_divergence_v2_breakout_buffer_pct == 0.003
+        assert cfg.bottom_divergence_v2_sync_window == 3
+        assert cfg.bottom_divergence_v2_retention_bars == 20
+        assert cfg.bottom_divergence_v2_r1_weights == (
+            0.30, 0.25, 0.15, 0.15, 0.10, 0.05,
+        )
+        assert cfg.bottom_divergence_v2_r2_weights == (
+            0.35, 0.15, 0.15, 0.15, 0.10, 0.10,
+        )
+        assert cfg.backtest_buy_cost_bps == 0.0
+        assert cfg.backtest_sell_cost_bps == 0.0
+        assert cfg.backtest_slippage_bps == 0.0
+        assert cfg._bottom_divergence_v2_parse_errors == ()
+        assert "_bottom_divergence_v2_parse_errors" not in repr(cfg)
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_bottom_divergence_v2_fields_load_from_env(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ):
+        with patch.dict(
+            "os.environ",
+            {
+                "BOTTOM_DIVERGENCE_V2_ENABLED": "true",
+                "BOTTOM_DIVERGENCE_V2_CLUSTER_PCT": "0.02",
+                "BOTTOM_DIVERGENCE_V2_ATR_GAP_MULTIPLIER": "0.7",
+                "BOTTOM_DIVERGENCE_V2_ZONE_SCORE_MIN": "0.6",
+                "BOTTOM_DIVERGENCE_V2_BREAKOUT_BUFFER_PCT": "0.004",
+                "BOTTOM_DIVERGENCE_V2_SYNC_WINDOW": "4",
+                "BOTTOM_DIVERGENCE_V2_RETENTION_BARS": "25",
+                "BOTTOM_DIVERGENCE_V2_R1_WEIGHTS": "0.2,0.2,0.2,0.2,0.1,0.1",
+                "BOTTOM_DIVERGENCE_V2_R2_WEIGHTS": "0.1,0.2,0.2,0.2,0.2,0.1",
+                "BACKTEST_BUY_COST_BPS": "1.5",
+                "BACKTEST_SELL_COST_BPS": "2.5",
+                "BACKTEST_SLIPPAGE_BPS": "3.5",
+            },
+            clear=True,
+        ):
+            cfg = Config._load_from_env()
+
+        assert cfg.bottom_divergence_v2_enabled is True
+        assert cfg.bottom_divergence_v2_cluster_pct == 0.02
+        assert cfg.bottom_divergence_v2_atr_gap_multiplier == 0.7
+        assert cfg.bottom_divergence_v2_zone_score_min == 0.6
+        assert cfg.bottom_divergence_v2_breakout_buffer_pct == 0.004
+        assert cfg.bottom_divergence_v2_sync_window == 4
+        assert cfg.bottom_divergence_v2_retention_bars == 25
+        assert cfg.bottom_divergence_v2_r1_weights == (
+            0.2, 0.2, 0.2, 0.2, 0.1, 0.1,
+        )
+        assert cfg.bottom_divergence_v2_r2_weights == (
+            0.1, 0.2, 0.2, 0.2, 0.2, 0.1,
+        )
+        assert cfg.backtest_buy_cost_bps == 1.5
+        assert cfg.backtest_sell_cost_bps == 2.5
+        assert cfg.backtest_slippage_bps == 3.5
+        assert cfg._bottom_divergence_v2_parse_errors == ()
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_bottom_divergence_v2_invalid_enabled_typo_is_disabled_error(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ):
+        with patch.dict(
+            "os.environ",
+            {"BOTTOM_DIVERGENCE_V2_ENABLED": " flase "},
+            clear=True,
+        ):
+            cfg = Config._load_from_env()
+
+        assert cfg.bottom_divergence_v2_enabled is False
+        assert cfg._bottom_divergence_v2_parse_errors
+        assert any(
+            issue.severity == "error"
+            and issue.field == "BOTTOM_DIVERGENCE_V2_ENABLED"
+            for issue in cfg.validate_structured()
+        )
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_bottom_divergence_v2_invalid_env_formats_fallback_to_structured_issues(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ):
+        invalid_env = {
+            "BOTTOM_DIVERGENCE_V2_CLUSTER_PCT": "not-a-number",
+            "BOTTOM_DIVERGENCE_V2_SYNC_WINDOW": "3.5",
+            "BOTTOM_DIVERGENCE_V2_R1_WEIGHTS": "0.5,0.5",
+            "BACKTEST_BUY_COST_BPS": "nan",
+        }
+        with patch.dict("os.environ", invalid_env, clear=True):
+            cfg = Config._load_from_env()
+
+        assert cfg.bottom_divergence_v2_cluster_pct == 0.015
+        assert cfg.bottom_divergence_v2_sync_window == 3
+        assert cfg.bottom_divergence_v2_r1_weights == (
+            0.30, 0.25, 0.15, 0.15, 0.10, 0.05,
+        )
+        assert cfg.backtest_buy_cost_bps == 0.0
+        issues = cfg.validate_structured()
+        issue_fields = {
+            issue.field for issue in issues if issue.severity == "error"
+        }
+        assert issue_fields.issuperset(invalid_env)
+
+    @pytest.mark.parametrize(
+        ("field_name", "value", "expected_env"),
+        [
+            ("bottom_divergence_v2_cluster_pct", float("inf"), "BOTTOM_DIVERGENCE_V2_CLUSTER_PCT"),
+            ("bottom_divergence_v2_cluster_pct", 0.0, "BOTTOM_DIVERGENCE_V2_CLUSTER_PCT"),
+            ("bottom_divergence_v2_atr_gap_multiplier", -0.1, "BOTTOM_DIVERGENCE_V2_ATR_GAP_MULTIPLIER"),
+            ("bottom_divergence_v2_zone_score_min", 1.1, "BOTTOM_DIVERGENCE_V2_ZONE_SCORE_MIN"),
+            ("bottom_divergence_v2_breakout_buffer_pct", -0.1, "BOTTOM_DIVERGENCE_V2_BREAKOUT_BUFFER_PCT"),
+            ("bottom_divergence_v2_sync_window", 3.0, "BOTTOM_DIVERGENCE_V2_SYNC_WINDOW"),
+            ("bottom_divergence_v2_sync_window", 0, "BOTTOM_DIVERGENCE_V2_SYNC_WINDOW"),
+            ("bottom_divergence_v2_retention_bars", -1, "BOTTOM_DIVERGENCE_V2_RETENTION_BARS"),
+            ("bottom_divergence_v2_retention_bars", 0, "BOTTOM_DIVERGENCE_V2_RETENTION_BARS"),
+            ("bottom_divergence_v2_r1_weights", (0, 0, 1, 0, 0, 0), "BOTTOM_DIVERGENCE_V2_R1_WEIGHTS"),
+            ("bottom_divergence_v2_r2_weights", (0.2,) * 6, "BOTTOM_DIVERGENCE_V2_R2_WEIGHTS"),
+            ("backtest_sell_cost_bps", -0.1, "BACKTEST_SELL_COST_BPS"),
+            ("backtest_slippage_bps", float("nan"), "BACKTEST_SLIPPAGE_BPS"),
+        ],
+    )
+    def test_bottom_divergence_v2_invalid_values_are_structured_errors(
+        self,
+        field_name,
+        value,
+        expected_env,
+    ):
+        cfg = _make_config(**{field_name: value})
+
+        issues = cfg.validate_structured()
+
+        assert any(
+            issue.severity == "error" and issue.field == expected_env
+            for issue in issues
+        )
 
 
 # ---------------------------------------------------------------------------

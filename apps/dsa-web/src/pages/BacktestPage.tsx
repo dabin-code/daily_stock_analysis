@@ -253,6 +253,8 @@ const STRATEGY_LABELS: Record<string, string> = {
   low123_breakout: '低位123',
   bottom_divergence_breakout: '底背离双突破',
   bottom_divergence_double_breakout: '底背离双突破',
+  bottom_divergence_layered_entry: '底背离分层入场',
+  bottom_divergence_layered_entry_v2: '底背离分层入场 v2',
   ma100_low123_combined: 'MA100+123 组合',
 };
 
@@ -286,6 +288,10 @@ function getStrategyMetaLabel(key: string): string {
     case 'bottom_divergence_breakout':
     case 'bottom_divergence_double_breakout':
       return '偏拐点确认研究，需重点看边界样本与观察样本比例。';
+    case 'bottom_divergence_layered_entry':
+      return '底背离分层入场 setup，按早期、R1 与 R2 阶段拆分研究。';
+    case 'bottom_divergence_layered_entry_v2':
+      return '底背离 v2 分层版本（opt-in），需按版本核对阻力区与可操作性。';
     case 'ma100_low123_combined':
       return '偏组合确认研究，需重点核对归因链与 Low123 校验状态。';
     default:
@@ -306,6 +312,12 @@ function getStrategyConclusion(
   }
   if (selectedStrategyKey === 'bottom_divergence_breakout' || selectedStrategyKey === 'bottom_divergence_double_breakout') {
     return '底背离双突破当前具备较强的结构性研究价值，适合结合观察信号与关键命中原因一起复盘。';
+  }
+  if (selectedStrategyKey === 'bottom_divergence_layered_entry_v2') {
+    return '底背离 v2 需按早期、R1、R2 分层及版本证据复盘，历史突破不代表当前可操作。';
+  }
+  if (selectedStrategyKey === 'bottom_divergence_layered_entry') {
+    return '底背离分层入场需分别观察早期、R1 与 R2 阶段表现，避免混合不同阶段样本。';
   }
   if (summary?.winRatePct != null && summary.winRatePct >= 60) {
     return `${getStrategyDisplayName(selectedStrategyKey)} 当前表现较稳，可优先查看代表样本与异常样本之间的差异。`;
@@ -681,7 +693,9 @@ const BacktestPage: React.FC = () => {
   const strategySidebarItems = useMemo<StrategySidebarItem[]>(() => {
     if (strategySummaries.length > 0) {
       return strategySummaries.map((item) => {
-        const relatedEval = evaluations.find((evaluation) => evaluation.snapshotSetupType === item.groupKey);
+        const relatedEvaluations = evaluations.filter(
+          (evaluation) => evaluation.snapshotSetupType === item.groupKey,
+        );
         return {
           key: item.groupKey,
           strategyKey: item.groupKey,
@@ -691,7 +705,9 @@ const BacktestPage: React.FC = () => {
           winRatePct: item.winRatePct,
           avgReturnPct: item.avgReturnPct,
           profitFactor: item.profitFactor,
-          warningTag: relatedEval?.sampleBucket === 'boundary' ? '边界样本偏多' : null,
+          warningTag: relatedEvaluations.some((evaluation) => evaluation.sampleBucket === 'boundary')
+            ? '边界样本偏多'
+            : null,
         };
       });
     }

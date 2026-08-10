@@ -113,6 +113,7 @@ export type EntryMaturity = 'low' | 'medium' | 'high';
 export type CandidatePoolLevel = 'leader_pool' | 'focus_list' | 'watchlist';
 export type SetupType =
   | 'bottom_divergence_breakout'
+  | 'bottom_divergence_layered_entry'
   | 'low123_breakout'
   | 'trend_breakout'
   | 'trend_pullback'
@@ -469,6 +470,43 @@ export interface ScreeningFactorSnapshot extends Record<string, unknown> {
   bottom_divergence_extended_pct?: number;
   bottom_divergence_validation_status?: string;
 
+  // Bottom divergence v2 layered-entry fields
+  bottom_divergence_v2_candidate?: boolean;
+  bottom_divergence_v2_stage?: string;
+  bottom_divergence_v2_pattern_code?: string;
+  bottom_divergence_v2_pattern_label?: string;
+  bottom_divergence_v2_early_reversal?: boolean;
+  bottom_divergence_v2_early_strength?: number;
+  bottom_divergence_v2_near_zone_lower?: number;
+  bottom_divergence_v2_near_zone_upper?: number;
+  bottom_divergence_v2_near_zone_score?: number;
+  bottom_divergence_v2_near_entered?: boolean;
+  bottom_divergence_v2_near_accepted?: boolean;
+  bottom_divergence_v2_near_crossed?: boolean;
+  bottom_divergence_v2_near_cleared?: boolean;
+  bottom_divergence_v2_major_zone_lower?: number;
+  bottom_divergence_v2_major_zone_upper?: number;
+  bottom_divergence_v2_major_zone_score?: number;
+  bottom_divergence_v2_major_breakout?: boolean;
+  bottom_divergence_v2_major_actionable_entry?: boolean;
+  bottom_divergence_v2_actionability_status?: string;
+  bottom_divergence_v2_event_days?: number;
+  bottom_divergence_v2_confirmation_days?: number;
+  bottom_divergence_v2_extended_pct?: number;
+  bottom_divergence_v2_extended_pct_raw?: number;
+  bottom_divergence_v2_stop_loss_price?: number;
+  bottom_divergence_v2_candidate_version?: string;
+  bottom_divergence_v2_zone_version?: string;
+  bottom_divergence_v2_candidate_records?: unknown[];
+  bottom_divergence_v2_layered_buy_points?: unknown[];
+  bottom_divergence_v2_as_of_index?: number;
+  bottom_divergence_v2_early_event_index?: number;
+  bottom_divergence_v2_near_event_index?: number;
+  bottom_divergence_v2_major_event_index?: number;
+  bottom_divergence_v2_active_event_index?: number;
+  bottom_divergence_v2_degradation_reasons?: string[];
+  bottom_divergence_v2_hit_reasons?: string[];
+
   // Pattern 123 fields
   pattern_123_low_trendline?: boolean;
   pattern_123_watchlist?: boolean;
@@ -549,7 +587,7 @@ export const CATEGORY_COLORS: Record<string, string> = {
 };
 
 /**
- * The 4 target strategies for the consolidated screening page.
+ * Target strategies for the consolidated screening page.
  * Strategies not yet implemented are shown as disabled (hasScreeningRules=false).
  */
 export const TARGET_STRATEGIES: ScreeningStrategy[] = [
@@ -559,6 +597,14 @@ export const TARGET_STRATEGIES: ScreeningStrategy[] = [
     description: '基于DIF/DEA六形态底背离 + 下降趋势线/水平阻力线双突破确认',
     category: 'reversal',
     hasScreeningRules: true,
+  },
+  {
+    name: 'bottom_divergence_layered_entry_v2',
+    displayName: '底背离分层入场 v2（可选）',
+    description: 'v2 opt-in：按早期反转、R1 与 R2 阻力区分层入场，默认关闭',
+    category: 'reversal',
+    hasScreeningRules: true,
+    setupType: 'bottom_divergence_layered_entry',
   },
   {
     name: 'ma100_low123_combined',
@@ -644,6 +690,7 @@ export const MARKET_REGIME_COLORS: Record<string, string> = {
 
 export const SETUP_TYPE_LABELS: Record<string, string> = {
   bottom_divergence_breakout: '底背离突破',
+  bottom_divergence_layered_entry: '底背离分层入场',
   low123_breakout: '低位123突破',
   trend_breakout: '趋势突破',
   trend_pullback: '趋势回调',

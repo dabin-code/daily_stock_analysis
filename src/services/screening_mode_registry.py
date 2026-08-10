@@ -4,6 +4,13 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 SCREENING_MODE_OPTIONS = ("balanced", "aggressive", "quality")
+_SCREENING_CONFIG_FIELDS = {
+    "SCREENING_DEFAULT_MODE",
+    "SCREENING_CANDIDATE_LIMIT",
+    "SCREENING_AI_TOP_K",
+    "SCREENING_MIN_VOLUME_RATIO",
+    "SCREENING_MIN_FINAL_SCORE",
+}
 
 _SCREENING_MODE_PRESETS: Dict[str, Dict[str, Any]] = {
     "balanced": {},
@@ -63,6 +70,21 @@ def resolve_screening_runtime_config(
     candidate_limit: Optional[int],
     ai_top_k: Optional[int],
 ) -> ResolvedScreeningRuntimeConfig:
+    validate_structured = getattr(config, "validate_structured", None)
+    if callable(validate_structured):
+        config_errors = [
+            issue
+            for issue in validate_structured()
+            if issue.severity == "error"
+            and issue.field in _SCREENING_CONFIG_FIELDS
+        ]
+        if config_errors:
+            details = "; ".join(
+                f"{issue.field}: {issue.message}"
+                for issue in config_errors
+            )
+            raise ValueError(f"invalid screening configuration: {details}")
+
     resolved_mode = normalize_screening_mode(mode or getattr(config, "screening_default_mode", "balanced"))
     preset = _SCREENING_MODE_PRESETS[resolved_mode]
 

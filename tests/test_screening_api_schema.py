@@ -98,6 +98,52 @@ class ScreeningApiSchemaTestCase(unittest.TestCase):
         payload = decision.to_payload()
         self.assertEqual(payload["setup_type"], "trend_breakout")
 
+    def test_candidate_item_preserves_layered_divergence_v2_snapshot(self) -> None:
+        """API schema 必须接受新 setup 字符串并原样保留嵌套 v2 证据。"""
+        factor_snapshot = {
+            "bottom_divergence_v2_stage": "near_cleared",
+            "bottom_divergence_v2_candidate_version": "candidate-v2",
+            "bottom_divergence_v2_zone_version": "zone-v2",
+            "bottom_divergence_v2_candidate_records": [
+                {
+                    "candidate_version": "candidate-v2",
+                    "zone": {
+                        "zone_version": "zone-v2",
+                        "r1": {
+                            "lower": 37.46,
+                            "upper": 39.2,
+                            "touch_dates": [
+                                "2026-07-02",
+                                "2026-07-08",
+                                "2026-07-10",
+                            ],
+                        },
+                    },
+                    "near_zone_events": {
+                        "crossed": {"date": "2026-07-23"},
+                        "cleared_confirmed": {"date": "2026-07-23"},
+                    },
+                }
+            ],
+        }
+
+        item = ScreeningCandidateItem(
+            code="001337",
+            name="四川黄金",
+            rank=1,
+            rule_score=88.0,
+            selected_for_ai=True,
+            matched_strategies=["bottom_divergence_layered_entry_v2"],
+            setup_type="bottom_divergence_layered_entry",
+            factor_snapshot=factor_snapshot,
+        )
+
+        self.assertEqual(
+            item.setup_type,
+            "bottom_divergence_layered_entry",
+        )
+        self.assertEqual(item.factor_snapshot, factor_snapshot)
+
     def test_screening_run_response_accepts_theme_pipeline_snapshots(self) -> None:
         response = ScreeningRunResponse(
             run_id="run-theme-pipeline",

@@ -83,6 +83,23 @@ instructions: |
 | `bottom_divergence_state` | 底背离状态（rejected/divergence_only/structure_ready/confirmed/late_or_weak） | 底背离双突破 |
 | `bottom_divergence_signal_strength` | 底背离信号强度（0-1） | 底背离双突破 |
 | `bottom_divergence_pattern_code` | 底背离形态编码（六种形态） | 底背离双突破 |
+| `bottom_divergence_v2_candidate` | v2 是否进入候选/观察池；unknown provenance 下 early/R1 仍可为 true，但不代表可交易 | 底背离分层入场 v2 |
+| `bottom_divergence_v2_stage` | v2 阶段：early/near_cleared/major_actionable/major_unverified 等 | 底背离分层入场 v2 |
+| `bottom_divergence_v2_pattern_code` / `bottom_divergence_v2_pattern_label` | 冻结的底背离形态编码与标签 | 底背离分层入场 v2 |
+| `bottom_divergence_v2_early_reversal` / `bottom_divergence_v2_early_strength` | early 事件与强度 | 底背离分层入场 v2 |
+| `bottom_divergence_v2_near_zone_lower` / `bottom_divergence_v2_near_zone_upper` / `bottom_divergence_v2_near_zone_score` | 冻结 R1 区间与评分 | 底背离分层入场 v2 |
+| `bottom_divergence_v2_near_entered` / `bottom_divergence_v2_near_accepted` / `bottom_divergence_v2_near_crossed` / `bottom_divergence_v2_near_cleared` | R1 递进事件 | 底背离分层入场 v2 |
+| `bottom_divergence_v2_major_zone_lower` / `bottom_divergence_v2_major_zone_upper` / `bottom_divergence_v2_major_zone_score` | 冻结 R2 区间与评分 | 底背离分层入场 v2 |
+| `bottom_divergence_v2_major_breakout` / `bottom_divergence_v2_major_actionable_entry` | R2 历史突破与当前可执行性（两个独立事实） | 底背离分层入场 v2 |
+| `bottom_divergence_v2_actionability_status` | 当前执行门禁原因，如 actionable/adjustment_unknown | 底背离分层入场 v2 |
+| `bottom_divergence_v2_confirmation_days` / `bottom_divergence_v2_extended_pct` / `bottom_divergence_v2_extended_pct_raw` | R2 确认时效、展示用舍入延伸幅度与原始延伸幅度 | 底背离分层入场 v2 |
+| `bottom_divergence_v2_stop_loss_price` | 当前阶段冻结止损价 | 底背离分层入场 v2 |
+| `bottom_divergence_v2_candidate_version` / `bottom_divergence_v2_zone_version` | 候选与阻力区版本 | 底背离分层入场 v2 |
+| `bottom_divergence_v2_candidate_records` / `bottom_divergence_v2_layered_buy_points` | 版本化候选记录与 early/R1/R2 买点证据 | 底背离分层入场 v2 |
+| `bottom_divergence_v2_as_of_index` | 本次 point-in-time 因子快照的可见截止索引 | 底背离分层入场 v2 |
+| `bottom_divergence_v2_early_event_index` / `bottom_divergence_v2_near_event_index` / `bottom_divergence_v2_major_event_index` | 各阶段历史事件索引 | 底背离分层入场 v2 |
+| `bottom_divergence_v2_active_event_index` / `bottom_divergence_v2_event_days` | 当前可执行阶段事件索引与距今天数 | 底背离分层入场 v2 |
+| `bottom_divergence_v2_degradation_reasons` / `bottom_divergence_v2_hit_reasons` | 降级与命中解释 | 底背离分层入场 v2 |
 | `amplitude` | 振幅（%） | - |
 | `candle_pattern` | K线形态标识 | 一阳夹三阴 |
 | `avg_amount` | 5日均成交额 | 策略级流动性约束/评分，不再作为全局首筛硬过滤 |
@@ -100,6 +117,23 @@ instructions: |
 | 5 | 风险排查：利空新闻一票否决 |
 | 6 | 量价配合：成交量验证价格运动 |
 | 7 | 强势趋势股放宽：龙头股可适当放宽标准 |
+
+## 底背离分层入场 v2
+
+`bottom_divergence_layered_entry_v2.yaml` 是显式 opt-in 策略，不替代 legacy v1
+`bottom_divergence_double_breakout`，也不在默认启用列表中。运行时还需设置：
+
+```env
+BOTTOM_DIVERGENCE_V2_ENABLED=true
+```
+
+策略按 `early`（20%）、`near_cleared`/R1（50%）和
+`major_actionable`/R2（100%）分层。R1/R2 与下降趋势线在 B+1 使用当时可见数据冻结，
+后续不重画。只有复权 provenance 为受信任的 `tushare_native` 或
+`akshare_qfq_div_raw` 才允许执行；unknown provenance 下 early/R1 仅观察，
+且 `bottom_divergence_v2_candidate` 仍可为 true 以进入观察池；历史 R2 为
+`major_unverified` 且 candidate 为 false。所有 unknown provenance 场景均禁止
+交易执行，生产 AI review 只能解释证据，不能生成或升级可执行建议。
 
 ## 自定义策略目录
 

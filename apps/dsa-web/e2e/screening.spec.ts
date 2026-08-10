@@ -309,7 +309,7 @@ test.describe('候选详情抽屉', () => {
     await expect(detail).toBeVisible({ timeout: 10_000 });
 
     // 检查五层分区标题（L1~L5 + AI）
-    const sectionTexts = ['大盘环境', '题材', '候选池', '入场', '交易计划', 'AI'];
+    const sectionTexts = ['大盘环境', '题材', '候选池', '入场', '交易阶段', 'AI'];
     let found = 0;
     for (const text of sectionTexts) {
       const el = detail.getByText(text, { exact: false }).first();
@@ -318,6 +318,14 @@ test.describe('候选详情抽屉', () => {
     }
     // 旧 run 可能走 legacy 布局，不强制要求所有分区都存在
     // 但如果有 trade_stage 数据，至少应有 3 个分区
+    const hasTradeStageSection = await detail
+      .getByText('L5 交易阶段', { exact: false })
+      .first()
+      .isVisible({ timeout: 2_000 })
+      .catch(() => false);
+    if (hasTradeStageSection) {
+      expect(found).toBeGreaterThanOrEqual(3);
+    }
   });
 });
 

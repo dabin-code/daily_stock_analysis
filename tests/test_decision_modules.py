@@ -18,6 +18,7 @@ from src.schemas.trading_types import (
 )
 from src.services.entry_maturity_assessor import EntryMaturityAssessor
 from src.services.candidate_pool_classifier import CandidatePoolClassifier
+from src.services.setup_freshness_assessor import SetupFreshnessAssessor
 from src.services.trade_stage_judge import TradeStageJudge
 
 
@@ -59,6 +60,61 @@ class EntryMaturityAssessorTestCase(unittest.TestCase):
         fs = {"bottom_divergence_state": "late_or_weak"}
         result = self.assessor.assess(SetupType.BOTTOM_DIVERGENCE_BREAKOUT, fs)
         self.assertEqual(result, EntryMaturity.MEDIUM)
+
+    def test_bottom_divergence_v2_stage_maturity_mapping(self) -> None:
+        cases = {
+            "forming": EntryMaturity.LOW,
+            "invalidated": EntryMaturity.LOW,
+            "stale": EntryMaturity.LOW,
+            "extended": EntryMaturity.LOW,
+            "major_unverified": EntryMaturity.LOW,
+            "breakout_failed": EntryMaturity.LOW,
+            "major_confirmed": EntryMaturity.LOW,
+            "unknown_stage": EntryMaturity.LOW,
+            "rejected": EntryMaturity.LOW,
+            "early": EntryMaturity.MEDIUM,
+            "near_cleared": EntryMaturity.HIGH,
+        }
+        for stage, expected in cases.items():
+            with self.subTest(stage=stage):
+                result = self.assessor.assess(
+                    SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY,
+                    {"bottom_divergence_v2_stage": stage},
+                )
+                self.assertEqual(result, expected)
+
+    def test_bottom_divergence_v2_major_requires_actionability(self) -> None:
+        self.assertEqual(
+            self.assessor.assess(
+                SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY,
+                {
+                    "bottom_divergence_v2_stage": "major_actionable",
+                    "bottom_divergence_v2_major_actionable_entry": True,
+                },
+            ),
+            EntryMaturity.HIGH,
+        )
+        self.assertEqual(
+            self.assessor.assess(
+                SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY,
+                {
+                    "bottom_divergence_v2_stage": "major_actionable",
+                    "bottom_divergence_v2_major_actionable_entry": False,
+                    "bottom_divergence_v2_actionability_status": "extended",
+                },
+            ),
+            EntryMaturity.LOW,
+        )
+        self.assertEqual(
+            self.assessor.assess(
+                SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY,
+                {
+                    "bottom_divergence_v2_stage": "major_confirmed",
+                    "bottom_divergence_v2_major_actionable_entry": True,
+                },
+            ),
+            EntryMaturity.LOW,
+        )
 
     def test_low123_breakout_ready_high(self) -> None:
         """Low123 breakout_ready → HIGH。"""
@@ -106,6 +162,74 @@ class EntryMaturityAssessorTestCase(unittest.TestCase):
         """setup_type=NONE → LOW。"""
         result = self.assessor.assess(SetupType.NONE, {})
         self.assertEqual(result, EntryMaturity.LOW)
+
+
+class SetupFreshnessAssessorV2TestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.assessor = SetupFreshnessAssessor()
+
+    def test_uses_only_flat_v2_event_days_when_present(self) -> None:
+        for event_days, expected in ((0, 1.0), (1, 0.9), (2, 0.8)):
+            with self.subTest(event_days=event_days):
+                freshness = self.assessor.assess(
+                    SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY,
+                    {
+                        "bottom_divergence_v2_stage": "early",
+                        "bottom_divergence_v2_event_days": event_days,
+                    },
+                )
+                self.assertEqual(freshness, expected)
+
+    def test_missing_flat_event_days_ignores_record_as_of_and_confirmation(self) -> None:
+        freshness = self.assessor.assess(
+            SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY,
+            {
+                "bottom_divergence_v2_stage": "early",
+                "bottom_divergence_v2_confirmation_days": 2,
+                "bottom_divergence_confirmation_days": 0,
+                "bottom_divergence_v2_candidate_records": [
+                    {
+                        "candidate_version": "primary",
+                        "lifecycle": "confirmed",
+                        "as_of_index": 20,
+                        "early_reversal": {"bar_index": 20},
+                    },
+                ],
+            },
+        )
+
+        self.assertEqual(freshness, 0.8)
+
+    def test_missing_event_inputs_use_stage_safe_defaults(self) -> None:
+        expected = {
+            "early": 0.8,
+            "near_cleared": 0.9,
+            "major_actionable": 1.0,
+            "forming": 0.5,
+            "stale": 0.3,
+        }
+        for stage, score in expected.items():
+            with self.subTest(stage=stage):
+                freshness = self.assessor.assess(
+                    SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY,
+                    {
+                        "bottom_divergence_v2_stage": stage,
+                        "bottom_divergence_confirmation_days": 99,
+                    },
+                )
+                self.assertEqual(freshness, score)
+
+    def test_unknown_v2_stage_fails_closed_even_with_fresh_event(self) -> None:
+        for stage in ("major_confirmed", "unknown_stage"):
+            with self.subTest(stage=stage):
+                freshness = self.assessor.assess(
+                    SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY,
+                    {
+                        "bottom_divergence_v2_stage": stage,
+                        "bottom_divergence_v2_event_days": 0,
+                    },
+                )
+                self.assertEqual(freshness, 0.3)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 import src.auth as auth
 from api.app import create_app
 from src.config import Config
+from src.services import data_health_task_service as data_health_tasks
 from src.storage import DatabaseManager
 
 
@@ -22,8 +23,16 @@ def _reset_auth_globals() -> None:
     auth._rate_limit = {}
 
 
+def _reset_data_health_task_globals() -> None:
+    service = data_health_tasks._DEFAULT_TASK_SERVICE
+    data_health_tasks._DEFAULT_TASK_SERVICE = None
+    if service is not None:
+        service._executor.shutdown(wait=True, cancel_futures=True)
+
+
 def _build_client(tmp_dir: tempfile.TemporaryDirectory) -> tuple[TestClient, DatabaseManager]:
     _reset_auth_globals()
+    _reset_data_health_task_globals()
     data_dir = Path(tmp_dir.name)
     db_path = data_dir / "data_health_api.db"
     env_path = data_dir / ".env"
@@ -146,6 +155,7 @@ def test_data_health_api_exposes_summary_coverage_and_gaps():
         assert all_gaps.status_code == 200
         assert all_gaps.json()["total"] == 3
     finally:
+        _reset_data_health_task_globals()
         DatabaseManager.reset_instance()
         Config.reset_instance()
         os.environ.pop("ENV_FILE", None)
@@ -170,6 +180,7 @@ def test_data_health_api_submits_operation_and_returns_task_status():
         assert fetched.json()["task_id"] == task_id
         assert fetched.json()["operation_type"] == "repair_gaps"
     finally:
+        _reset_data_health_task_globals()
         DatabaseManager.reset_instance()
         Config.reset_instance()
         os.environ.pop("ENV_FILE", None)

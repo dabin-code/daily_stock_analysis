@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in causal bottom-divergence v2 detection with B+1-frozen MACD/trendline evidence,
+  deterministic R1/R2 resistance zones, versioned candidate records, and staged
+  `early` / `near_cleared` / `major_actionable` factors. The new strategy
+  `bottom_divergence_layered_entry_v2` remains disabled by default through
+  `BOTTOM_DIVERGENCE_V2_ENABLED=false`.
+- Added point-in-time replay coverage and the 001337 fixture beginning at 2025-12-01.
+  Its frozen explainability regression is R1=`37.46–39.20`,
+  R2=`40.61–42.90`, with 2026-07-22 early, 2026-07-23 R1, and
+  2026-08-05 R2 historical. Frozen evidence and prefix-invariance tests prevent
+  future bars from changing earlier zones or event dates.
+- Added a reproducible sample-out CLI,
+  `scripts/validate_bottom_divergence_v2.py`, with chronological 60/20/20
+  selection, canonical JSON reports, version-separated v1/v2 metrics, isolated
+  replay storage, and a zero-cost fail-closed release gate.
+- Added bounded-memory frozen-evidence replay, Windows spawn-safe stock workers,
+  stable progress/ETA output, and atomic parameter checkpoints with strict
+  data/config/YAML/algorithm identity checks, content integrity, and atomic
+  corruption recovery for resumable sample-out validation.
+- Added Web cards and backtest labels for v2 stages/resistance ranges, plus
+  production AI-review evidence and hard guards for provenance, stale,
+  invalidated, extended, and incomplete execution states.
+
+### Changed
+
+- Preserved legacy v1 detector, factors, strategy, API, and Web rendering
+  unchanged while exposing v2 through additive `bottom_divergence_v2_*`
+  fields and the existing screening API.
+- Adjustment provenance is now an execution boundary for v2: only trusted
+  `tushare_native` / `akshare_qfq_div_raw` data is executable. Unknown
+  provenance keeps early/R1 as observation-only evidence, projects historical
+  R2 as `major_unverified`, and blocks trade-plan execution even when the
+  historical breakout event remains visible.
+- Five-layer decisions, AI review, Web presentation, and backtest replay now
+  preserve the distinction between historical R2 confirmation and current
+  actionability; AI cannot override rule-level safety gates.
+- Sample-out replay now streams OHLCV once, reuses parameter-independent base
+  factors and FiveLayer sector context, evaluates immutable causal/zone evidence
+  per parameter hash, and runs only the selected hash for test/future maturation.
+- Verification gates are green: the complete backend suite has 0 failures
+  across stable shards, expected skips remain intentional, and the subsequently
+  added configuration/API cases pass separately. Python compilation, flake8,
+  `test.sh`-equivalent checks, full Web lint, and the production Web build pass.
+  Direct Bash invocation of the CRLF gate script on Windows remains only a local
+  line-ending difference because its equivalent commands pass. Exact collection
+  totals remain in delivery evidence rather than this long-lived changelog.
+- The sole remaining release blocker is the sample-out CLI's default zero-cost
+  safety gate and the absence of a user-approved non-zero cost model and run
+  range. Causal bottom-divergence v2 therefore remains disabled by default.
+
 ### 低位123检测改为段内极值选点（修复下跌中继反弹高点被误判为 P2）
 
 - Fixed `Low123TrendlineDetector` 用"最新摆动点优先"的方式挑选 P1/P2/P3，导致把真实反弹高点之后的**下跌中继反弹高点误选为 P2** 的问题。典型误判：603980 于 2026-07-28 收盘 6.50 站上伪 P2（07-17 反弹高点 6.40）即被报为 `breakout_ready` 最佳买点，而真实结构的 P2（06-24 高点 7.02）远未突破；此前多轮外围补丁（跨度上限、突破时效、破位失效）均未触及该选点根因。

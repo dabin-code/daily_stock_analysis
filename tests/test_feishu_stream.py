@@ -17,6 +17,7 @@ class DummyFeishuReplyClient(FeishuReplyClient):
         receive_id_type: str = "chat_id",
         at_user: bool = False,
         user_id: str | None = None,
+        collapse_long_content: bool = True,
     ) -> bool:
         self.calls.append(
             {

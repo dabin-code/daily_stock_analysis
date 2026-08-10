@@ -169,6 +169,91 @@ python scripts/approve_kline_skip.py --market cn --code 000001 --from-date 2026-
 | 推送 | 多渠道通知 | 企业微信、飞书、Telegram、Discord、钉钉、邮件、Pushover |
 | 自动化 | 定时运行 | GitHub Actions 定时执行，无需服务器 |
 
+### 因果底背离 v2（显式启用）
+
+默认运行仍使用 legacy v1 `bottom_divergence_double_breakout`，原有检测器、因子、
+API 和策略语义不变。不配置任何 v2 环境变量时不会改变现有筛选、回测或 Web 行为。
+
+v2 将底背离后的决策拆成三个可审计阶段，并在 B+1 只使用当时可见数据冻结下降趋势线
+与阻力区，后续 K 线只更新事件状态，不重画 R1/R2：
+
+- `early`：早期反转，目标仓位建议 20%；
+- `near_cleared`（R1）：近端阻力区确认清除，累计目标仓位建议 50%；
+- `major_actionable`（R2）：主要阻力区历史突破且当前仍可执行，累计目标仓位建议 100%。
+
+启用方式：
+
+```env
+BOTTOM_DIVERGENCE_V2_ENABLED=true
+```
+
+核心配置键及默认值：
+
+```env
+BOTTOM_DIVERGENCE_V2_CLUSTER_PCT=0.015
+BOTTOM_DIVERGENCE_V2_ATR_GAP_MULTIPLIER=0.5
+BOTTOM_DIVERGENCE_V2_ZONE_SCORE_MIN=0.45
+BOTTOM_DIVERGENCE_V2_BREAKOUT_BUFFER_PCT=0.003
+BOTTOM_DIVERGENCE_V2_SYNC_WINDOW=3
+BOTTOM_DIVERGENCE_V2_RETENTION_BARS=20
+BOTTOM_DIVERGENCE_V2_R1_WEIGHTS=0.30,0.25,0.15,0.15,0.10,0.05
+BOTTOM_DIVERGENCE_V2_R2_WEIGHTS=0.35,0.15,0.15,0.15,0.10,0.10
+```
+
+安全边界：
+
+- 只有复权因子完整有效且 provenance 为受信任的 `tushare_native` 或
+  `akshare_qfq_div_raw` 时才允许执行。
+- provenance 为 unknown 时，early/R1 仅作为观察证据；历史 R2 显示为
+  `major_unverified`，不会生成可执行交易计划。AI 复核不能绕过该硬门禁。
+- stale、invalidated、structure broken、extended 等状态均不可执行。
+- v2 默认关闭；回滚只需设置 `BOTTOM_DIVERGENCE_V2_ENABLED=false`，并从请求策略中
+  移除 `bottom_divergence_layered_entry_v2`。无需数据库迁移。
+
+001337 的解释性回放 fixture 从 2025-12-01 开始，冻结
+R1=`37.46–39.20`、R2=`40.61–42.90`；逐日结果为 2026-07-22 early、
+2026-07-23 R1、2026-08-05 R2 historical。该个股用于因果性和可解释性回归，
+不作为参数训练或发布依据。
+
+发布前必须运行样本外验证 CLI。先查看参数：
+
+```bash
+python scripts/validate_bottom_divergence_v2.py --help
+```
+
+示例：
+
+```bash
+python scripts/validate_bottom_divergence_v2.py \
+  --date-from 2024-01-01 \
+  --date-to 2026-07-31 \
+  --market cn \
+  --workers 12 \
+  --checkpoint .claude/reviews/bottom-divergence-v2-checkpoint.json \
+  --output .claude/reviews/bottom-divergence-v2-validation.json
+```
+
+长任务中断后可在输入数据和配置未变化时追加 `--resume`。断点文件会校验
+`data_version`、完整 v2 配置、参数网格、成本、日期/市场/universe、
+检测算法版本及 v1/v2 YAML 内容哈希，不匹配时拒绝续跑；写入采用带内容
+校验的临时文件原子替换，并可从有效临时副本恢复损坏的主文件。
+`--workers` 默认 `4`，内存充足的 Windows 主机可使用 `12`；基准峰值约
+`1.71 GB`，正式全市场运行前应先按机器资源完成小样本基准。
+
+交易成本配置为 `BACKTEST_BUY_COST_BPS`、`BACKTEST_SELL_COST_BPS` 和
+`BACKTEST_SLIPPAGE_BPS`。三项默认均为 `0.0`；零成本运行会先写出 canonical JSON，
+以 `ZERO_COST_MODEL` 和退出码 1 fail-close，不复制数据库、不执行长时间全市场回放。
+正式发布门禁必须由用户提供非零成本模型和明确运行范围，且只有样本资格与全部
+预注册非劣门禁同时通过时 CLI 才退出 0。
+
+截至 2026-08-07，后端完整套件已通过稳定分片覆盖：0 failed，skip 均为预期；
+随后新增的配置与 API 用例也已另行通过。`py_compile`、flake8 与 `test.sh` 等价命令
+均通过。Web 完整 lint 与生产 build 也已通过。Windows 下直接用 Bash 调用 CRLF
+脚本仅存在本地换行符差异，等价门禁命令结果为绿色。精确命令和当次输出保留在
+交付证据中，不在长期用户文档固定易漂移的收集总数。当前唯一发布阻断仍是上述
+样本外 CLI 零成本门禁，以及尚未获得用户确认的非零成本模型和运行范围；因此 v2
+继续保持默认关闭。
+
 ### 智能选股页
 
 - 选股策略默认不选中，需要手动勾选后开始筛选

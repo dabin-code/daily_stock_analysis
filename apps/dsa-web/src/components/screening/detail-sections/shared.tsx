@@ -1,5 +1,4 @@
 import type React from 'react';
-import type { ScreeningCandidateDetail } from '../../../types/screening';
 import {
   TRADE_STAGE_LABELS,
   TRADE_STAGE_COLORS,
@@ -32,10 +31,6 @@ export function InfoRow({ label, children }: { label: string; children: React.Re
       <span className="text-right font-mono text-foreground">{children}</span>
     </div>
   );
-}
-
-export function hasFiveLayerData(candidate: ScreeningCandidateDetail): boolean {
-  return candidate.tradeStage != null || candidate.marketRegime != null;
 }
 
 export {

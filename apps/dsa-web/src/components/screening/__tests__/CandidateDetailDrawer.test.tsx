@@ -238,6 +238,59 @@ describe('CandidateDetailDrawer', () => {
     expect(screen.queryAllByText(/价格持平-MACD抬升/).length).toBeGreaterThan(0);
   });
 
+  it('shows the independent v2 layered-entry card in candidate details', () => {
+    mockStore.selectedCandidate = {
+      ...mockCandidate,
+      setupType: 'bottom_divergence_layered_entry',
+      factorSnapshot: {
+        ...mockCandidate.factorSnapshot,
+        bottom_divergence_v2_candidate: true,
+        bottom_divergence_v2_stage: 'early',
+        bottom_divergence_v2_early_reversal: true,
+        bottom_divergence_v2_early_strength: 0.72,
+        bottom_divergence_v2_near_zone_lower: 39.08,
+        bottom_divergence_v2_near_zone_upper: 39.2,
+        bottom_divergence_v2_stop_loss_price: 37.66,
+      },
+    };
+
+    render(<CandidateDetailDrawer />);
+
+    expect(screen.getByText('底背离早期反转·试仓')).toBeInTheDocument();
+    expect(screen.getByText('目标20%')).toBeInTheDocument();
+    expect(screen.getByText('39.08–39.20')).toBeInTheDocument();
+  });
+
+  it('filters internal candidate records while preserving visible v2 evidence', () => {
+    mockStore.selectedCandidate = {
+      ...mockCandidate,
+      factorSnapshot: {
+        ...mockCandidate.factorSnapshot,
+        bottom_divergence_v2_candidate: true,
+        bottom_divergence_v2_stage: 'early',
+        bottom_divergence_v2_early_reversal: true,
+        bottom_divergence_v2_early_strength: 0.72,
+        bottom_divergence_v2_near_zone_lower: 39.08,
+        bottom_divergence_v2_near_zone_upper: 39.2,
+        bottom_divergence_v2_stop_loss_price: 37.66,
+        bottom_divergence_v2_candidate_version: 'candidate-v2-visible',
+        bottom_divergence_v2_zone_version: 'zone-v2-visible',
+        bottom_divergence_v2_candidate_records: [
+          { internal_marker: 'INTERNAL_CANDIDATE_RECORD_MUST_NOT_RENDER' },
+        ],
+      },
+    };
+
+    render(<CandidateDetailDrawer />);
+
+    expect(screen.getByText('底背离早期反转·试仓')).toBeInTheDocument();
+    expect(screen.getByText('目标20%')).toBeInTheDocument();
+    expect(screen.getByText('39.08–39.20')).toBeInTheDocument();
+    expect(screen.getAllByText('candidate-v2-visible').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('zone-v2-visible').length).toBeGreaterThan(0);
+    expect(screen.queryByText(/INTERNAL_CANDIDATE_RECORD_MUST_NOT_RENDER/)).not.toBeInTheDocument();
+  });
+
   it('shows merged technical hit reasons for extreme strength combo', () => {
     mockStore.selectedCandidate = {
       ...mockCandidate,

@@ -31,6 +31,25 @@ def _make_candidate(code: str = "600001", name: str = "测试", **overrides) -> 
     return ScreeningCandidateRecord(**defaults)
 
 
+def _make_review_service() -> MagicMock:
+    """Keep these unit tests deterministic and off the real LLM network path."""
+    review = MagicMock()
+    review.to_payload.return_value = {"result_source": "rules_plus_ai"}
+    review.ai_query_id = "q1"
+    review.reasoning_summary = "策略分析结果"
+    review.ai_operation_advice = "focus"
+    review.trade_stage = "focus"
+    review.confidence = 0.8
+    review.environment_ok = True
+    review.initial_position = None
+    review.stop_loss_rule = None
+    review.take_profit_plan = None
+    review.invalidation_rule = None
+    service = MagicMock()
+    service.review_candidate.return_value = review
+    return service
+
+
 class TestCandidateAnalysisServiceAgentPath:
 
     def test_analyze_top_k_accepts_skill_manager(self):
@@ -43,6 +62,7 @@ class TestCandidateAnalysisServiceAgentPath:
             analysis_service=mock_analysis,
             db_manager=mock_db,
             skill_manager=mock_skill_mgr,
+            screening_ai_review_service=_make_review_service(),
         )
         assert service._skill_manager is mock_skill_mgr
 
@@ -70,6 +90,7 @@ class TestCandidateAnalysisServiceAgentPath:
             analysis_service=mock_analysis,
             db_manager=mock_db,
             skill_manager=mock_skill_mgr,
+            screening_ai_review_service=_make_review_service(),
         )
 
         candidates = [_make_candidate("600001", matched_strategies=["volume_breakout"])]
@@ -95,6 +116,7 @@ class TestCandidateAnalysisServiceAgentPath:
         service = CandidateAnalysisService(
             analysis_service=mock_analysis,
             db_manager=mock_db,
+            screening_ai_review_service=_make_review_service(),
         )
 
         candidates = [_make_candidate("600001")]
@@ -122,6 +144,7 @@ class TestCandidateAnalysisServiceAgentPath:
             analysis_service=mock_analysis,
             db_manager=mock_db,
             skill_manager=mock_skill_mgr,
+            screening_ai_review_service=_make_review_service(),
         )
 
         candidates = [_make_candidate("600001", matched_strategies=["volume_breakout"])]

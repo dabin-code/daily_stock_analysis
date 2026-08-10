@@ -54,6 +54,7 @@ class TradeStage(str, Enum):
 class SetupType(str, Enum):
     """L4 买点类型"""
     BOTTOM_DIVERGENCE_BREAKOUT = "bottom_divergence_breakout"
+    BOTTOM_DIVERGENCE_LAYERED_ENTRY = "bottom_divergence_layered_entry"
     LOW123_BREAKOUT = "low123_breakout"
     TREND_BREAKOUT = "trend_breakout"
     TREND_PULLBACK = "trend_pullback"
@@ -155,6 +156,10 @@ class TradePlan:
     take_profit_price: Optional[float] = None
     time_stop_days: Optional[int] = None
     exit_rules: Optional[List[str]] = None
+
+    def to_payload(self) -> Dict[str, Any]:
+        """Serialize every plan field, including explicit null values."""
+        return _serialize_value(asdict(self))
 
 
 @dataclass

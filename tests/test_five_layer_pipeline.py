@@ -9,18 +9,25 @@
   4. 硬规则在集成层面生效（stand_aside → watch）
 """
 
+import json
 import unittest
-from datetime import date, datetime
+from datetime import date
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pandas as pd
 
 from src.core.market_guard import MarketGuardResult
 from src.schemas.trading_types import (
     EntryMaturity,
+    MarketEnvironment,
     MarketRegime,
     RiskLevel,
+    ThemeDecision,
     ThemePosition,
     TradeStage,
 )
+from src.services.five_layer_pipeline import FiveLayerPipeline
 from src.services.screener_service import ScreeningCandidateRecord
 
 
@@ -303,6 +310,96 @@ class DBSaveTestCase(unittest.TestCase):
         self.assertEqual(row["candidate_pool_level"], "leader_pool")
         self.assertEqual(row["risk_level"], "medium")
         self.assertEqual(row["setup_type"], "trend_breakout")
+
+    def test_layered_divergence_persistence_preserves_versioned_json_evidence(
+        self,
+    ) -> None:
+        """v2 的嵌套候选、版本和分层事件必须逐字段通过通用 JSON 保存链路。"""
+        from src.services.screening_task_service import ScreeningTaskService
+
+        factor_snapshot = {
+            "bottom_divergence_v2_stage": "early",
+            "bottom_divergence_v2_candidate_version": "candidate-v2",
+            "bottom_divergence_v2_zone_version": "zone-v2",
+            "bottom_divergence_v2_candidate_records": [
+                {
+                    "candidate_version": "candidate-v2",
+                    "lifecycle": "confirmed",
+                    "zone": {
+                        "zone_version": "zone-v2",
+                        "r1": {"lower": 37.46, "upper": 39.2},
+                        "r2": {"lower": 40.61, "upper": 42.9},
+                    },
+                    "early_reversal": {
+                        "triggered": True,
+                        "date": "2026-07-22",
+                    },
+                    "near_zone_events": {
+                        "crossed": {"date": None},
+                        "cleared_confirmed": {"date": None},
+                    },
+                    "major_zone_breakout": {
+                        "confirmed": False,
+                        "date": None,
+                    },
+                }
+            ],
+            "bottom_divergence_v2_layered_buy_points": [
+                {
+                    "level": "early",
+                    "price": 36.6,
+                    "stop": 31.36,
+                    "triggered": True,
+                }
+            ],
+        }
+        candidate = ScreeningCandidateRecord(
+            code="001337",
+            name="四川黄金",
+            rank=1,
+            rule_score=82.0,
+            rule_hits=["strategy:bottom_divergence_layered_entry_v2"],
+            factor_snapshot=factor_snapshot,
+            matched_strategies=["bottom_divergence_layered_entry_v2"],
+            strategy_scores={"bottom_divergence_layered_entry_v2": 82.0},
+            setup_type="bottom_divergence_layered_entry",
+            strategy_family="reversal",
+            primary_strategy="bottom_divergence_layered_entry_v2",
+        )
+        candidate.trade_stage = "probe_entry"
+        candidate.entry_maturity = "medium"
+        candidate.market_regime = "balanced"
+        candidate.theme_position = "main_theme"
+        candidate.candidate_pool_level = "focus_list"
+        candidate.risk_level = "medium"
+
+        payload = ScreeningTaskService._build_candidate_payloads(
+            selected=[candidate],
+            ai_results={},
+            ai_top_k=1,
+        )[0]
+        run_id = "test-run-v2-versioned-evidence"
+        self.db.create_screening_run(
+            run_id=run_id,
+            trade_date=date(2026, 7, 22),
+            trigger_type="manual",
+        )
+        self.db.save_screening_candidates(run_id=run_id, candidates=[payload])
+
+        row = self.db.list_screening_candidates(run_id=run_id)[0]
+        self.assertEqual(
+            row["matched_strategies"],
+            ["bottom_divergence_layered_entry_v2"],
+        )
+        self.assertEqual(
+            row["setup_type"],
+            "bottom_divergence_layered_entry",
+        )
+        self.assertEqual(row["factor_snapshot"], factor_snapshot)
+        self.assertEqual(
+            row["primary_strategy"],
+            "bottom_divergence_layered_entry_v2",
+        )
 
 
 class Phase2BDispatchTestCase(unittest.TestCase):
@@ -674,7 +771,9 @@ class Phase3ATradePlanTestCase(unittest.TestCase):
 
     def test_trade_plan_json_persists_to_db(self):
         """trade_plan_json 能正确写入 DB。"""
-        import tempfile, os, json
+        import json
+        import os
+        import tempfile
 
         temp_dir = tempfile.TemporaryDirectory()
         db_path = os.path.join(temp_dir.name, "test.db")
@@ -737,6 +836,413 @@ class Phase3ATradePlanTestCase(unittest.TestCase):
             Config.reset_instance()
             os.environ.pop("DATABASE_PATH", None)
             temp_dir.cleanup()
+
+
+class BottomDivergenceV2RealPipelineTestCase(unittest.TestCase):
+    def _run(
+        self,
+        *,
+        stage: str,
+        regime: MarketRegime = MarketRegime.BALANCED,
+        direct_stop: object = 8.8,
+        layered_points: list | None = None,
+        setup_type: str = "bottom_divergence_layered_entry",
+        has_stop_loss: bool = False,
+        leader_score: float = 55.0,
+        is_limit_up: bool = False,
+        actionability_status: str | None = None,
+    ) -> ScreeningCandidateRecord:
+        if layered_points is None:
+            layered_points = [
+                {
+                    "level": "early",
+                    "price": 12.0,
+                    "stop": 8.8,
+                    "triggered": stage
+                    in ("early", "near_cleared", "major_actionable"),
+                },
+                {
+                    "level": "r1",
+                    "price": 14.0,
+                    "stop": 9.5,
+                    "triggered": stage
+                    in ("near_cleared", "major_actionable"),
+                },
+                {
+                    "level": "r2",
+                    "price": 16.0,
+                    "stop": 11.0,
+                    "triggered": stage == "major_actionable",
+                },
+            ]
+        factor_snapshot = {
+            "leader_score": leader_score,
+            "extreme_strength_score": 65.0,
+            "is_limit_up": is_limit_up,
+            "has_stop_loss": has_stop_loss,
+            "bottom_divergence_v2_stage": stage,
+            "bottom_divergence_v2_actionability_status": (
+                actionability_status
+                if actionability_status is not None
+                else (
+                    "actionable"
+                    if stage == "major_actionable"
+                    else "major_not_confirmed"
+                )
+            ),
+            "bottom_divergence_v2_major_actionable_entry": (
+                stage == "major_actionable"
+            ),
+            "bottom_divergence_v2_stop_loss_price": direct_stop,
+            "bottom_divergence_v2_layered_buy_points": layered_points,
+        }
+        candidate = ScreeningCandidateRecord(
+            code="001337",
+            name="四川黄金",
+            rank=1,
+            rule_score=80.0,
+            rule_hits=["bottom_divergence_v2_candidate"],
+            factor_snapshot=factor_snapshot,
+            matched_strategies=["bottom_divergence_layered_entry_v2"],
+            strategy_scores={"bottom_divergence_layered_entry_v2": 80.0},
+            setup_type=setup_type,
+        )
+        screener = MagicMock()
+        screener._context = SimpleNamespace(run_id="v2-real-pipeline")
+        screener.evaluate.return_value = SimpleNamespace(
+            selected=[candidate],
+            rejected=[],
+        )
+        db = MagicMock()
+        db.batch_get_instrument_board_names.return_value = {
+            "001337": ["黄金"],
+        }
+        market_env = MarketEnvironment(
+            regime=regime,
+            risk_level=RiskLevel.MEDIUM,
+            is_safe=True,
+        )
+        theme_resolver = MagicMock()
+        theme_resolver.identified_themes = []
+        theme_resolver.get_main_theme_boards.return_value = set()
+        theme_resolver.resolve.return_value = ThemeDecision(
+            theme_tag="黄金",
+            theme_score=90.0,
+            theme_position=ThemePosition.MAIN_THEME,
+            leader_score=leader_score,
+            sector_strength=80.0,
+        )
+        sector_engine = MagicMock()
+        sector_engine.compute_all_sectors.return_value = []
+        registry = MagicMock()
+        registry.is_empty = False
+        aggregation = MagicMock()
+        aggregation.aggregate.return_value = []
+
+        with (
+            patch(
+                "src.services.sector_heat_engine.SectorHeatEngine",
+                return_value=sector_engine,
+            ),
+            patch(
+                "src.services.theme_mapping_registry.ThemeMappingRegistry",
+                return_value=registry,
+            ),
+            patch(
+                "src.services.theme_aggregation_service.ThemeAggregationService",
+                return_value=aggregation,
+            ),
+            patch(
+                "src.services.theme_position_resolver.ThemePositionResolver",
+                return_value=theme_resolver,
+            ),
+        ):
+            result = FiveLayerPipeline().run(
+                snapshot_df=pd.DataFrame(
+                    [{"code": "001337", "name": "四川黄金"}]
+                ),
+                trade_date=date(2026, 8, 5),
+                market_env=market_env,
+                guard_result=SimpleNamespace(is_safe=True, message="ok"),
+                screener_service=screener,
+                candidate_limit=10,
+                db_manager=db,
+                skill_manager=None,
+                lock_universe=True,
+            )
+
+        self.assertEqual(len(result.candidates), 1)
+        return result.candidates[0]
+
+    def test_global_stop_without_current_point_stays_focus(self) -> None:
+        candidate = self._run(stage="early", layered_points=[])
+
+        self.assertEqual(candidate.trade_stage, TradeStage.FOCUS.value)
+        self.assertEqual(candidate.entry_maturity, EntryMaturity.MEDIUM.value)
+        self.assertIsNone(candidate.trade_plan_json)
+
+    def test_global_stop_with_untriggered_or_wrong_level_point_stays_focus(
+        self,
+    ) -> None:
+        for layered_points in (
+            [
+                {
+                    "level": "early",
+                    "price": 12.0,
+                    "stop": 8.8,
+                    "triggered": False,
+                },
+            ],
+            [
+                {
+                    "level": "r1",
+                    "price": 14.0,
+                    "stop": 9.5,
+                    "triggered": True,
+                },
+            ],
+        ):
+            with self.subTest(layered_points=layered_points):
+                candidate = self._run(
+                    stage="early",
+                    direct_stop=8.8,
+                    layered_points=layered_points,
+                )
+
+                self.assertEqual(candidate.trade_stage, TradeStage.FOCUS.value)
+                self.assertIsNone(candidate.trade_plan_json)
+
+    def test_r1_reaches_probe_and_r2_reaches_add_by_environment(self) -> None:
+        near = self._run(stage="near_cleared")
+        major = self._run(
+            stage="major_actionable",
+            regime=MarketRegime.AGGRESSIVE,
+            leader_score=80.0,
+            is_limit_up=True,
+        )
+
+        self.assertEqual(near.trade_stage, TradeStage.PROBE_ENTRY.value)
+        self.assertEqual(major.trade_stage, TradeStage.ADD_ON_STRENGTH.value)
+        self.assertIsNotNone(near.trade_plan_json)
+        self.assertIsNotNone(major.trade_plan_json)
+
+    def test_unknown_provenance_early_and_r1_are_capped_at_focus(self) -> None:
+        for stage in ("early", "near_cleared"):
+            with self.subTest(stage=stage):
+                candidate = self._run(
+                    stage=stage,
+                    actionability_status="adjustment_unknown",
+                )
+
+                self.assertEqual(candidate.trade_stage, TradeStage.FOCUS.value)
+                self.assertIsNone(candidate.trade_plan_json)
+
+    def test_trade_plan_json_serializes_every_trade_plan_field(self) -> None:
+        candidate = self._run(stage="near_cleared")
+
+        plan = json.loads(candidate.trade_plan_json)
+        self.assertEqual(
+            set(plan),
+            {
+                "initial_position",
+                "add_rule",
+                "stop_loss_rule",
+                "take_profit_plan",
+                "invalidation_rule",
+                "risk_level",
+                "holding_expectation",
+                "execution_note",
+                "entry_price",
+                "entry_rule",
+                "entry_valid_days",
+                "stop_loss_price",
+                "take_profit_price",
+                "time_stop_days",
+                "exit_rules",
+            },
+        )
+
+        from src.backtest.execution.plan_replay_executor import PlanReplayExecutor
+
+        replay = PlanReplayExecutor.replay(
+            plan,
+            [
+                SimpleNamespace(
+                    date=date(2026, 8, 6),
+                    low=13.5,
+                    high=14.5,
+                    close=14.2,
+                )
+            ],
+        )
+        self.assertNotEqual(
+            replay.status,
+            "missing_structured_trade_plan",
+        )
+
+    def test_layered_point_stop_is_enough_without_flat_stop(self) -> None:
+        candidate = self._run(
+            stage="early",
+            direct_stop=None,
+            layered_points=[
+                {
+                    "level": "early",
+                    "price": 12.0,
+                    "stop": 8.8,
+                    "triggered": True,
+                },
+            ],
+        )
+
+        self.assertEqual(candidate.trade_stage, TradeStage.PROBE_ENTRY.value)
+
+    def test_future_layer_stops_cannot_unlock_early_entry(self) -> None:
+        candidate = self._run(
+            stage="early",
+            direct_stop=None,
+            layered_points=[
+                {
+                    "level": "early",
+                    "price": 12.0,
+                    "stop": None,
+                    "triggered": True,
+                },
+                {
+                    "level": "r1",
+                    "price": 14.0,
+                    "stop": 9.5,
+                    "triggered": False,
+                },
+                {
+                    "level": "r2",
+                    "price": 16.0,
+                    "stop": 11.0,
+                    "triggered": False,
+                },
+            ],
+        )
+
+        self.assertEqual(candidate.trade_stage, TradeStage.FOCUS.value)
+
+    def test_r1_cannot_reuse_triggered_early_stop(self) -> None:
+        candidate = self._run(
+            stage="near_cleared",
+            direct_stop=None,
+            layered_points=[
+                {
+                    "level": "early",
+                    "price": 12.0,
+                    "stop": 8.8,
+                    "triggered": True,
+                },
+                {
+                    "level": "r1",
+                    "price": 14.0,
+                    "stop": None,
+                    "triggered": True,
+                },
+            ],
+        )
+
+        self.assertEqual(candidate.trade_stage, TradeStage.FOCUS.value)
+
+    def test_major_cannot_reuse_triggered_historical_stop(self) -> None:
+        candidate = self._run(
+            stage="major_actionable",
+            regime=MarketRegime.AGGRESSIVE,
+            direct_stop=None,
+            leader_score=80.0,
+            is_limit_up=True,
+            layered_points=[
+                {
+                    "level": "early",
+                    "price": 12.0,
+                    "stop": 8.8,
+                    "triggered": True,
+                },
+                {
+                    "level": "r1",
+                    "price": 14.0,
+                    "stop": 9.5,
+                    "triggered": True,
+                },
+                {
+                    "level": "r2",
+                    "price": 16.0,
+                    "stop": None,
+                    "triggered": True,
+                },
+            ],
+        )
+
+        self.assertEqual(candidate.trade_stage, TradeStage.FOCUS.value)
+
+    def test_current_stage_point_stop_unlocks_r1_and_major(self) -> None:
+        near = self._run(
+            stage="near_cleared",
+            direct_stop=None,
+            layered_points=[
+                {
+                    "level": "early",
+                    "price": 12.0,
+                    "stop": 8.8,
+                    "triggered": True,
+                },
+                {
+                    "level": "near",
+                    "price": 14.0,
+                    "stop": 9.5,
+                    "triggered": True,
+                },
+            ],
+        )
+        major = self._run(
+            stage="major_actionable",
+            regime=MarketRegime.AGGRESSIVE,
+            direct_stop=None,
+            leader_score=80.0,
+            is_limit_up=True,
+            layered_points=[
+                {
+                    "level": "major",
+                    "price": 16.0,
+                    "stop": 11.0,
+                    "triggered": True,
+                },
+            ],
+        )
+
+        self.assertEqual(near.trade_stage, TradeStage.PROBE_ENTRY.value)
+        self.assertEqual(major.trade_stage, TradeStage.ADD_ON_STRENGTH.value)
+        self.assertIsNotNone(near.trade_plan_json)
+        self.assertIsNotNone(major.trade_plan_json)
+
+    def test_missing_or_non_positive_v2_stop_caps_at_focus(self) -> None:
+        for direct_stop, layered_points in (
+            (None, []),
+            (0, [{"level": "early", "price": 12.0, "stop": 0}]),
+            (-1, [{"level": "early", "price": 12.0, "stop": -1}]),
+        ):
+            with self.subTest(
+                direct_stop=direct_stop,
+                layered_points=layered_points,
+            ):
+                candidate = self._run(
+                    stage="near_cleared",
+                    direct_stop=direct_stop,
+                    layered_points=layered_points,
+                )
+                self.assertEqual(candidate.trade_stage, TradeStage.FOCUS.value)
+
+    def test_v1_still_uses_only_legacy_has_stop_loss(self) -> None:
+        candidate = self._run(
+            stage="early",
+            setup_type="bottom_divergence_breakout",
+            has_stop_loss=False,
+            direct_stop=8.8,
+        )
+
+        self.assertEqual(candidate.trade_stage, TradeStage.FOCUS.value)
 
 
 if __name__ == "__main__":

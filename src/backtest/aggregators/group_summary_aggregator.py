@@ -441,9 +441,10 @@ def _is_aggregatable(evaluation: FiveLayerBacktestEvaluation) -> bool:
 def _entry_return(evaluation: FiveLayerBacktestEvaluation) -> Optional[float]:
     if evaluation.signal_family != "entry":
         return None
-    if evaluation.trade_return_pct is not None:
-        return evaluation.trade_return_pct
-    return evaluation.forward_return_5d
+    trade_return = _as_number(getattr(evaluation, "trade_return_pct", None))
+    if trade_return is not None:
+        return trade_return
+    return _as_number(getattr(evaluation, "forward_return_5d", None))
 
 
 def _build_sample_baseline(

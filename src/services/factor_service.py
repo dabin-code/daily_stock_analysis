@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import select
 
-from src.config import get_config
+from src.config import Config, get_config
 from src.core.trading_calendar import get_market_for_stock
 from src.storage import DatabaseManager, StockDaily
 from src.indicators.ma_breakout_detector import MABreakoutDetector
@@ -20,6 +20,13 @@ from src.indicators.pattern_detector import PatternDetector
 from src.indicators.low_123_trendline_detector import Low123TrendlineDetector
 from src.indicators.bottom_divergence_breakout_detector import (
     BottomDivergenceBreakoutDetector,
+)
+from src.indicators.causal_bottom_divergence_detector import (
+    CausalBottomDivergenceDetector,
+)
+from src.indicators.resistance_zone_detector import (
+    ResistanceZoneMetadata,
+    ResistanceZoneParams,
 )
 from src.indicators.shrink_pullback_detector import ShrinkPullbackDetector
 
@@ -59,19 +66,24 @@ class FactorService:
         min_list_days: Optional[int] = None,
         theme_context: Optional[object] = None,
         fetcher_manager: Optional[Any] = None,
+        config: Optional[Config] = None,
     ) -> None:
-        config = get_config()
+        self.config = config or get_config()
         self.db = db_manager or DatabaseManager.get_instance()
         self.lookback_days = (
-            lookback_days if lookback_days is not None else config.screening_factor_lookback_days
+            lookback_days
+            if lookback_days is not None
+            else self.config.screening_factor_lookback_days
         )
         self.min_list_days = (
-            min_list_days if min_list_days is not None else config.screening_min_list_days
+            min_list_days
+            if min_list_days is not None
+            else self.config.screening_min_list_days
         )
         self.breakout_lookback_days = (
             breakout_lookback_days
             if breakout_lookback_days is not None
-            else config.screening_breakout_lookback_days
+            else self.config.screening_breakout_lookback_days
         )
         # 保留 theme_context 仅为兼容旧调用方；主链路因子构建已与外部题材上下文解耦。
         self.theme_context = theme_context
@@ -121,6 +133,9 @@ class FactorService:
                     "volume": row.volume,
                     "amount": row.amount,
                     "pct_chg": row.pct_chg,
+                    "data_source": row.data_source,
+                    "adj_factor": row.adj_factor,
+                    "adj_factor_source": row.adj_factor_source,
                 }
                 for row in rows
             )
@@ -129,10 +144,29 @@ class FactorService:
             return pd.DataFrame()
 
         bars = pd.DataFrame(all_bar_dicts)
+        return self.build_factor_snapshot_from_groups(
+            universe_df,
+            {
+                str(code): group.sort_values("date").reset_index(drop=True)
+                for code, group in bars.groupby("code", sort=True)
+            },
+            trade_date=trade_date,
+            persist=persist,
+        )
 
+    def build_factor_snapshot_from_groups(
+        self,
+        universe_df: pd.DataFrame,
+        bar_groups: Dict[str, pd.DataFrame],
+        *,
+        trade_date: date,
+        persist: bool = False,
+    ) -> pd.DataFrame:
+        """Build an identical snapshot from preloaded, date-bounded bars."""
         snapshots = []
         universe_map = universe_df.set_index("code").to_dict("index")
-        for code, group in bars.groupby("code"):
+        for code in sorted(bar_groups):
+            group = bar_groups[code]
             group = group.sort_values("date").reset_index(drop=True)
             if len(group) < 20:
                 continue
@@ -477,6 +511,7 @@ class FactorService:
 
         # Bottom divergence double breakout factors
         bottom_div_factors = self._compute_bottom_divergence_factors(group)
+        bottom_div_v2_factors = self._compute_bottom_divergence_v2_factors(group)
 
         # Trend pullback freshness / support confirmation
         shrink_pullback_factors = self._compute_shrink_pullback_factors(group)
@@ -508,6 +543,7 @@ class FactorService:
             **trendline_factors,
             **pattern_123_factors,
             **bottom_div_factors,
+            **bottom_div_v2_factors,
             **ma100_low123_factors,
             **ma100_60min_factors,
         }
@@ -880,6 +916,380 @@ class FactorService:
         }
 
     @staticmethod
+    def _bottom_divergence_v2_defaults(
+        status: str,
+        as_of_index: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Return the stable additive v2 snapshot schema."""
+        return {
+            "bottom_divergence_v2_candidate": False,
+            "bottom_divergence_v2_stage": "rejected",
+            "bottom_divergence_v2_pattern_code": None,
+            "bottom_divergence_v2_pattern_label": None,
+            "bottom_divergence_v2_early_reversal": False,
+            "bottom_divergence_v2_early_strength": 0.0,
+            "bottom_divergence_v2_near_zone_lower": None,
+            "bottom_divergence_v2_near_zone_upper": None,
+            "bottom_divergence_v2_near_zone_score": None,
+            "bottom_divergence_v2_near_entered": False,
+            "bottom_divergence_v2_near_accepted": False,
+            "bottom_divergence_v2_near_crossed": False,
+            "bottom_divergence_v2_near_cleared": False,
+            "bottom_divergence_v2_major_zone_lower": None,
+            "bottom_divergence_v2_major_zone_upper": None,
+            "bottom_divergence_v2_major_zone_score": None,
+            "bottom_divergence_v2_major_breakout": False,
+            "bottom_divergence_v2_major_actionable_entry": False,
+            "bottom_divergence_v2_actionability_status": status,
+            "bottom_divergence_v2_confirmation_days": None,
+            "bottom_divergence_v2_extended_pct": None,
+            "bottom_divergence_v2_extended_pct_raw": None,
+            "bottom_divergence_v2_stop_loss_price": None,
+            "bottom_divergence_v2_candidate_version": None,
+            "bottom_divergence_v2_zone_version": None,
+            "bottom_divergence_v2_candidate_records": [],
+            "bottom_divergence_v2_layered_buy_points": [],
+            "bottom_divergence_v2_as_of_index": as_of_index,
+            "bottom_divergence_v2_early_event_index": None,
+            "bottom_divergence_v2_near_event_index": None,
+            "bottom_divergence_v2_major_event_index": None,
+            "bottom_divergence_v2_active_event_index": None,
+            "bottom_divergence_v2_event_days": None,
+            "bottom_divergence_v2_degradation_reasons": [],
+            "bottom_divergence_v2_hit_reasons": [],
+        }
+
+    @staticmethod
+    def _bottom_divergence_v2_metadata(
+        group: pd.DataFrame,
+    ) -> tuple[ResistanceZoneMetadata, bool]:
+        """Build deterministic provenance metadata and adjustment safety state."""
+        trusted_adjustment_sources = {
+            "tushare_native",
+            "akshare_qfq_div_raw",
+        }
+
+        def normalized_values(column: str) -> tuple[list[str], bool]:
+            if column not in group.columns:
+                return [], True
+            values: list[str] = []
+            missing = False
+            for raw in group[column].tolist():
+                if pd.isna(raw) or not str(raw).strip():
+                    missing = True
+                    continue
+                values.append(str(raw).strip())
+            return sorted(set(values)), missing
+
+        data_sources, data_source_missing = normalized_values("data_source")
+        adjustment_sources, adjustment_source_missing = normalized_values(
+            "adj_factor_source"
+        )
+        source_unknown = (
+            data_source_missing
+            or adjustment_source_missing
+            or not data_sources
+            or not adjustment_sources
+            or any(
+                value.lower() not in trusted_adjustment_sources
+                for value in adjustment_sources
+            )
+        )
+
+        adjustment_unknown = source_unknown
+        if "adj_factor" not in group.columns:
+            adjustment_unknown = True
+        else:
+            factors = pd.to_numeric(group["adj_factor"], errors="coerce")
+            adjustment_unknown = adjustment_unknown or bool(
+                factors.isna().any()
+                or not np.isfinite(factors.to_numpy(dtype=float)).all()
+                or (factors <= 0).any()
+            )
+
+        metadata = ResistanceZoneMetadata(
+            data_source="|".join(data_sources) or None,
+            adj_factor_source=(
+                "unknown"
+                if adjustment_unknown
+                else "|".join(adjustment_sources) or None
+            ),
+        )
+        return metadata, adjustment_unknown
+
+    def _compute_bottom_divergence_v2_factors(
+        self,
+        group: pd.DataFrame,
+        frozen_evidence: Any = None,
+    ) -> Dict[str, Any]:
+        """Run causal v2 when enabled and flatten only its primary output."""
+        as_of_index = (
+            len(group) - 1
+            if isinstance(group, pd.DataFrame) and not group.empty
+            else None
+        )
+        config = getattr(self, "config", None)
+        if config is None or not config.bottom_divergence_v2_enabled:
+            return self._bottom_divergence_v2_defaults(
+                "disabled",
+                as_of_index,
+            )
+        if self.config._bottom_divergence_v2_parse_errors:
+            factors = self._bottom_divergence_v2_defaults(
+                "invalid_config",
+                as_of_index,
+            )
+            factors["bottom_divergence_v2_degradation_reasons"] = [
+                "invalid_config"
+            ]
+            return factors
+        if any(
+            type(value) is not int or value <= 0
+            for value in (
+                self.config.bottom_divergence_v2_sync_window,
+                self.config.bottom_divergence_v2_retention_bars,
+            )
+        ):
+            factors = self._bottom_divergence_v2_defaults(
+                "invalid_config",
+                as_of_index,
+            )
+            factors["bottom_divergence_v2_degradation_reasons"] = [
+                "invalid_config"
+            ]
+            return factors
+        if group is None or len(group) < 60:
+            return self._bottom_divergence_v2_defaults(
+                "insufficient_data",
+                as_of_index,
+            )
+
+        try:
+            zone_params = self._bottom_divergence_v2_zone_params()
+        except (IndexError, TypeError, ValueError):
+            factors = self._bottom_divergence_v2_defaults(
+                "invalid_config",
+                as_of_index,
+            )
+            factors["bottom_divergence_v2_degradation_reasons"] = [
+                "invalid_config"
+            ]
+            return factors
+        metadata, _ = self._bottom_divergence_v2_metadata(
+            group
+        )
+        detector_result = (
+            CausalBottomDivergenceDetector.detect(
+                group,
+                as_of_index=len(group) - 1,
+                zone_params=zone_params,
+                metadata=metadata,
+            )
+            if frozen_evidence is None
+            else CausalBottomDivergenceDetector.evaluate_frozen_evidence(
+                group,
+                frozen_evidence,
+                zone_params=zone_params,
+            )
+        )
+
+        factors = self._bottom_divergence_v2_defaults(
+            str(detector_result.get("actionability_status") or "no_primary_candidate"),
+            as_of_index,
+        )
+        factors["bottom_divergence_v2_candidate_records"] = list(
+            detector_result.get("candidate_records") or []
+        )
+        factors["bottom_divergence_v2_degradation_reasons"] = list(
+            detector_result.get("degradation_reasons") or []
+        )
+        if not detector_result.get("found"):
+            return factors
+
+        stage = str(detector_result.get("stage") or "rejected")
+        pattern = detector_result.get("pattern") or {}
+        early = detector_result.get("early_reversal") or {}
+        near = detector_result.get("near_zone_events") or {}
+        major = detector_result.get("major_zone_breakout") or {}
+        actionable = (
+            detector_result.get("major_zone_actionable_entry") or {}
+        )
+        zone = detector_result.get("zone") or {}
+        near_zone = zone.get("r1") or {}
+        major_zone = zone.get("r2") or {}
+        zone_metadata = zone.get("metadata") or {}
+        candidate_adjustment_source = str(
+            zone_metadata.get("adj_factor_source")
+            or metadata.adj_factor_source
+            or ""
+        ).strip().lower()
+        adjustment_unknown = candidate_adjustment_source == "unknown"
+        early_event_index = early.get("bar_index")
+        near_event_index = (
+            near.get("cleared_confirmed") or {}
+        ).get("bar_index")
+        major_event_index = (
+            major.get("bar_index") if major.get("confirmed") else None
+        )
+
+        factors.update({
+            "bottom_divergence_v2_candidate": stage in {
+                "early",
+                "near_cleared",
+                "major_actionable",
+            },
+            "bottom_divergence_v2_stage": stage,
+            "bottom_divergence_v2_pattern_code": pattern.get("code"),
+            "bottom_divergence_v2_pattern_label": pattern.get("label"),
+            "bottom_divergence_v2_early_reversal": (
+                early.get("bar_index") is not None
+            ),
+            "bottom_divergence_v2_early_strength": float(
+                early.get("strength", 0.0) or 0.0
+            ),
+            "bottom_divergence_v2_near_zone_lower": near_zone.get("lower"),
+            "bottom_divergence_v2_near_zone_upper": near_zone.get("upper"),
+            "bottom_divergence_v2_near_zone_score": near_zone.get("score"),
+            "bottom_divergence_v2_near_entered": (
+                (near.get("entered") or {}).get("bar_index") is not None
+            ),
+            "bottom_divergence_v2_near_accepted": (
+                (near.get("accepted") or {}).get("bar_index") is not None
+            ),
+            "bottom_divergence_v2_near_crossed": (
+                (near.get("crossed") or {}).get("bar_index") is not None
+            ),
+            "bottom_divergence_v2_near_cleared": (
+                (near.get("cleared_confirmed") or {}).get("bar_index")
+                is not None
+            ),
+            "bottom_divergence_v2_major_zone_lower": major_zone.get("lower"),
+            "bottom_divergence_v2_major_zone_upper": major_zone.get("upper"),
+            "bottom_divergence_v2_major_zone_score": major_zone.get("score"),
+            "bottom_divergence_v2_major_breakout": (
+                bool(major.get("confirmed", False))
+            ),
+            "bottom_divergence_v2_major_actionable_entry": bool(
+                actionable.get("actionable", False)
+            ),
+            "bottom_divergence_v2_actionability_status": str(
+                detector_result.get("actionability_status") or ""
+            ),
+            "bottom_divergence_v2_confirmation_days": actionable.get(
+                "confirmation_days"
+            ),
+            "bottom_divergence_v2_extended_pct": actionable.get("extended_pct"),
+            "bottom_divergence_v2_extended_pct_raw": actionable.get(
+                "extended_pct_raw"
+            ),
+            "bottom_divergence_v2_stop_loss_price": detector_result.get(
+                "stop_loss_price"
+            ),
+            "bottom_divergence_v2_candidate_version": detector_result.get(
+                "candidate_version"
+            ),
+            "bottom_divergence_v2_zone_version": zone.get("zone_version"),
+            "bottom_divergence_v2_layered_buy_points": list(
+                detector_result.get("layered_buy_points") or []
+            ),
+            "bottom_divergence_v2_early_event_index": early_event_index,
+            "bottom_divergence_v2_near_event_index": near_event_index,
+            "bottom_divergence_v2_major_event_index": major_event_index,
+            "bottom_divergence_v2_hit_reasons": list(
+                detector_result.get("hit_reasons") or []
+            ),
+        })
+        if adjustment_unknown:
+            if factors["bottom_divergence_v2_major_breakout"]:
+                factors["bottom_divergence_v2_candidate"] = False
+                factors["bottom_divergence_v2_stage"] = "major_unverified"
+            factors["bottom_divergence_v2_major_actionable_entry"] = False
+            factors[
+                "bottom_divergence_v2_actionability_status"
+            ] = "adjustment_unknown"
+
+        active_event_index = None
+        final_stage = factors["bottom_divergence_v2_stage"]
+        if final_stage == "major_actionable":
+            active_event_index = major_event_index
+        elif final_stage == "near_cleared":
+            active_event_index = near_event_index
+        elif final_stage == "early":
+            active_event_index = early_event_index
+        if (
+            type(active_event_index) is int
+            and as_of_index is not None
+            and 0 <= active_event_index <= as_of_index
+        ):
+            factors[
+                "bottom_divergence_v2_active_event_index"
+            ] = active_event_index
+            factors["bottom_divergence_v2_event_days"] = (
+                as_of_index - active_event_index
+            )
+        return factors
+
+    def _bottom_divergence_v2_zone_params(self) -> ResistanceZoneParams:
+        weights_r1 = self.config.bottom_divergence_v2_r1_weights
+        weights_r2 = self.config.bottom_divergence_v2_r2_weights
+        return ResistanceZoneParams(
+            swing_order=5,
+            cluster_pct=self.config.bottom_divergence_v2_cluster_pct,
+            atr_gap_multiplier=(
+                self.config.bottom_divergence_v2_atr_gap_multiplier
+            ),
+            long_wick_ratio=0.5,
+            rejection_wick_ratio=0.35,
+            rejection_atr_ratio=0.5,
+            score_min=self.config.bottom_divergence_v2_zone_score_min,
+            overlap_ratio=0.60,
+            breakout_buffer_pct=(
+                self.config.bottom_divergence_v2_breakout_buffer_pct
+            ),
+            sync_window=self.config.bottom_divergence_v2_sync_window,
+            invalidated_retention_bars=(
+                self.config.bottom_divergence_v2_retention_bars
+            ),
+            r1_touch_weight=weights_r1[0],
+            r1_recency_weight=weights_r1[1],
+            r1_volume_weight=weights_r1[2],
+            r1_rejection_weight=weights_r1[3],
+            r1_tightness_weight=weights_r1[4],
+            r1_distance_weight=weights_r1[5],
+            r2_touch_weight=weights_r2[0],
+            r2_recency_weight=weights_r2[1],
+            r2_volume_weight=weights_r2[2],
+            r2_rejection_weight=weights_r2[3],
+            r2_tightness_weight=weights_r2[4],
+            r2_height_weight=weights_r2[5],
+        )
+
+    def freeze_bottom_divergence_v2_evidence(
+        self,
+        group: pd.DataFrame,
+    ) -> Any:
+        """Freeze causal v2 evidence for reuse across grid parameters."""
+        metadata, _ = self._bottom_divergence_v2_metadata(group)
+        return CausalBottomDivergenceDetector.freeze_evidence(
+            group,
+            as_of_index=len(group) - 1,
+            zone_params=self._bottom_divergence_v2_zone_params(),
+            metadata=metadata,
+        )
+
+    def compute_bottom_divergence_v2_factors(
+        self,
+        group: pd.DataFrame,
+        *,
+        frozen_evidence: Any = None,
+    ) -> Dict[str, Any]:
+        """Public cached-validation boundary for v2-only factor evaluation."""
+        return self._compute_bottom_divergence_v2_factors(
+            group,
+            frozen_evidence=frozen_evidence,
+        )
+
+    @staticmethod
     def _compute_bottom_divergence_confirmation_days(
         group: pd.DataFrame,
         detector_result: dict,
@@ -1004,7 +1414,6 @@ class FactorService:
         )
 
         # bars_since_entry: how many bars since the 123 breakout confirmation
-        entry_price = pattern_123_factors.get("pattern_123_entry_price")
         signal_strength = float(pattern_123_factors.get("pattern_123_signal_strength", 0.0))
         bars_since_entry = FactorService._compute_low123_confirmation_days(group, pattern_123_raw)
         data_complete = p123_breakout_ready and bars_since_entry is not None

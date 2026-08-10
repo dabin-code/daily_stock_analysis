@@ -244,6 +244,133 @@ class TestFiveLayerBacktestPipeline(unittest.TestCase):
                     )
             session.commit()
 
+    def _seed_layered_divergence_versioned_run(self):
+        from src.storage import ScreeningCandidate, ScreeningRun, StockDaily
+
+        trade_date = date(2024, 6, 3)
+        with self.db.get_session() as session:
+            session.add(
+                ScreeningRun(
+                    run_id="sr-layered-divergence-v2",
+                    trade_date=trade_date,
+                    market="cn",
+                    status="completed",
+                )
+            )
+            session.flush()
+            session.add_all(
+                [
+                    ScreeningCandidate(
+                        run_id="sr-layered-divergence-v2",
+                        code="001337",
+                        name="四川黄金",
+                        rank=1,
+                        rule_score=92.0,
+                        matched_strategies_json=json.dumps(
+                            ["bottom_divergence_layered_entry_v2"]
+                        ),
+                        rule_hits_json=json.dumps(
+                            ["strategy:bottom_divergence_layered_entry_v2"]
+                        ),
+                        factor_snapshot_json=json.dumps(
+                            {
+                                "bottom_divergence_v2_stage": "major_actionable",
+                                "bottom_divergence_v2_candidate_version": "candidate-v2",
+                                "bottom_divergence_v2_zone_version": "zone-v2",
+                                "bottom_divergence_v2_candidate_records": [
+                                    {
+                                        "candidate_version": "candidate-v2",
+                                        "zone": {"zone_version": "zone-v2"},
+                                        "major_zone_breakout": {
+                                            "confirmed": True,
+                                            "date": "2024-06-03",
+                                        },
+                                    }
+                                ],
+                            }
+                        ),
+                        candidate_decision_json=json.dumps(
+                            {
+                                "primary_strategy": (
+                                    "bottom_divergence_layered_entry_v2"
+                                ),
+                                "contributing_strategies": [],
+                                "strategy_scores": {
+                                    "bottom_divergence_layered_entry_v2": 92.0
+                                },
+                            }
+                        ),
+                        trade_stage="probe_entry",
+                        setup_type="bottom_divergence_layered_entry",
+                        entry_maturity="high",
+                        market_regime="balanced",
+                        theme_position="main_theme",
+                        candidate_pool_level="leader_pool",
+                        risk_level="medium",
+                        trade_plan_json=json.dumps(
+                            {"take_profit": 7.0, "stop_loss": -4.0}
+                        ),
+                    ),
+                    ScreeningCandidate(
+                        run_id="sr-layered-divergence-v2",
+                        code="300750",
+                        name="宁德时代",
+                        rank=2,
+                        rule_score=88.0,
+                        matched_strategies_json=json.dumps(
+                            ["bottom_divergence_double_breakout"]
+                        ),
+                        rule_hits_json=json.dumps(
+                            ["strategy:bottom_divergence_double_breakout"]
+                        ),
+                        factor_snapshot_json=json.dumps(
+                            {
+                                "bottom_divergence_state": "confirmed",
+                                "bottom_divergence_double_breakout": True,
+                            }
+                        ),
+                        candidate_decision_json=json.dumps(
+                            {
+                                "primary_strategy": (
+                                    "bottom_divergence_double_breakout"
+                                ),
+                                "contributing_strategies": [],
+                                "strategy_scores": {
+                                    "bottom_divergence_double_breakout": 88.0
+                                },
+                            }
+                        ),
+                        trade_stage="probe_entry",
+                        setup_type="bottom_divergence_breakout",
+                        entry_maturity="high",
+                        market_regime="balanced",
+                        theme_position="main_theme",
+                        candidate_pool_level="leader_pool",
+                        risk_level="medium",
+                        trade_plan_json=json.dumps(
+                            {"take_profit": 6.0, "stop_loss": -3.5}
+                        ),
+                    ),
+                ]
+            )
+            for code, base_price in (("001337", 40.0), ("300750", 180.0)):
+                for offset in range(1, 12):
+                    price = base_price + offset * 0.5
+                    session.add(
+                        StockDaily(
+                            code=code,
+                            date=trade_date + timedelta(days=offset),
+                            open=price - 0.2,
+                            high=price + 0.8,
+                            low=price - 0.8,
+                            close=price,
+                            pct_chg=0.5,
+                            volume=1000000.0,
+                            amount=price * 1000000.0,
+                        )
+                    )
+            session.commit()
+
     def _seed_stage_recovery_screening_run(self):
         from src.storage import ScreeningRun, ScreeningCandidate
         with self.db.get_session() as session:
@@ -669,6 +796,74 @@ class TestFiveLayerBacktestPipeline(unittest.TestCase):
         self.assertEqual(low123.snapshot_setup_type, "low123_breakout")
         self.assertTrue(factor_snapshot["ma100_low123_confirmed"])
         self.assertEqual(factor_snapshot["ma100_low123_validation_status"], "confirmed")
+
+    def test_pipeline_preserves_layered_divergence_versions_and_separates_v1_v2(
+        self,
+    ) -> None:
+        from src.backtest.repositories.evaluation_repo import EvaluationRepository
+        from src.backtest.services.backtest_service import FiveLayerBacktestService
+
+        self._seed_layered_divergence_versioned_run()
+        service = FiveLayerBacktestService(db_manager=self.db)
+        run = service.run_backtest_pipeline(
+            screening_run_id="sr-layered-divergence-v2",
+            evaluation_mode="historical_snapshot",
+            execution_model="conservative",
+        )
+        evaluations = EvaluationRepository(self.db).get_by_run(
+            run.backtest_run_id
+        )
+        by_code = {evaluation.code: evaluation for evaluation in evaluations}
+        v2 = by_code["001337"]
+        v1 = by_code["300750"]
+
+        v2_evidence = json.loads(v2.evidence_json)
+        self.assertEqual(
+            v2_evidence["matched_strategies"],
+            ["bottom_divergence_layered_entry_v2"],
+        )
+        self.assertEqual(
+            v2_evidence["primary_strategy"],
+            "bottom_divergence_layered_entry_v2",
+        )
+        self.assertEqual(v2_evidence["candidate_version"], "candidate-v2")
+        self.assertEqual(v2_evidence["zone_version"], "zone-v2")
+        self.assertEqual(
+            v2.snapshot_setup_type,
+            "bottom_divergence_layered_entry",
+        )
+        self.assertEqual(
+            json.loads(v2.factor_snapshot_json)[
+                "bottom_divergence_v2_candidate_records"
+            ][0]["candidate_version"],
+            "candidate-v2",
+        )
+
+        self.assertEqual(
+            json.loads(v1.evidence_json)["primary_strategy"],
+            "bottom_divergence_double_breakout",
+        )
+        self.assertEqual(
+            v1.snapshot_setup_type,
+            "bottom_divergence_breakout",
+        )
+
+        summaries = service.compute_summaries(run.backtest_run_id)
+        strategy_cohorts = {
+            json.loads(summary.metrics_json)["strategy_cohort_context"][
+                "primary_strategy"
+            ]
+            for summary in summaries
+            if summary.group_type == "strategy_cohort"
+        }
+        self.assertIn(
+            "bottom_divergence_layered_entry_v2",
+            strategy_cohorts,
+        )
+        self.assertIn(
+            "bottom_divergence_double_breakout",
+            strategy_cohorts,
+        )
 
     def test_pipeline_recovers_entry_under_rule_replay_when_snapshot_was_too_conservative(self):
         """Under ``rule_replay``, strong entry snapshots should be replayed

@@ -1,6 +1,29 @@
 from __future__ import annotations
 
+import math
+
 from src.schemas.trading_types import SetupType
+
+
+_V2_STAGE_DEFAULTS = {
+    "early": 0.8,
+    "near_cleared": 0.9,
+    "major_actionable": 1.0,
+    "forming": 0.5,
+    "stale": 0.3,
+    "extended": 0.3,
+    "invalidated": 0.3,
+    "major_unverified": 0.3,
+    "breakout_failed": 0.3,
+    "rejected": 0.3,
+}
+
+
+def _non_negative_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    parsed = float(value)
+    return parsed if math.isfinite(parsed) and parsed >= 0 else None
 
 
 class SetupFreshnessAssessor:
@@ -28,6 +51,19 @@ class SetupFreshnessAssessor:
     def assess(self, setup_type: SetupType, factor_snapshot: dict) -> float:
         if setup_type == SetupType.NONE:
             return 0.0
+
+        if setup_type == SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY:
+            stage = str(
+                factor_snapshot.get("bottom_divergence_v2_stage") or "rejected"
+            )
+            if stage not in _V2_STAGE_DEFAULTS:
+                return 0.3
+            event_days = _non_negative_number(
+                factor_snapshot.get("bottom_divergence_v2_event_days")
+            )
+            if event_days is not None:
+                return self._score_from_breakout_days(event_days + 1)
+            return _V2_STAGE_DEFAULTS.get(stage, 0.3)
 
         # ── Priority override for bottom-divergence double-breakout ──
         # BottomDivergenceBreakoutDetector 会写入 ``bottom_divergence_

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from api.v1.schemas.screening import (
     ScreeningCandidateDetailResponse,
@@ -26,6 +26,20 @@ from src.services.screening_task_service import ScreeningTaskService, ScreeningT
 from src.services.fast_backfill_service import FastBackfillService
 
 router = APIRouter()
+
+
+def _sanitize_candidate_for_list(item: dict[str, Any]) -> dict[str, Any]:
+    """Copy one candidate and omit detail-only v2 evidence from list output."""
+    sanitized = dict(item)
+    factor_snapshot = sanitized.get("factor_snapshot")
+    if isinstance(factor_snapshot, dict):
+        sanitized_snapshot = dict(factor_snapshot)
+        sanitized_snapshot.pop(
+            "bottom_divergence_v2_candidate_records",
+            None,
+        )
+        sanitized["factor_snapshot"] = sanitized_snapshot
+    return sanitized
 
 
 # OpenClaw 接口模型
@@ -141,9 +155,9 @@ def create_screening_run(request: CreateScreeningRunRequest) -> ScreeningRunResp
     runtime_config = service.resolve_run_config(
         mode=request.mode,
         candidate_limit=request.candidate_limit,
-        ai_top_k=request.ai_top_k,
+        ai_top_k=None,
     )
-    if runtime_config.ai_top_k > runtime_config.candidate_limit:
+    if request.ai_top_k is not None and request.ai_top_k > runtime_config.candidate_limit:
         raise HTTPException(
             status_code=422,
             detail={
@@ -233,7 +247,14 @@ def list_screening_candidates(
             status_code=409,
             detail={"error": "run_not_ready", "message": "筛选任务尚未完成，候选结果不可用", "run_id": run_id},
         )
-    items = service.list_candidates(run_id=run_id, limit=limit, with_ai_only=with_ai_only)
+    items = [
+        _sanitize_candidate_for_list(item)
+        for item in service.list_candidates(
+            run_id=run_id,
+            limit=limit,
+            with_ai_only=with_ai_only,
+        )
+    ]
     return ScreeningCandidateListResponse(total=len(items), items=items)
 
 

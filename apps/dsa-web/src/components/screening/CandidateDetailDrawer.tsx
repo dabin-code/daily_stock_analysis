@@ -62,6 +62,10 @@ const TECHNICAL_RULE_KEYS = new Set([
   'bottom_divergence_double_breakout',
 ]);
 
+const HIDDEN_FACTOR_SNAPSHOT_KEYS = new Set([
+  'bottom_divergence_v2_candidate_records',
+]);
+
 function formatPrimitiveValue(value: unknown): string {
   if (value == null) return EMPTY_VALUE;
   if (typeof value === 'number') return Number.isInteger(value) ? String(value) : value.toFixed(2);
@@ -373,6 +377,8 @@ export const CandidateDetailDrawer: React.FC = () => {
     .filter((item) => TECHNICAL_RULE_KEYS.has(item.key))
     .map((item) => item.translated);
   const technicalPatterns = extractTechnicalPatterns(factorSnapshot, technicalHitsFromRules);
+  const visibleFactorEntries = Object.entries(factorSnapshot)
+    .filter(([key]) => !HIDDEN_FACTOR_SNAPSHOT_KEYS.has(key));
 
   const useFiveLayer = selectedCandidate != null && hasFiveLayerData(selectedCandidate);
 
@@ -461,10 +467,10 @@ export const CandidateDetailDrawer: React.FC = () => {
           )}
 
           {/* Factor snapshot (collapsed for five-layer, expanded for legacy) */}
-          {Object.keys(factorSnapshot).length > 0 && (
+          {visibleFactorEntries.length > 0 && (
             <Collapsible title="因子快照" defaultOpen={!useFiveLayer}>
               <div className="max-h-60 overflow-y-auto">
-                {Object.entries(factorSnapshot).map(([key, value]) => (
+                {visibleFactorEntries.map(([key, value]) => (
                   <FactorRow key={key} label={key} value={value} />
                 ))}
               </div>

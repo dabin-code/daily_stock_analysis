@@ -26,14 +26,16 @@ from typing import Any, Dict, List, Optional, Set
 import pandas as pd
 
 from src.schemas.trading_types import (
-    CandidatePoolLevel,
     MarketEnvironment,
-    MarketRegime,
     SetupType,
-    ThemePosition,
     TradeStage,
 )
 from src.services._debug_session_logger import write_debug_log
+from src.services.bottom_divergence_v2_trade_support import (
+    is_v2_execution_allowed,
+    resolve_current_stage_buy_point,
+    resolve_current_stage_stop_loss,
+)
 from src.services.screener_service import ScreeningCandidateRecord, ScreenerService
 
 logger = logging.getLogger(__name__)
@@ -103,6 +105,7 @@ def _normalize_candidate_record(item: Any) -> ScreeningCandidateRecord:
             contributing_strategies=list(item.get("contributing_strategies", []) or []),
         )
     raise TypeError(f"Unsupported candidate type for five-layer pipeline: {type(item)!r}")
+
 
 # ── 五层优先级排序权重 ──────────────────────────────────────────────────────
 _STAGE_PRIORITY: Dict[str, int] = {
@@ -188,8 +191,32 @@ class FiveLayerPipeline:
         sector_results = []
         all_sector_results = []
         try:
-            sector_engine = SectorHeatEngine(db_manager=db_manager)
-            all_sector_results = sector_engine.compute_all_sectors(snapshot_df, trade_date)
+            data_version = getattr(
+                db_manager,
+                "validation_data_version",
+                None,
+            )
+            cache_key = (
+                (str(data_version), trade_date)
+                if data_version is not None
+                else None
+            )
+            validation_cache = getattr(
+                self,
+                "_validation_sector_cache",
+                {},
+            )
+            if cache_key is not None and cache_key in validation_cache:
+                all_sector_results = validation_cache[cache_key]
+            else:
+                sector_engine = SectorHeatEngine(db_manager=db_manager)
+                all_sector_results = sector_engine.compute_all_sectors(
+                    snapshot_df,
+                    trade_date,
+                )
+                if cache_key is not None:
+                    validation_cache[cache_key] = all_sector_results
+                    self._validation_sector_cache = validation_cache
             sector_results = [
                 s for s in all_sector_results
                 if s.sector_status in ("hot", "warm")
@@ -528,7 +555,20 @@ class FiveLayerPipeline:
             )
 
             # L5: 交易阶段裁决
-            has_stop = bool(fs.get("has_stop_loss", False))
+            v2_execution_allowed = (
+                is_v2_execution_allowed(fs)
+                if st == SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY
+                else True
+            )
+            has_stop = (
+                (
+                    v2_execution_allowed
+                    and resolve_current_stage_buy_point(fs) is not None
+                    and resolve_current_stage_stop_loss(fs) is not None
+                )
+                if st == SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY
+                else bool(fs.get("has_stop_loss", False))
+            )
             trade_stage = stage_judge.judge(
                 env=market_env,
                 setup_type=st,
@@ -537,6 +577,12 @@ class FiveLayerPipeline:
                 theme_position=tp,
                 has_stop_loss=has_stop,
             )
+            if (
+                not v2_execution_allowed
+                and trade_stage
+                in (TradeStage.PROBE_ENTRY, TradeStage.ADD_ON_STRENGTH)
+            ):
+                trade_stage = TradeStage.FOCUS
 
             # Phase 3A: 交易计划
             trade_plan = plan_builder.build(
@@ -574,16 +620,7 @@ class FiveLayerPipeline:
             fs["effective_leader_score_source"] = leader_score_source
             if trade_plan is not None:
                 candidate.trade_plan_json = json.dumps(
-                    {
-                        "initial_position": trade_plan.initial_position,
-                        "add_rule": trade_plan.add_rule,
-                        "stop_loss_rule": trade_plan.stop_loss_rule,
-                        "take_profit_plan": trade_plan.take_profit_plan,
-                        "invalidation_rule": trade_plan.invalidation_rule,
-                        "risk_level": trade_plan.risk_level.value,
-                        "holding_expectation": trade_plan.holding_expectation,
-                        "execution_note": trade_plan.execution_note,
-                    },
+                    trade_plan.to_payload(),
                     ensure_ascii=False,
                 )
 
@@ -704,4 +741,3 @@ class FiveLayerPipeline:
             "hot_theme_count": sum(1 for s in sector_results if s.sector_status == "hot"),
             "warm_theme_count": sum(1 for s in sector_results if s.sector_status == "warm"),
         }
-

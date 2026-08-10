@@ -147,11 +147,6 @@ export const ScreeningCandidateTable: React.FC = () => {
     }
   };
 
-  if (!currentRun || candidates.length === 0) {
-    if (candidatesLoading) return <Loading label="加载候选..." />;
-    return null;
-  }
-
   const sorted = useMemo(
     () => sortCandidates(candidates, sortKey, sortDir),
     [candidates, sortKey, sortDir],
@@ -161,6 +156,11 @@ export const ScreeningCandidateTable: React.FC = () => {
     () => candidates.some((c) => c.tradeStage != null),
     [candidates],
   );
+
+  if (!currentRun || candidates.length === 0) {
+    if (candidatesLoading) return <Loading label="加载候选..." />;
+    return null;
+  }
 
   const thClass = 'px-3 py-2.5 text-left text-xs font-medium text-secondary-text cursor-pointer select-none hover:text-foreground transition-colors';
   const thStatic = cn(thClass, 'cursor-default hover:text-secondary-text');

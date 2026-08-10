@@ -1,0 +1,47 @@
+# Bottom Divergence Layered Entry v2 / 底背离分层入场 v2
+# Opt-in only: this strategy is loaded as disabled and is not in default enable lists.
+
+name: bottom_divergence_layered_entry_v2
+display_name: 底背离分层入场 v2
+description: 基于因果底背离候选的 early、R1、R2 三级事件，按20%/50%/100%目标仓位分层执行。
+category: reversal
+core_rules: [1, 3]
+required_tools:
+  - get_daily_history
+  - get_realtime_quote
+
+system_role: entry_core
+strategy_family: reversal
+applicable_market: [balanced, aggressive]
+applicable_theme: [main_theme, secondary_theme, follower_theme, non_theme]
+setup_type: bottom_divergence_layered_entry
+
+screening:
+  filters:
+    - field: bottom_divergence_v2_candidate
+      op: "=="
+      value: true
+  scoring:
+    - field: bottom_divergence_v2_early_strength
+      weight: 30
+      cap: 1
+    - field: bottom_divergence_v2_near_zone_score
+      weight: 30
+      cap: 1
+    - field: bottom_divergence_v2_major_zone_score
+      weight: 40
+      cap: 1
+
+instructions: |
+  **底背离分层入场 v2（显式 opt-in）**
+
+  本策略只消费 `bottom_divergence_v2_*` 因果检测结果，不替代或别名到
+  v1 `bottom_divergence_double_breakout`，也不接入默认启用列表或 AI gate。
+
+  分层执行：
+  1. early：早期反转事件成立，目标仓位20%。
+  2. near_cleared（R1）：近端阻力区确认清除，目标仓位50%。
+  3. major_actionable（R2）：主要阻力区突破且仍可操作，目标仓位100%。
+
+  forming、invalidated、stale、extended、rejected 均不执行买入；
+  major 已确认但不可操作时禁止追高。

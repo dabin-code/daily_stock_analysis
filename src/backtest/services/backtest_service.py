@@ -919,6 +919,9 @@ class FiveLayerBacktestService:
         evaluation.snapshot_risk_level = candidate.get("risk_level")
         evaluation.factor_snapshot_json = _dump_json(candidate.get("factor_snapshot"))
         evaluation.trade_plan_json = _dump_json(candidate.get("trade_plan"))
+        factor_snapshot = candidate.get("factor_snapshot")
+        if not isinstance(factor_snapshot, dict):
+            factor_snapshot = {}
         evaluation.evidence_json = _dump_json(
             {
                 "matched_strategies": candidate.get("matched_strategies", []),
@@ -926,6 +929,12 @@ class FiveLayerBacktestService:
                 "primary_strategy": candidate.get("primary_strategy"),
                 "contributing_strategies": candidate.get("contributing_strategies", []),
                 "strategy_scores": candidate.get("strategy_scores", {}),
+                "candidate_version": factor_snapshot.get(
+                    "bottom_divergence_v2_candidate_version"
+                ),
+                "zone_version": factor_snapshot.get(
+                    "bottom_divergence_v2_zone_version"
+                ),
                 "ai_trade_stage": candidate.get("ai_trade_stage"),
                 "ai_confidence": candidate.get("ai_confidence"),
             },

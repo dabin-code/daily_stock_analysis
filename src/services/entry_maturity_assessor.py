@@ -8,6 +8,13 @@ from __future__ import annotations
 from src.schemas.trading_types import EntryMaturity, SetupType
 
 
+_V2_ACTIONABLE_STAGE_MATURITY = {
+    "early": EntryMaturity.MEDIUM,
+    "near_cleared": EntryMaturity.HIGH,
+    "major_actionable": EntryMaturity.HIGH,
+}
+
+
 class EntryMaturityAssessor:
 
     def assess(self, setup_type: SetupType, factor_snapshot: dict) -> EntryMaturity:
@@ -34,6 +41,20 @@ def _assess_bottom_divergence(fs: dict) -> EntryMaturity:
     if state in ("late_or_weak", "structure_ready"):
         return EntryMaturity.MEDIUM
     return EntryMaturity.LOW
+
+
+def _assess_bottom_divergence_v2(fs: dict) -> EntryMaturity:
+    """Map causal layered-entry stages without falling back to v1 fields."""
+    stage = str(fs.get("bottom_divergence_v2_stage") or "rejected")
+    maturity = _V2_ACTIONABLE_STAGE_MATURITY.get(stage)
+    if maturity is None:
+        return EntryMaturity.LOW
+    if (
+        stage == "major_actionable"
+        and not bool(fs.get("bottom_divergence_v2_major_actionable_entry"))
+    ):
+        return EntryMaturity.LOW
+    return maturity
 
 
 def _assess_low123(fs: dict) -> EntryMaturity:
@@ -143,6 +164,7 @@ def _default_assess(fs: dict) -> EntryMaturity:
 
 _HANDLERS = {
     SetupType.BOTTOM_DIVERGENCE_BREAKOUT: _assess_bottom_divergence,
+    SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY: _assess_bottom_divergence_v2,
     SetupType.LOW123_BREAKOUT: _assess_low123,
     SetupType.TREND_BREAKOUT: _assess_trend_breakout,
     SetupType.TREND_PULLBACK: _assess_trend_pullback,

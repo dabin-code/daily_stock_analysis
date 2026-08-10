@@ -12,6 +12,7 @@ A股自选股智能分析系统 - 配置管理模块
 
 import json
 import logging
+import math
 import os
 import re
 from pathlib import Path
@@ -59,6 +60,82 @@ def parse_env_bool(value: Optional[str], default: bool = False) -> bool:
     if not normalized:
         return default
     return normalized not in _FALSEY_ENV_VALUES
+
+
+def _parse_bottom_divergence_v2_float(
+    env_name: str,
+    default: float,
+    errors: List[Tuple[str, str]],
+) -> float:
+    """Parse one v2 float without aborting Config construction."""
+    raw = os.getenv(env_name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = math.nan
+    if not math.isfinite(value):
+        errors.append((env_name, f"{env_name} 必须是有限数值"))
+        return default
+    return value
+
+
+def _parse_bottom_divergence_v2_bool(
+    env_name: str,
+    default: bool,
+    errors: List[Tuple[str, str]],
+) -> bool:
+    """Strictly parse one v2 boolean and reject spelling mistakes."""
+    raw = os.getenv(env_name)
+    if raw is None or not raw.strip():
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    errors.append((
+        env_name,
+        f"{env_name} 必须是 true/1/yes/on 或 false/0/no/off",
+    ))
+    return default
+
+
+def _parse_bottom_divergence_v2_int(
+    env_name: str,
+    default: int,
+    errors: List[Tuple[str, str]],
+) -> int:
+    """Parse one v2 integer without accepting float-like strings."""
+    raw = os.getenv(env_name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        errors.append((env_name, f"{env_name} 必须是整数"))
+        return default
+
+
+def _parse_bottom_divergence_v2_weights(
+    env_name: str,
+    default: Tuple[float, float, float, float, float, float],
+    errors: List[Tuple[str, str]],
+) -> Tuple[float, float, float, float, float, float]:
+    """Parse exactly six finite comma-separated v2 weights."""
+    raw = os.getenv(env_name)
+    if raw is None or not raw.strip():
+        return default
+    parts = [part.strip() for part in raw.split(",")]
+    try:
+        values = tuple(float(part) for part in parts)
+    except (TypeError, ValueError):
+        values = ()
+    if len(values) != 6 or any(not math.isfinite(value) for value in values):
+        errors.append((env_name, f"{env_name} 必须是逗号分隔的 6 个有限数值"))
+        return default
+    return values  # type: ignore[return-value]
 
 
 def normalize_news_strategy_profile(value: Optional[str]) -> str:
@@ -497,12 +574,34 @@ class Config:
     # 破位容差比例（0~1）：B 后最低价跌破 min(A,B)*(1-tol) 视为结构失效，默认严格跌破
     bottom_divergence_break_tolerance: float = 0.0
 
+    # === 因果底背离 v2（默认关闭）===
+    bottom_divergence_v2_enabled: bool = False
+    bottom_divergence_v2_cluster_pct: float = 0.015
+    bottom_divergence_v2_atr_gap_multiplier: float = 0.5
+    bottom_divergence_v2_zone_score_min: float = 0.45
+    bottom_divergence_v2_breakout_buffer_pct: float = 0.003
+    bottom_divergence_v2_sync_window: int = 3
+    bottom_divergence_v2_retention_bars: int = 20
+    bottom_divergence_v2_r1_weights: Tuple[float, ...] = (
+        0.30, 0.25, 0.15, 0.15, 0.10, 0.05,
+    )
+    bottom_divergence_v2_r2_weights: Tuple[float, ...] = (
+        0.35, 0.15, 0.15, 0.15, 0.10, 0.10,
+    )
+    _bottom_divergence_v2_parse_errors: Tuple[Tuple[str, str], ...] = field(
+        default_factory=tuple,
+        repr=False,
+    )
+
     # === 回测配置 ===
     backtest_enabled: bool = True
     backtest_eval_window_days: int = 10
     backtest_min_age_days: int = 14
     backtest_engine_version: str = "v1"
     backtest_neutral_band_pct: float = 2.0
+    backtest_buy_cost_bps: float = 0.0
+    backtest_sell_cost_bps: float = 0.0
+    backtest_slippage_bps: float = 0.0
     
     # === 日志配置 ===
     log_dir: str = "./logs"  # 日志文件目录
@@ -591,6 +690,10 @@ class Config:
     screening_min_volume_ratio: float = 1.2
     screening_breakout_lookback_days: int = 20
     screening_factor_lookback_days: int = 200
+    _screening_parse_errors: Tuple[Tuple[str, str], ...] = field(
+        default_factory=tuple,
+        repr=False,
+    )
     screening_ingest_failure_threshold: float = 0.20
     screening_market_guard_enabled: bool = True
     screening_market_guard_index: str = "sh000001"
@@ -957,6 +1060,64 @@ class Config:
             if board_sync_run_immediately_env is not None
             else False
         )
+
+        screening_parse_errors: List[Tuple[str, str]] = []
+        bottom_divergence_v2_parse_errors: List[Tuple[str, str]] = []
+        bottom_divergence_v2_cluster_pct = _parse_bottom_divergence_v2_float(
+            "BOTTOM_DIVERGENCE_V2_CLUSTER_PCT",
+            0.015,
+            bottom_divergence_v2_parse_errors,
+        )
+        bottom_divergence_v2_atr_gap_multiplier = _parse_bottom_divergence_v2_float(
+            "BOTTOM_DIVERGENCE_V2_ATR_GAP_MULTIPLIER",
+            0.5,
+            bottom_divergence_v2_parse_errors,
+        )
+        bottom_divergence_v2_zone_score_min = _parse_bottom_divergence_v2_float(
+            "BOTTOM_DIVERGENCE_V2_ZONE_SCORE_MIN",
+            0.45,
+            bottom_divergence_v2_parse_errors,
+        )
+        bottom_divergence_v2_breakout_buffer_pct = _parse_bottom_divergence_v2_float(
+            "BOTTOM_DIVERGENCE_V2_BREAKOUT_BUFFER_PCT",
+            0.003,
+            bottom_divergence_v2_parse_errors,
+        )
+        bottom_divergence_v2_sync_window = _parse_bottom_divergence_v2_int(
+            "BOTTOM_DIVERGENCE_V2_SYNC_WINDOW",
+            3,
+            bottom_divergence_v2_parse_errors,
+        )
+        bottom_divergence_v2_retention_bars = _parse_bottom_divergence_v2_int(
+            "BOTTOM_DIVERGENCE_V2_RETENTION_BARS",
+            20,
+            bottom_divergence_v2_parse_errors,
+        )
+        bottom_divergence_v2_r1_weights = _parse_bottom_divergence_v2_weights(
+            "BOTTOM_DIVERGENCE_V2_R1_WEIGHTS",
+            (0.30, 0.25, 0.15, 0.15, 0.10, 0.05),
+            bottom_divergence_v2_parse_errors,
+        )
+        bottom_divergence_v2_r2_weights = _parse_bottom_divergence_v2_weights(
+            "BOTTOM_DIVERGENCE_V2_R2_WEIGHTS",
+            (0.35, 0.15, 0.15, 0.15, 0.10, 0.10),
+            bottom_divergence_v2_parse_errors,
+        )
+        backtest_buy_cost_bps = _parse_bottom_divergence_v2_float(
+            "BACKTEST_BUY_COST_BPS",
+            0.0,
+            bottom_divergence_v2_parse_errors,
+        )
+        backtest_sell_cost_bps = _parse_bottom_divergence_v2_float(
+            "BACKTEST_SELL_COST_BPS",
+            0.0,
+            bottom_divergence_v2_parse_errors,
+        )
+        backtest_slippage_bps = _parse_bottom_divergence_v2_float(
+            "BACKTEST_SLIPPAGE_BPS",
+            0.0,
+            bottom_divergence_v2_parse_errors,
+        )
         
         return cls(
             stock_list=stock_list,
@@ -1100,11 +1261,34 @@ class Config:
             bottom_divergence_break_tolerance=float(
                 os.getenv('BOTTOM_DIVERGENCE_BREAK_TOLERANCE', '0.0')
             ),
+            bottom_divergence_v2_enabled=_parse_bottom_divergence_v2_bool(
+                "BOTTOM_DIVERGENCE_V2_ENABLED",
+                default=False,
+                errors=bottom_divergence_v2_parse_errors,
+            ),
+            bottom_divergence_v2_cluster_pct=bottom_divergence_v2_cluster_pct,
+            bottom_divergence_v2_atr_gap_multiplier=(
+                bottom_divergence_v2_atr_gap_multiplier
+            ),
+            bottom_divergence_v2_zone_score_min=bottom_divergence_v2_zone_score_min,
+            bottom_divergence_v2_breakout_buffer_pct=(
+                bottom_divergence_v2_breakout_buffer_pct
+            ),
+            bottom_divergence_v2_sync_window=bottom_divergence_v2_sync_window,
+            bottom_divergence_v2_retention_bars=bottom_divergence_v2_retention_bars,
+            bottom_divergence_v2_r1_weights=bottom_divergence_v2_r1_weights,
+            bottom_divergence_v2_r2_weights=bottom_divergence_v2_r2_weights,
+            _bottom_divergence_v2_parse_errors=tuple(
+                bottom_divergence_v2_parse_errors
+            ),
             backtest_enabled=os.getenv('BACKTEST_ENABLED', 'true').lower() == 'true',
             backtest_eval_window_days=int(os.getenv('BACKTEST_EVAL_WINDOW_DAYS', '10')),
             backtest_min_age_days=int(os.getenv('BACKTEST_MIN_AGE_DAYS', '14')),
             backtest_engine_version=os.getenv('BACKTEST_ENGINE_VERSION', 'v1'),
             backtest_neutral_band_pct=float(os.getenv('BACKTEST_NEUTRAL_BAND_PCT', '2.0')),
+            backtest_buy_cost_bps=backtest_buy_cost_bps,
+            backtest_sell_cost_bps=backtest_sell_cost_bps,
+            backtest_slippage_bps=backtest_slippage_bps,
             log_dir=os.getenv('LOG_DIR', './logs'),
             log_level=os.getenv('LOG_LEVEL', 'INFO'),
             max_workers=int(os.getenv('MAX_WORKERS', '3')),
@@ -1197,14 +1381,24 @@ class Config:
             portfolio_risk_lookback_days=int(os.getenv('PORTFOLIO_RISK_LOOKBACK_DAYS', '180')),
             portfolio_fx_update_enabled=os.getenv('PORTFOLIO_FX_UPDATE_ENABLED', 'true').lower() == 'true',
             # 全市场筛选
-            screening_default_mode=os.getenv('SCREENING_DEFAULT_MODE', 'balanced'),
-            screening_candidate_limit=int(os.getenv('SCREENING_CANDIDATE_LIMIT', '30')),
-            screening_ai_top_k=int(os.getenv('SCREENING_AI_TOP_K', '10')),
+            screening_default_mode=cls._parse_screening_default_mode(
+                os.getenv('SCREENING_DEFAULT_MODE', 'balanced'),
+                errors=screening_parse_errors,
+            ),
+            screening_candidate_limit=cls._read_int_env(
+                'SCREENING_CANDIDATE_LIMIT', 30, errors=screening_parse_errors
+            ),
+            screening_ai_top_k=cls._read_int_env(
+                'SCREENING_AI_TOP_K', 10, errors=screening_parse_errors
+            ),
             screening_min_final_score=float(os.getenv('SCREENING_MIN_FINAL_SCORE', '80')),
             screening_min_list_days=int(os.getenv('SCREENING_MIN_LIST_DAYS', '120')),
-            screening_min_volume_ratio=float(os.getenv('SCREENING_MIN_VOLUME_RATIO', '1.2')),
+            screening_min_volume_ratio=cls._read_float_env(
+                'SCREENING_MIN_VOLUME_RATIO', 1.2, errors=screening_parse_errors
+            ),
             screening_breakout_lookback_days=int(os.getenv('SCREENING_BREAKOUT_LOOKBACK_DAYS', '20')),
             screening_factor_lookback_days=int(os.getenv('SCREENING_FACTOR_LOOKBACK_DAYS', '200')),
+            _screening_parse_errors=tuple(screening_parse_errors),
             screening_ingest_failure_threshold=float(os.getenv('SCREENING_INGEST_FAILURE_THRESHOLD', '0.20')),
             screening_market_guard_enabled=parse_env_bool(os.getenv('SCREENING_MARKET_GUARD_ENABLED'), default=True),
             screening_market_guard_index=os.getenv('SCREENING_MARKET_GUARD_INDEX', 'sh000001'),
@@ -1503,6 +1697,88 @@ class Config:
             if 'stocks' in g and 'emails' in g and g['stocks'] and g['emails']:
                 result.append((g['stocks'], g['emails']))
         return result
+
+    @classmethod
+    def _read_int_env(
+        cls,
+        key: str,
+        default: int,
+        errors: Optional[List[Tuple[str, str]]] = None,
+    ) -> int:
+        raw = (os.getenv(key) or "").strip()
+        if not raw:
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            message = f"{key} 必须是整数"
+            if errors is not None:
+                errors.append((key, message))
+            logging.getLogger(__name__).warning(
+                "%s 配置值 '%s' 无法解析为整数，已回退为默认值 %s",
+                key,
+                raw,
+                default,
+            )
+            return default
+
+    @classmethod
+    def _read_float_env(
+        cls,
+        key: str,
+        default: float,
+        errors: Optional[List[Tuple[str, str]]] = None,
+    ) -> float:
+        raw = (os.getenv(key) or "").strip()
+        if not raw:
+            return default
+        try:
+            value = float(raw)
+        except ValueError:
+            message = f"{key} 必须是有限数值"
+            if errors is not None:
+                errors.append((key, message))
+            logging.getLogger(__name__).warning(
+                "%s 配置值 '%s' 无法解析为数字，已回退为默认值 %s",
+                key,
+                raw,
+                default,
+            )
+            return default
+        if not math.isfinite(value):
+            message = f"{key} 必须是有限数值"
+            if errors is not None:
+                errors.append((key, message))
+            logging.getLogger(__name__).warning(
+                "%s 配置值 '%s' 不是有限数字，已回退为默认值 %s",
+                key,
+                raw,
+                default,
+            )
+            return default
+        return value
+
+    @classmethod
+    def _parse_screening_default_mode(
+        cls,
+        value: str,
+        errors: Optional[List[Tuple[str, str]]] = None,
+    ) -> str:
+        """Parse screening default mode, fallback to balanced for invalid values."""
+        normalized = (value or "balanced").strip().lower()
+        if normalized in {"balanced", "aggressive", "quality"}:
+            return normalized
+        message = (
+            "SCREENING_DEFAULT_MODE 必须是 balanced、aggressive 或 quality"
+        )
+        if errors is not None:
+            errors.append(("SCREENING_DEFAULT_MODE", message))
+        logging.getLogger(__name__).warning(
+            "SCREENING_DEFAULT_MODE 配置值 '%s' 无效，已回退为默认值 'balanced'"
+            "（合法值：balanced / aggressive / quality）",
+            value,
+        )
+        return "balanced"
 
     @classmethod
     def _parse_report_type(cls, value: str) -> str:
@@ -1812,7 +2088,42 @@ class Config:
                 field="OPENAI_VISION_MODEL",
             ))
 
-        # --- Screening cross-field checks ---
+        # --- Screening parse, range, and cross-field checks ---
+        issues.extend(
+            ConfigIssue(severity="error", message=message, field=field_name)
+            for field_name, message in self._screening_parse_errors
+        )
+
+        for field_name, value, minimum, maximum in (
+            (
+                "SCREENING_CANDIDATE_LIMIT",
+                self.screening_candidate_limit,
+                1,
+                200,
+            ),
+            ("SCREENING_AI_TOP_K", self.screening_ai_top_k, 0, 50),
+            (
+                "SCREENING_MIN_VOLUME_RATIO",
+                self.screening_min_volume_ratio,
+                0.1,
+                10.0,
+            ),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not minimum <= value <= maximum
+            ):
+                issues.append(ConfigIssue(
+                    severity="error",
+                    message=(
+                        f"{field_name} ({value}) 必须在 "
+                        f"[{minimum}, {maximum}] 范围内"
+                    ),
+                    field=field_name,
+                ))
+
         if self.screening_ai_top_k > self.screening_candidate_limit:
             issues.append(ConfigIssue(
                 severity="error",
@@ -1832,6 +2143,117 @@ class Config:
                 ),
                 field="SCREENING_MIN_FINAL_SCORE",
             ))
+
+        # --- Causal bottom-divergence v2 ---
+        issues.extend(
+            ConfigIssue(severity="error", message=message, field=field_name)
+            for field_name, message in self._bottom_divergence_v2_parse_errors
+        )
+
+        def add_v2_numeric_issue(
+            field_name: str,
+            value: Any,
+            *,
+            minimum: float = 0.0,
+            maximum: Optional[float] = None,
+            minimum_inclusive: bool = True,
+        ) -> None:
+            minimum_valid = (
+                float(value) >= minimum
+                if minimum_inclusive
+                else float(value) > minimum
+            ) if (
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(float(value))
+            ) else False
+            valid = (
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(float(value))
+                and minimum_valid
+                and (maximum is None or float(value) <= maximum)
+            )
+            if not valid:
+                issues.append(ConfigIssue(
+                    severity="error",
+                    message=f"{field_name} 配置值无效",
+                    field=field_name,
+                ))
+
+        add_v2_numeric_issue(
+            "BOTTOM_DIVERGENCE_V2_CLUSTER_PCT",
+            self.bottom_divergence_v2_cluster_pct,
+            minimum_inclusive=False,
+        )
+        add_v2_numeric_issue(
+            "BOTTOM_DIVERGENCE_V2_ATR_GAP_MULTIPLIER",
+            self.bottom_divergence_v2_atr_gap_multiplier,
+        )
+        add_v2_numeric_issue(
+            "BOTTOM_DIVERGENCE_V2_ZONE_SCORE_MIN",
+            self.bottom_divergence_v2_zone_score_min,
+            maximum=1.0,
+        )
+        add_v2_numeric_issue(
+            "BOTTOM_DIVERGENCE_V2_BREAKOUT_BUFFER_PCT",
+            self.bottom_divergence_v2_breakout_buffer_pct,
+        )
+        for field_name, value in (
+            ("BOTTOM_DIVERGENCE_V2_SYNC_WINDOW", self.bottom_divergence_v2_sync_window),
+            (
+                "BOTTOM_DIVERGENCE_V2_RETENTION_BARS",
+                self.bottom_divergence_v2_retention_bars,
+            ),
+        ):
+            if type(value) is not int or value <= 0:
+                issues.append(ConfigIssue(
+                    severity="error",
+                    message=f"{field_name} 必须是大于 0 的整数",
+                    field=field_name,
+                ))
+
+        for field_name, weights in (
+            ("BOTTOM_DIVERGENCE_V2_R1_WEIGHTS", self.bottom_divergence_v2_r1_weights),
+            ("BOTTOM_DIVERGENCE_V2_R2_WEIGHTS", self.bottom_divergence_v2_r2_weights),
+        ):
+            valid_weights = (
+                isinstance(weights, tuple)
+                and len(weights) == 6
+                and all(
+                    not isinstance(value, bool)
+                    and isinstance(value, (int, float))
+                    and math.isfinite(float(value))
+                    and value >= 0
+                    for value in weights
+                )
+            )
+            if valid_weights:
+                valid_weights = math.isclose(
+                    sum(float(value) for value in weights),
+                    1.0,
+                    abs_tol=1e-9,
+                ) and sum(
+                    float(value)
+                    for index, value in enumerate(weights)
+                    if index != 2
+                ) > 0
+            if not valid_weights:
+                issues.append(ConfigIssue(
+                    severity="error",
+                    message=(
+                        f"{field_name} 必须包含 6 个非负有限权重、总和为 1，"
+                        "且非成交量权重之和大于 0"
+                    ),
+                    field=field_name,
+                ))
+
+        for field_name, value in (
+            ("BACKTEST_BUY_COST_BPS", self.backtest_buy_cost_bps),
+            ("BACKTEST_SELL_COST_BPS", self.backtest_sell_cost_bps),
+            ("BACKTEST_SLIPPAGE_BPS", self.backtest_slippage_bps),
+        ):
+            add_v2_numeric_issue(field_name, value)
 
         # --- Vision key availability ---
         # Only warn when user explicitly set VISION_MODEL (or OPENAI_VISION_MODEL alias).

@@ -57,6 +57,262 @@ describe('extractTechnicalPatterns', () => {
 
       expect(patterns).toHaveLength(0);
     });
+
+    it('renders an early v2 probe card without requiring the v1 double breakout', () => {
+      const snapshot: ScreeningFactorSnapshot = {
+        bottom_divergence_v2_candidate: true,
+        bottom_divergence_v2_stage: 'early',
+        bottom_divergence_v2_actionability_status: 'major_not_confirmed',
+        bottom_divergence_v2_early_reversal: true,
+        bottom_divergence_v2_early_strength: 0.72,
+        bottom_divergence_v2_near_zone_lower: 39.08,
+        bottom_divergence_v2_near_zone_upper: 39.2,
+        bottom_divergence_v2_near_entered: true,
+        bottom_divergence_v2_stop_loss_price: 37.66,
+        bottom_divergence_v2_event_days: 0,
+        bottom_divergence_v2_candidate_version: 'candidate-v2',
+        bottom_divergence_v2_zone_version: 'zone-v2',
+        bottom_divergence_v2_degradation_reasons: ['复权状态待确认'],
+        bottom_divergence_v2_hit_reasons: ['早期反转结构成立'],
+        bottom_divergence_v2_candidate_records: [{ should_not_render: true }],
+      };
+
+      const patterns = extractTechnicalPatterns(snapshot);
+
+      expect(patterns).toHaveLength(1);
+      expect(patterns[0]).toMatchObject({
+        id: 'bottom_divergence_v2',
+        name: '底背离早期反转·试仓',
+        signalStrength: 0.72,
+      });
+      expect(patterns[0].metrics).toEqual(expect.arrayContaining([
+        { label: '目标仓位', value: '目标20%' },
+        { label: '早期强度', value: '72%' },
+        { label: '止损参考', value: '37.66' },
+        { label: 'R1阻力', value: '39.08–39.20' },
+        { label: '触发时间', value: '今日触发' },
+        { label: '候选版本', value: 'candidate-v2' },
+        { label: '阻力区版本', value: 'zone-v2' },
+        { label: 'R1事件', value: '已触及阻力区' },
+      ]));
+      expect(patterns[0].hitReasons).toEqual(expect.arrayContaining([
+        '早期反转结构成立',
+        '降级：复权状态待确认',
+      ]));
+      expect(patterns[0].name).not.toContain('candidate-v2');
+      expect(JSON.stringify(patterns[0])).not.toContain('should_not_render');
+    });
+
+    it('renders a near-cleared v2 add card with R1 and R2 ranges', () => {
+      const snapshot: ScreeningFactorSnapshot = {
+        bottom_divergence_v2_candidate: true,
+        bottom_divergence_v2_stage: 'near_cleared',
+        bottom_divergence_v2_actionability_status: 'major_not_confirmed',
+        bottom_divergence_v2_near_zone_lower: 39.08,
+        bottom_divergence_v2_near_zone_upper: 39.2,
+        bottom_divergence_v2_near_zone_score: 0.81,
+        bottom_divergence_v2_near_crossed: true,
+        bottom_divergence_v2_near_cleared: true,
+        bottom_divergence_v2_major_zone_lower: 41.2,
+        bottom_divergence_v2_major_zone_upper: 42.9,
+        bottom_divergence_v2_major_zone_score: 0.66,
+      };
+
+      const patterns = extractTechnicalPatterns(snapshot);
+
+      expect(patterns[0].name).toBe('近端阻力突破·加仓');
+      expect(patterns[0].metrics).toEqual(expect.arrayContaining([
+        { label: '目标仓位', value: '目标50%' },
+        { label: 'R1阻力', value: '39.08–39.20' },
+        { label: 'R2阻力', value: '41.20–42.90' },
+        { label: 'R1事件', value: '已突破并确认' },
+      ]));
+    });
+
+    it('shows accepted R1 evidence before a confirmed cross', () => {
+      const snapshot: ScreeningFactorSnapshot = {
+        bottom_divergence_v2_stage: 'early',
+        bottom_divergence_v2_near_accepted: true,
+      };
+
+      expect(extractTechnicalPatterns(snapshot)[0].metrics).toContainEqual({
+        label: 'R1事件',
+        value: '已进入并承接',
+      });
+    });
+
+    it('renders a currently actionable major-breakout v2 card', () => {
+      const snapshot: ScreeningFactorSnapshot = {
+        bottom_divergence_v2_candidate: true,
+        bottom_divergence_v2_stage: 'major_actionable',
+        bottom_divergence_v2_major_zone_lower: 41.2,
+        bottom_divergence_v2_major_zone_upper: 42.9,
+        bottom_divergence_v2_major_breakout: true,
+        bottom_divergence_v2_major_actionable_entry: true,
+        bottom_divergence_v2_actionability_status: 'actionable',
+      };
+
+      const patterns = extractTechnicalPatterns(snapshot);
+
+      expect(patterns[0].name).toBe('主要阻力确认·可加仓');
+      expect(patterns[0].metrics).toEqual(expect.arrayContaining([
+        { label: '目标仓位', value: '目标100%' },
+        { label: 'R2阻力', value: '41.20–42.90' },
+        { label: '历史突破', value: '已确认' },
+        { label: '当前可操作', value: '是' },
+      ]));
+    });
+
+    it.each([
+      ['early', undefined, true],
+      ['early', true, false],
+      ['near_cleared', undefined, true],
+      ['near_cleared', true, false],
+      ['major_actionable', undefined, true],
+      ['major_actionable', true, false],
+    ])(
+      'fails closed for %s when candidate=%s and stage evidence=%s',
+      (stage, candidate, stageEvidence) => {
+        const snapshot: ScreeningFactorSnapshot = {
+          bottom_divergence_v2_stage: stage,
+          bottom_divergence_v2_candidate: candidate,
+          bottom_divergence_v2_early_reversal: stage === 'early' ? stageEvidence : undefined,
+          bottom_divergence_v2_near_cleared: stage === 'near_cleared' ? stageEvidence : undefined,
+          bottom_divergence_v2_major_actionable_entry: stage === 'major_actionable' ? stageEvidence : undefined,
+          bottom_divergence_v2_actionability_status: stage === 'major_actionable'
+            ? 'actionable'
+            : 'major_not_confirmed',
+        };
+
+        const pattern = extractTechnicalPatterns(snapshot)[0];
+        const renderedText = `${pattern.name} ${pattern.metrics.map((metric) => `${metric.label}${metric.value}`).join(' ')}`;
+
+        expect(pattern.name).toBe('仅观察·证据不完整');
+        expect(renderedText).not.toMatch(/试仓|可加仓|目标仓位|目标\d+%/);
+        expect(renderedText).not.toMatch(/近端阻力突破·加仓/);
+      },
+    );
+
+    it('keeps an historical major breakout fail-closed when current actionability is unverified', () => {
+      const snapshot: ScreeningFactorSnapshot = {
+        bottom_divergence_v2_stage: 'major_unverified',
+        bottom_divergence_v2_major_breakout: true,
+        bottom_divergence_v2_major_actionable_entry: false,
+        bottom_divergence_v2_actionability_status: 'adjustment_unknown',
+        bottom_divergence_v2_major_zone_lower: 41.2,
+        bottom_divergence_v2_major_zone_upper: 42.9,
+      };
+
+      const pattern = extractTechnicalPatterns(snapshot)[0];
+      const renderedText = `${pattern.name} ${pattern.metrics.map((metric) => `${metric.label}${metric.value}`).join(' ')}`;
+
+      expect(pattern.name).toBe('数据待确认·仅观察');
+      expect(pattern.metrics).toEqual(expect.arrayContaining([
+        { label: '历史突破', value: '已确认' },
+        { label: '当前可操作', value: '否·仅观察' },
+      ]));
+      expect(renderedText).not.toContain('可加仓');
+      expect(renderedText).not.toContain('目标仓位');
+    });
+
+    it.each(['early', 'near_cleared'])(
+      'renders real unknown-provenance %s evidence as observation-only',
+      (stage) => {
+        const snapshot: ScreeningFactorSnapshot = {
+          bottom_divergence_v2_candidate: true,
+          bottom_divergence_v2_stage: stage,
+          bottom_divergence_v2_actionability_status: 'adjustment_unknown',
+          bottom_divergence_v2_early_reversal: stage === 'early',
+          bottom_divergence_v2_near_cleared: stage === 'near_cleared',
+        };
+
+        const pattern = extractTechnicalPatterns(snapshot)[0];
+        const renderedText = `${pattern.name} ${pattern.metrics.map((metric) => `${metric.label}${metric.value}`).join(' ')}`;
+
+        expect(pattern.name).toBe('数据待确认·仅观察');
+        expect(renderedText).not.toMatch(/试仓|加仓|目标仓位|目标20%|目标50%/);
+      },
+    );
+
+    it.each(['', 'unknown', 'unexpected_status'])(
+      'fails closed for unrecognized actionability status %s',
+      (status) => {
+        const snapshot: ScreeningFactorSnapshot = {
+          bottom_divergence_v2_candidate: true,
+          bottom_divergence_v2_stage: 'early',
+          bottom_divergence_v2_actionability_status: status,
+          bottom_divergence_v2_early_reversal: true,
+        };
+
+        const pattern = extractTechnicalPatterns(snapshot)[0];
+        const renderedText = `${pattern.name} ${pattern.metrics.map((metric) => `${metric.label}${metric.value}`).join(' ')}`;
+
+        expect(pattern.name).toBe('数据待确认·仅观察');
+        expect(renderedText).not.toMatch(/试仓|加仓|目标仓位|目标20%|目标50%/);
+      },
+    );
+
+    it.each([
+      ['stale', 'stale', '底背离信号已过期·仅观察'],
+      ['major_actionable', 'extended', '底背离已走远·勿追'],
+      ['invalidated', 'invalidated', '底背离结构已失效·仅观察'],
+      ['major_actionable', 'breakout_failed', '阻力突破失败·仅观察'],
+    ])('uses observation-only wording for %s/%s', (stage, status, expectedName) => {
+      const snapshot: ScreeningFactorSnapshot = {
+        bottom_divergence_v2_stage: stage,
+        bottom_divergence_v2_actionability_status: status,
+        bottom_divergence_v2_major_breakout: true,
+        bottom_divergence_v2_major_actionable_entry: false,
+      };
+
+      const pattern = extractTechnicalPatterns(snapshot)[0];
+      const renderedText = `${pattern.name} ${pattern.metrics.map((metric) => `${metric.label}${metric.value}`).join(' ')}`;
+
+      expect(pattern.name).toBe(expectedName);
+      expect(renderedText).not.toMatch(/可加仓|目标仓位|目标\d+%/);
+    });
+
+    it('does not invent a resistance range when only one boundary exists', () => {
+      const snapshot: ScreeningFactorSnapshot = {
+        bottom_divergence_v2_stage: 'near_cleared',
+        bottom_divergence_v2_near_zone_lower: 39.08,
+        bottom_divergence_v2_major_zone_upper: 42.9,
+      };
+
+      const pattern = extractTechnicalPatterns(snapshot)[0];
+
+      expect(pattern.metrics).toEqual(expect.arrayContaining([
+        { label: 'R1阻力', value: '39.08' },
+        { label: 'R2阻力', value: '42.90' },
+      ]));
+      expect(pattern.metrics.find((metric) => metric.label === 'R1阻力')?.value).not.toContain('–');
+    });
+
+    it('does not render the stable disabled/rejected v2 default as a pattern', () => {
+      const snapshot: ScreeningFactorSnapshot = {
+        bottom_divergence_v2_candidate: false,
+        bottom_divergence_v2_stage: 'rejected',
+        bottom_divergence_v2_actionability_status: 'disabled',
+      };
+
+      expect(extractTechnicalPatterns(snapshot)).toHaveLength(0);
+    });
+
+    it('keeps genuine v1 and v2 cards independent', () => {
+      const snapshot: ScreeningFactorSnapshot = {
+        bottom_divergence_v2_candidate: true,
+        bottom_divergence_v2_stage: 'early',
+        bottom_divergence_double_breakout: true,
+        bottom_divergence_pattern_label: '价格持平-MACD抬升',
+      };
+
+      const patterns = extractTechnicalPatterns(snapshot, ['底背离双突破']);
+
+      expect(patterns.map((pattern) => pattern.id)).toEqual([
+        'bottom_divergence_v2',
+        'bottom_divergence',
+      ]);
+    });
   });
 
   describe('MA100+Low123 pattern', () => {

@@ -401,6 +401,133 @@ class ScreeningApiTestCase(unittest.TestCase):
         self.assertEqual(payload["analysis_history"]["query_id"], "query-detail-1")
 
     @patch("api.v1.endpoints.screening.ScreeningTaskService")
+    def test_layered_divergence_list_omits_records_but_detail_keeps_them(
+        self,
+        service_cls,
+    ) -> None:
+        service = service_cls.return_value
+        service.get_run.return_value = {
+            "run_id": "run-layered-divergence-v2",
+            "mode": "balanced",
+            "status": "completed",
+            "candidate_count": 1,
+            "universe_size": 1,
+        }
+        factor_snapshot = {
+            "bottom_divergence_v2_stage": "major_actionable",
+            "bottom_divergence_v2_candidate_version": "candidate-v2",
+            "bottom_divergence_v2_zone_version": "zone-v2",
+            "bottom_divergence_v2_candidate_records": [
+                {
+                    "candidate_version": "candidate-v2",
+                    "zone": {
+                        "zone_version": "zone-v2",
+                        "r1": {"lower": 37.46, "upper": 39.2},
+                        "r2": {"lower": 40.61, "upper": 42.9},
+                    },
+                    "major_zone_breakout": {
+                        "confirmed": True,
+                        "date": "2026-08-05",
+                    },
+                }
+            ],
+        }
+        candidate = {
+            "code": "001337",
+            "name": "四川黄金",
+            "rank": 1,
+            "rule_score": 95.0,
+            "selected_for_ai": True,
+            "matched_strategies": [
+                "bottom_divergence_layered_entry_v2"
+            ],
+            "rule_hits": [
+                "strategy:bottom_divergence_layered_entry_v2"
+            ],
+            "setup_type": "bottom_divergence_layered_entry",
+            "factor_snapshot": factor_snapshot,
+        }
+        service.list_candidates.return_value = [candidate]
+        service.get_candidate_detail.return_value = candidate
+
+        list_response = self.client.get(
+            "/api/v1/screening/runs/run-layered-divergence-v2/candidates"
+        )
+        detail_response = self.client.get(
+            "/api/v1/screening/runs/run-layered-divergence-v2/candidates/001337"
+        )
+
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual(detail_response.status_code, 200)
+        list_item = list_response.json()["items"][0]
+        detail_item = detail_response.json()
+        self.assertEqual(
+            list_item["setup_type"],
+            "bottom_divergence_layered_entry",
+        )
+        self.assertNotIn(
+            "bottom_divergence_v2_candidate_records",
+            list_item["factor_snapshot"],
+        )
+        self.assertEqual(detail_item["factor_snapshot"], factor_snapshot)
+        self.assertIn(
+            "bottom_divergence_v2_candidate_records",
+            candidate["factor_snapshot"],
+        )
+        self.assertIs(candidate["factor_snapshot"], factor_snapshot)
+
+    @patch("api.v1.endpoints.screening.ScreeningTaskService")
+    def test_candidate_list_sanitizes_one_hundred_items_without_mutation(
+        self,
+        service_cls,
+    ) -> None:
+        service = service_cls.return_value
+        service.get_run.return_value = {
+            "run_id": "run-list-100",
+            "mode": "balanced",
+            "status": "completed",
+            "candidate_count": 100,
+            "universe_size": 100,
+        }
+        items = [
+            {
+                "code": f"{index:06d}",
+                "name": f"candidate-{index}",
+                "rank": index + 1,
+                "rule_score": 80.0,
+                "selected_for_ai": False,
+                "factor_snapshot": {
+                    "close": float(index + 1),
+                    "bottom_divergence_v2_candidate_records": [
+                        {"unique_marker": f"record-{index}"}
+                    ],
+                },
+            }
+            for index in range(100)
+        ]
+        service.list_candidates.return_value = items
+
+        response = self.client.get(
+            "/api/v1/screening/runs/run-list-100/candidates?limit=100"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["total"], 100)
+        self.assertEqual(len(payload["items"]), 100)
+        self.assertTrue(all(
+            "bottom_divergence_v2_candidate_records"
+            not in item["factor_snapshot"]
+            for item in payload["items"]
+        ))
+        self.assertEqual(
+            items[99]["factor_snapshot"][
+                "bottom_divergence_v2_candidate_records"
+            ][0]["unique_marker"],
+            "record-99",
+        )
+
+    @patch("api.v1.endpoints.screening.ScreeningTaskService")
     def test_candidate_detail_returns_404_when_candidate_missing(self, service_cls) -> None:
         service = service_cls.return_value
         service.get_run.return_value = {
@@ -565,6 +692,89 @@ class ScreeningApiTestCase(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 422)
+
+    @patch("api.v1.endpoints.screening.ScreeningTaskService.execute_run")
+    def test_create_run_accepts_ai_top_k_within_aggressive_mode_limit(self, execute_run) -> None:
+        execute_run.return_value = {
+            "run_id": "run-aggressive-boundary",
+            "mode": "aggressive",
+            "status": "completed",
+            "candidate_count": 0,
+            "universe_size": 1,
+        }
+
+        response = self.client.post(
+            "/api/v1/screening/runs",
+            json={
+                "trade_date": "2026-03-13",
+                "stock_codes": ["600519"],
+                "mode": "aggressive",
+                "ai_top_k": 40,
+                "market": "cn",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_create_run_rejects_ai_top_k_above_aggressive_mode_limit(self) -> None:
+        response = self.client.post(
+            "/api/v1/screening/runs",
+            json={
+                "trade_date": "2026-03-13",
+                "stock_codes": ["600519"],
+                "mode": "aggressive",
+                "ai_top_k": 51,
+                "market": "cn",
+            },
+        )
+
+        self.assertEqual(response.status_code, 422)
+
+    @patch("api.v1.endpoints.screening.ScreeningTaskService.execute_run")
+    def test_create_run_accepts_ai_top_k_at_balanced_mode_limit(self, execute_run) -> None:
+        execute_run.return_value = {
+            "run_id": "run-balanced-boundary",
+            "mode": "balanced",
+            "status": "completed",
+            "candidate_count": 0,
+            "universe_size": 1,
+        }
+
+        response = self.client.post(
+            "/api/v1/screening/runs",
+            json={
+                "trade_date": "2026-03-13",
+                "stock_codes": ["600519"],
+                "mode": "balanced",
+                "ai_top_k": 30,
+                "market": "cn",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+    @patch("api.v1.endpoints.screening.ScreeningTaskService.execute_run")
+    def test_create_run_accepts_ai_top_k_at_explicit_candidate_limit(self, execute_run) -> None:
+        execute_run.return_value = {
+            "run_id": "run-explicit-boundary",
+            "mode": "balanced",
+            "status": "completed",
+            "candidate_count": 0,
+            "universe_size": 1,
+        }
+
+        response = self.client.post(
+            "/api/v1/screening/runs",
+            json={
+                "trade_date": "2026-03-13",
+                "stock_codes": ["600519"],
+                "candidate_limit": 5,
+                "ai_top_k": 5,
+                "market": "cn",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
 
     @patch("api.v1.endpoints.screening.ScreeningTaskService")
     def test_create_run_passes_mode_to_service(self, service_cls) -> None:

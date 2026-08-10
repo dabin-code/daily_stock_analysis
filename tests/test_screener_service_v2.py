@@ -40,6 +40,8 @@ def _bullish_row(code="600001", name="趋势龙头", **overrides):
         "days_since_listed": 500,
         "trend_score": 85.0,
         "liquidity_score": 90.0,
+        "close_strength": 0.8,
+        "ma5_distance_pct": 2.0,
     }
     base.update(overrides)
     return base
@@ -52,7 +54,7 @@ class TestScreenerServiceLegacyMode:
 
     def test_legacy_evaluate_returns_evaluation_result(self):
         snapshot = _make_snapshot(
-            _bullish_row("600001", volume_ratio=1.8, breakout_ratio=1.02),
+            _bullish_row("600001", breakout_ratio=1.02),
             _bullish_row("600002", is_st=True),
         )
         service = ScreenerService(

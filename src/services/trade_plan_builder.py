@@ -7,6 +7,7 @@ Phase 3A — TradePlanBuilder: 根据 trade_stage + setup_type 生成可执行�
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional
 
 from src.schemas.trading_types import (
@@ -17,11 +18,17 @@ from src.schemas.trading_types import (
     TradePlan,
     TradeStage,
 )
+from src.services.bottom_divergence_v2_trade_support import (
+    is_v2_execution_allowed,
+    resolve_current_stage_buy_point,
+    resolve_current_stage_stop_loss,
+)
 
 # ── 止损模板 ─────────────────────────────────────────────────────────────────
 
 _STOP_LOSS_TEMPLATES: Dict[SetupType, str] = {
     SetupType.BOTTOM_DIVERGENCE_BREAKOUT: "跌破底背离确认K线低点止损",
+    SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY: "跌破因果底背离结构止损价离场",
     SetupType.LOW123_BREAKOUT: "初始跌破P3止损;突破后形成新低点→止损上移至最新低点（自然止损法）",
     SetupType.TREND_BREAKOUT: "跌破突破K线实体下沿或MA20止损",
     SetupType.TREND_PULLBACK: "跌破回踩MA20低点止损",
@@ -35,6 +42,7 @@ _DEFAULT_STOP_LOSS = "跌破近期支撑位止损"
 
 _TAKE_PROFIT_TEMPLATES: Dict[SetupType, str] = {
     SetupType.BOTTOM_DIVERGENCE_BREAKOUT: "目标前高压力位;分批止盈,首目标+10%减半",
+    SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY: "R2完成后按结构移动止损并分批止盈",
     SetupType.LOW123_BREAKOUT: "目标前高或MA100;突破后随新低点推升止损;冲高分批减仓",
     SetupType.TREND_BREAKOUT: "沿MA10移动止盈;跌破MA10减仓",
     SetupType.TREND_PULLBACK: "反弹至前高区域止盈;跌破MA20离场",
@@ -48,6 +56,7 @@ _DEFAULT_TAKE_PROFIT = "分批止盈;跌破关键均线离场"
 
 _ADD_RULE_TEMPLATES: Dict[SetupType, str] = {
     SetupType.BOTTOM_DIVERGENCE_BREAKOUT: "突破前高+放量确认后加仓;最多加仓1次;跌破加仓K低点取消",
+    SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY: "仅按R1/R2因果事件分层加仓;跌破结构止损价取消",
     SetupType.LOW123_BREAKOUT: "回踩P2支撑位+缩量企稳二次加仓;最多加仓1次;跌破P2支撑取消",
     SetupType.TREND_BREAKOUT: "回踩MA20不破+放量反弹加仓;最多加仓1次;跌破MA20取消",
     SetupType.TREND_PULLBACK: "二次回踩MA20+缩量企稳加仓;最多加仓1次;跌破前低取消",
@@ -61,6 +70,7 @@ _DEFAULT_ADD_RULE = "确认突破+放量后加仓;最多加仓1次;跌破关键�
 
 _SWING_SETUPS = frozenset({
     SetupType.BOTTOM_DIVERGENCE_BREAKOUT,
+    SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY,
     SetupType.LOW123_BREAKOUT,
     SetupType.TREND_BREAKOUT,
 })
@@ -82,6 +92,11 @@ _ADD_ON_POSITION: Dict[RiskLevel, str] = {
 }
 
 _INVALIDATION_RULE = "买入后3个交易日未启动则离场"
+_V2_STAGE_TO_LEVEL = {
+    "early": "early",
+    "near_cleared": "r1",
+    "major_actionable": "r2",
+}
 
 
 def _build_divergence_add_rule(buy_points: list) -> Optional[str]:
@@ -129,20 +144,70 @@ def _format_anchor_value(label: str, value: object) -> Optional[str]:
         return None
 
 
-def _safe_float(value: object) -> Optional[float]:
+def _safe_positive_finite_price(value: object) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
     try:
         parsed = float(value)
     except (TypeError, ValueError):
         return None
-    if parsed <= 0:
+    if not math.isfinite(parsed) or parsed <= 0:
         return None
     return parsed
 
 
-def _round_price(value: Optional[float]) -> Optional[float]:
-    if value is None:
+def _v2_layered_point(factor_snapshot: dict, level: str) -> Optional[dict]:
+    points = factor_snapshot.get("bottom_divergence_v2_layered_buy_points")
+    if not isinstance(points, list):
         return None
-    return round(value, 4)
+    return next(
+        (
+            point
+            for point in points
+            if isinstance(point, dict)
+            and str(point.get("level") or "").lower() == level
+        ),
+        None,
+    )
+
+
+def _v2_point_price(point: Optional[dict]) -> Optional[float]:
+    if point is None:
+        return None
+    return (
+        _safe_positive_finite_price(point.get("price"))
+        or _safe_positive_finite_price(point.get("trigger_price"))
+    )
+
+
+def _v2_point_stop(point: Optional[dict]) -> Optional[float]:
+    if point is None:
+        return None
+    return _safe_positive_finite_price(
+        point.get("stop")
+    ) or _safe_positive_finite_price(
+        point.get("stop_loss_price")
+    )
+
+
+def _v2_add_rule(factor_snapshot: dict, next_level: str) -> str:
+    point = _v2_layered_point(factor_snapshot, next_level.lower())
+    label = next_level.upper()
+    parts = [f"等待{label}因果事件确认后提升仓位"]
+    price = _v2_point_price(point)
+    stop = _v2_point_stop(point)
+    if price is not None:
+        parts.append(f"触发价{price:.2f}")
+    if stop is not None:
+        parts.append(f"止损{stop:.2f}")
+    return "；".join(parts)
+
+
+def _round_price(value: Optional[float]) -> Optional[float]:
+    parsed = _safe_positive_finite_price(value)
+    if parsed is None:
+        return None
+    return round(parsed, 4)
 
 
 def _build_execution_note(setup_type: SetupType, factor_snapshot: dict) -> str:
@@ -176,49 +241,88 @@ def _first_take_profit_target(factor_snapshot: dict) -> Optional[float]:
             if not isinstance(target, dict):
                 continue
             for key in ("target_price", "price", "trigger_price"):
-                parsed = _safe_float(target.get(key))
+                parsed = _safe_positive_finite_price(target.get(key))
                 if parsed is not None:
                     return parsed
 
     risk_params = factor_snapshot.get("risk_params") or {}
     if isinstance(risk_params, dict):
-        close = _safe_float(factor_snapshot.get("close"))
-        ratio = _safe_float(risk_params.get("take_profit_ratio"))
+        close = _safe_positive_finite_price(factor_snapshot.get("close"))
+        ratio = _safe_positive_finite_price(risk_params.get("take_profit_ratio"))
         if close is not None and ratio is not None:
             return close * (1 + ratio)
     return None
 
 
 def _build_structured_prices(setup_type: SetupType, factor_snapshot: dict) -> dict:
-    close = _safe_float(factor_snapshot.get("close"))
+    close = _safe_positive_finite_price(factor_snapshot.get("close"))
     risk_params = factor_snapshot.get("risk_params") or {}
     if not isinstance(risk_params, dict):
         risk_params = {}
 
-    if setup_type == SetupType.LOW123_BREAKOUT:
-        entry_price = _safe_float(factor_snapshot.get("pattern_123_entry_price")) or close
-        stop_loss_price = _safe_float(factor_snapshot.get("pattern_123_stop_loss"))
+    if setup_type == SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY:
+        stage = str(factor_snapshot.get("bottom_divergence_v2_stage") or "")
+        level = _V2_STAGE_TO_LEVEL.get(stage)
+        point = resolve_current_stage_buy_point(factor_snapshot)
+        entry_price = _v2_point_price(point)
+        stop_loss_price = resolve_current_stage_stop_loss(factor_snapshot)
+        entry_rule = f"触达底背离v2 {level.upper()}分层买点" if level else None
+    elif setup_type == SetupType.LOW123_BREAKOUT:
+        entry_price = (
+            _safe_positive_finite_price(
+                factor_snapshot.get("pattern_123_entry_price")
+            )
+            or close
+        )
+        stop_loss_price = _safe_positive_finite_price(
+            factor_snapshot.get("pattern_123_stop_loss")
+        )
         entry_rule = "触达低位123结构买点"
     elif setup_type == SetupType.BOTTOM_DIVERGENCE_BREAKOUT:
-        entry_price = _safe_float(factor_snapshot.get("bottom_divergence_entry_price")) or close
+        entry_price = (
+            _safe_positive_finite_price(
+                factor_snapshot.get("bottom_divergence_entry_price")
+            )
+            or close
+        )
         stop_loss_price = (
-            _safe_float(factor_snapshot.get("bottom_divergence_stop_loss"))
-            or _safe_float((factor_snapshot.get("bottom_divergence_exit_plan") or {}).get("initial_stop_loss"))
+            _safe_positive_finite_price(
+                factor_snapshot.get("bottom_divergence_stop_loss")
+            )
+            or _safe_positive_finite_price(
+                (factor_snapshot.get("bottom_divergence_exit_plan") or {}).get(
+                    "initial_stop_loss"
+                )
+            )
         )
         entry_rule = "触达底背离确认买点"
     elif setup_type == SetupType.TREND_PULLBACK:
-        entry_price = _safe_float(factor_snapshot.get("shrink_pullback_entry_price")) or close
-        stop_loss_price = _safe_float(factor_snapshot.get("shrink_pullback_stop_loss_price"))
+        entry_price = (
+            _safe_positive_finite_price(
+                factor_snapshot.get("shrink_pullback_entry_price")
+            )
+            or close
+        )
+        stop_loss_price = _safe_positive_finite_price(
+            factor_snapshot.get("shrink_pullback_stop_loss_price")
+        )
         entry_rule = "触达缩量回踩买点"
     else:
         entry_price = close
-        stop_loss_price = _safe_float(risk_params.get("stop_loss"))
+        stop_loss_price = _safe_positive_finite_price(risk_params.get("stop_loss"))
         entry_rule = "触达选股日结构买点"
 
-    if stop_loss_price is None:
-        stop_loss_price = _safe_float(risk_params.get("stop_loss"))
+    if (
+        stop_loss_price is None
+        and setup_type != SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY
+    ):
+        stop_loss_price = _safe_positive_finite_price(risk_params.get("stop_loss"))
 
-    take_profit_price = _first_take_profit_target(factor_snapshot)
+    take_profit_price = (
+        None
+        if setup_type == SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY
+        else _first_take_profit_target(factor_snapshot)
+    )
     exit_rules = []
     if stop_loss_price is not None:
         exit_rules.append("跌破结构化止损价离场")
@@ -252,6 +356,15 @@ class TradePlanBuilder:
         if trade_stage not in (TradeStage.PROBE_ENTRY, TradeStage.ADD_ON_STRENGTH):
             return None
 
+        v2_stage = str(
+            factor_snapshot.get("bottom_divergence_v2_stage") or ""
+        )
+        if (
+            setup_type == SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY
+            and not is_v2_execution_allowed(factor_snapshot)
+        ):
+            return None
+
         is_add_on = trade_stage == TradeStage.ADD_ON_STRENGTH
 
         # 底背离双突破：用检测器输出的量化数据替代文本模板
@@ -275,6 +388,27 @@ class TradePlanBuilder:
                 )
 
         dynamic_add_rule: Optional[str] = None
+        include_add_rule = is_add_on
+
+        if setup_type == SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY:
+            point = resolve_current_stage_buy_point(factor_snapshot)
+            stop = resolve_current_stage_stop_loss(factor_snapshot)
+            if point is None or stop is None:
+                return None
+            stop_loss_rule = f"底背离v2结构止损价{stop:.2f}；跌破即离场"
+            initial_position = {
+                "early": "目标仓位20%",
+                "near_cleared": "目标仓位50%",
+                "major_actionable": "目标仓位100%",
+            }[v2_stage]
+            if v2_stage == "early":
+                dynamic_add_rule = _v2_add_rule(factor_snapshot, "R1")
+                include_add_rule = True
+            elif v2_stage == "near_cleared":
+                dynamic_add_rule = _v2_add_rule(factor_snapshot, "R2")
+                include_add_rule = True
+            else:
+                include_add_rule = False
 
         if setup_type == SetupType.BOTTOM_DIVERGENCE_BREAKOUT:
             exit_plan = factor_snapshot.get("bottom_divergence_exit_plan") or {}
@@ -311,7 +445,7 @@ class TradePlanBuilder:
             initial_position=initial_position,
             add_rule=(
                 (dynamic_add_rule or _ADD_RULE_TEMPLATES.get(setup_type, _DEFAULT_ADD_RULE))
-                if is_add_on
+                if include_add_rule
                 else None
             ),
             stop_loss_rule=stop_loss_rule,
