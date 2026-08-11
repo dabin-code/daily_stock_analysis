@@ -150,6 +150,25 @@ class MarketDataSyncServiceTestCase(unittest.TestCase):
             f"expected a maintenance-mode warning, got: {captured.output}",
         )
 
+    def test_sync_trade_date_marks_maintenance_skip_reason_in_result(self) -> None:
+        """维护窗口短路必须自带机读标记：空跑结果本身会被算成 healthy。"""
+        os.environ["DATA_MAINTENANCE_MODE"] = "true"
+        Config.reset_instance()
+        self.addCleanup(Config.reset_instance)
+        self.addCleanup(os.environ.pop, "DATA_MAINTENANCE_MODE", None)
+
+        service = MarketDataSyncService(
+            db_manager=self.db,
+            fetcher_manager=_StubDataFetcherManager({}),
+        )
+
+        result = service.sync_trade_date(trade_date=date(2026, 3, 13))
+
+        self.assertEqual(result.get("skipped_reason"), "maintenance_mode")
+        # 现有字段与取值保持不变，避免影响已有调用方的控制流。
+        self.assertTrue(result["health_report"]["is_healthy"])
+        self.assertEqual(result["health_report"]["status"], "healthy")
+
     def test_sync_trade_date_runs_normally_when_maintenance_mode_disabled(self) -> None:
         """未开启维护窗口时行为不变，确认短路不会误伤正常路径。"""
         os.environ["DATA_MAINTENANCE_MODE"] = "false"

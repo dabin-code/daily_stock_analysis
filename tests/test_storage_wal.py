@@ -51,8 +51,14 @@ class SqliteWalModeTestCase(unittest.TestCase):
 
         self.assertEqual(str(mode).lower(), "wal")
 
-    def test_busy_timeout_is_configured(self) -> None:
-        """WAL 不能替代忙等超时，两者需要同时生效。"""
+    def test_connection_effective_busy_timeout_is_30_seconds(self) -> None:
+        """钉住 DatabaseManager 交出的连接上「生效的」忙等超时是 30 秒。
+
+        WAL 不能替代忙等超时，回补期间该值退化会直接表现为 database is locked。
+        但这个断言只覆盖最终生效值：当前它由 create_engine 的
+        connect_args={"timeout": 30} 建立，因此**不能**证明连接事件里那条显式的
+        `PRAGMA busy_timeout=30000` 仍然存在——删掉那条 pragma 本测试依然通过。
+        """
         with self.db.session_scope() as session:
             timeout = session.execute(text("PRAGMA busy_timeout")).scalar()
 

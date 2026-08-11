@@ -532,6 +532,26 @@ docker cp .\scripts\fix_none_setup_type.sql stock-analyzer:/tmp/fix_none_setup_t
 docker exec stock-analyzer python -c "import sqlite3; sql=open('/tmp/fix_none_setup_type.sql').read(); c=sqlite3.connect('/app/data/stock_analysis.db'); c.executescript(sql); c.commit(); c.close()"
 ```
 
+### 4.6 `backup_production_db.py` — 生产库整库备份
+
+**作用**：用 sqlite3 的 `backup()` API 给整库做一致性快照（不是文件拷贝，容器并发写时也安全），产物写到 `--out` 目录下的 `<库名>_<时间戳>.db`。**只读源库，幂等**。用于历史回补这类数小时长时作业前的兜底快照，属于粗粒度回滚手段，不承担表级回滚职责。
+
+`--db` 不传时取配置里的 `database_path`（即 `DATABASE_PATH` 约定），`--out` 默认 `./data/backups`。
+
+```powershell
+# 本地：备份默认库到默认目录
+python scripts/backup_production_db.py
+
+# 本地：指定库和输出目录
+python scripts/backup_production_db.py --db .\data\stock_analysis.db --out .\data\backups
+
+# docker
+docker cp .\scripts\backup_production_db.py stock-analyzer:/app/backup_production_db.py
+docker exec stock-analyzer python /app/backup_production_db.py --db /app/data/stock_analysis.db --out /app/data/backups
+```
+
+> 备份产物和源库在同一磁盘上时不抗硬件故障，重要节点请再往仓库外冷备一份。
+
 ---
 
 ## 5. 历史回测 / 抽样

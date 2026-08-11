@@ -73,7 +73,12 @@ class MarketDataSyncService:
                 "DATA_MAINTENANCE_MODE 已开启，跳过本次日线同步（trade_date=%s）",
                 trade_date.isoformat(),
             )
-            return self._build_sync_result(trade_date, codes=[], synced=0, skipped=0, errors=[])
+            # _build_sync_result 是所有路径共用的，空 codes + 无 error 必然算出
+            # is_healthy=True / status=healthy，调用方无法把「维护窗口跳过」和
+            # 「同步成功」区分开。这个附加标记是唯一可机读的判别依据。
+            result = self._build_sync_result(trade_date, codes=[], synced=0, skipped=0, errors=[])
+            result["skipped_reason"] = "maintenance_mode"
+            return result
 
         if stock_codes:
             codes = [str(code).strip().upper() for code in stock_codes if str(code).strip()]
