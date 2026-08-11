@@ -723,3 +723,142 @@ def test_repair_service_batches_symbol_gaps_by_trade_date():
         Config.reset_instance()
         os.environ.pop("DATABASE_PATH", None)
         temp_dir.cleanup()
+
+
+def _maintenance_skip_result(trade_date: date) -> dict:
+    """维护窗口下 sync_trade_date 的返回：零网络调用、零 error、自带机读标记。"""
+    return {
+        "trade_date": trade_date.isoformat() if isinstance(trade_date, date) else trade_date,
+        "total": 0,
+        "synced": 0,
+        "skipped": 0,
+        "errors": [],
+        "skipped_reason": "maintenance_mode",
+        "health_report": {"is_healthy": True, "status": "healthy"},
+    }
+
+
+def test_repair_service_preserves_retry_budget_across_maintenance_mode_attempts():
+    """维护窗口里反复触发补偿不能烧掉重试预算。
+
+    维护窗口下 sync_trade_date 立即空跑返回、零 error，如果照常记 repair_attempted，
+    三次 Web「修复缺口」点击就能把 kline_retry_max_attempts 耗光，之后这些缺口被永久
+    跳过，只能人工介入。这里钉住：空跑不记账，退出维护窗口后真实补偿仍然可用。
+    """
+    from src.services.kline_repair_service import KlineRepairService
+
+    temp_dir = tempfile.TemporaryDirectory()
+    try:
+        db_path = os.path.join(temp_dir.name, "test_kline_repair_maintenance.db")
+        os.environ["DATABASE_PATH"] = db_path
+        Config.reset_instance()
+        DatabaseManager.reset_instance()
+        db = DatabaseManager.get_instance()
+        _create_run(db, "repair-run-maintenance")
+
+        missing_from = date(2026, 4, 13)  # 周一
+        missing_to = date(2026, 4, 15)    # 周三
+        gap = db.upsert_kline_audit_gap(
+            market="cn",
+            gap_scope="symbol_range_gap",
+            code="000001",
+            missing_date_from=missing_from,
+            missing_date_to=missing_to,
+            source_run_id="repair-run-maintenance",
+            status="pending_retry",
+        )
+
+        session_dates = KlineRepairService._iter_market_dates(
+            market="cn", start=missing_from, end=missing_to
+        )
+        maintenance_rounds = 4  # 严格多于默认 retry_max_attempts=3
+        maintenance_sync = _StubSyncService(
+            [_maintenance_skip_result(day) for day in session_dates] * maintenance_rounds
+        )
+        maintenance_service = KlineRepairService(
+            db_manager=db,
+            sync_service=maintenance_sync,
+            candidate_failure_threshold=2,
+            retry_max_attempts=3,
+        )
+
+        for _ in range(maintenance_rounds):
+            maintenance_service.repair_gaps(market="cn", governance_run_succeeded=False)
+
+        # 每一轮都真的走到了同步调用（不是被别的分支提前跳过），却没有产生任何记账
+        assert len(maintenance_sync.calls) == len(session_dates) * maintenance_rounds
+        assert db.list_kline_audit_events(
+            gap_key=gap.gap_key, event_type="repair_attempted"
+        ) == []
+        still_pending = db.list_kline_audit_gaps(market="cn", status="pending_retry")
+        assert [item.gap_key for item in still_pending] == [gap.gap_key]
+
+        # 退出维护窗口后第一次真实补偿照常执行并记账，证明预算确实还在
+        recovery_service = KlineRepairService(
+            db_manager=db,
+            sync_service=_BatchRecordingSyncService(db),
+            candidate_failure_threshold=2,
+            retry_max_attempts=3,
+        )
+        recovery_result = recovery_service.repair_gaps(
+            market="cn", governance_run_succeeded=False
+        )
+
+        assert recovery_result["repaired_gap_count"] == 1
+        assert [item.event_type for item in db.list_kline_audit_events(gap_key=gap.gap_key)] == [
+            "repair_attempted",
+            "recovered",
+        ]
+    finally:
+        DatabaseManager.reset_instance()
+        Config.reset_instance()
+        os.environ.pop("DATABASE_PATH", None)
+        temp_dir.cleanup()
+
+
+def test_repair_service_preserves_retry_budget_for_market_day_gap_in_maintenance_mode():
+    """market_day_gap 走的是另一条同步分支，同样不能把维护窗口空跑记成重试。"""
+    from src.services.kline_repair_service import KlineRepairService
+
+    temp_dir = tempfile.TemporaryDirectory()
+    try:
+        db_path = os.path.join(temp_dir.name, "test_kline_repair_maintenance_market_day.db")
+        os.environ["DATABASE_PATH"] = db_path
+        Config.reset_instance()
+        DatabaseManager.reset_instance()
+        db = DatabaseManager.get_instance()
+        _seed_active_instruments(db)
+        _create_run(db, "repair-run-maintenance-market-day")
+
+        trade_date = date(2026, 4, 16)
+        gap = db.upsert_kline_audit_gap(
+            market="cn",
+            gap_scope="market_day_gap",
+            trade_date=trade_date,
+            source_run_id="repair-run-maintenance-market-day",
+            status="pending_retry",
+        )
+
+        maintenance_rounds = 4
+        sync_service = _StubSyncService(
+            [_maintenance_skip_result(trade_date) for _ in range(maintenance_rounds)]
+        )
+        service = KlineRepairService(
+            db_manager=db,
+            sync_service=sync_service,
+            candidate_failure_threshold=2,
+            retry_max_attempts=3,
+        )
+
+        for _ in range(maintenance_rounds):
+            service.repair_gaps(market="cn", governance_run_succeeded=False)
+
+        assert len(sync_service.calls) == maintenance_rounds
+        assert db.list_kline_audit_events(
+            gap_key=gap.gap_key, event_type="repair_attempted"
+        ) == []
+    finally:
+        DatabaseManager.reset_instance()
+        Config.reset_instance()
+        os.environ.pop("DATABASE_PATH", None)
+        temp_dir.cleanup()

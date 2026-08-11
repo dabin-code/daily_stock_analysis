@@ -3763,3 +3763,86 @@ def test_strategy_names_omitted_from_snapshot_when_none():
         strategy_names=None,
     )
     assert "strategy_names" not in snapshot
+
+
+def _build_empty_sync_service(*, skipped_reason=None) -> MagicMock:
+    """构造一个 synced==0 且 skipped==0 的同步结果，可选带维护窗口标记。"""
+    market_data_sync_service = MagicMock()
+    result = {
+        "trade_date": "2026-03-13",
+        "total": 0,
+        "synced": 0,
+        "skipped": 0,
+        "errors": [],
+        "health_report": {"is_healthy": True, "status": "healthy"},
+    }
+    if skipped_reason is not None:
+        result["skipped_reason"] = skipped_reason
+    market_data_sync_service.sync_trade_date.return_value = result
+    return market_data_sync_service
+
+
+def _run_screening_with_empty_sync(run_id: str, market_data_sync_service: MagicMock) -> MagicMock:
+    db = MagicMock()
+    db.create_screening_run.return_value = run_id
+    db.get_screening_run.return_value = {
+        "run_id": run_id,
+        "mode": "balanced",
+        "status": "failed",
+        "candidate_count": 0,
+    }
+
+    universe_service = MagicMock()
+    universe_service.resolve_universe.return_value = pd.DataFrame(
+        [{"code": "600519", "name": "贵州茅台"}]
+    )
+
+    factor_service = MagicMock()
+    factor_service.get_latest_trade_date.return_value = date(2026, 3, 13)
+
+    service = ScreeningTaskService(
+        db_manager=db,
+        universe_service=universe_service,
+        factor_service=factor_service,
+        screener_service=MagicMock(),
+        candidate_analysis_service=MagicMock(),
+        market_data_sync_service=market_data_sync_service,
+    )
+
+    result = service.execute_run(
+        trade_date=date(2026, 3, 13),
+        stock_codes=None,
+        candidate_limit=30,
+        ai_top_k=0,
+    )
+
+    assert result["status"] == "failed"
+    return db
+
+
+def test_screening_task_service_blames_maintenance_mode_when_sync_is_skipped():
+    """维护窗口下的空跑必须指向那个开关，而不是甩锅给数据源。
+
+    每天早上定时筛选都会在窗口期失败；如果沿用「无可用日线数据」的文案，运维会去查
+    Tushare / AkShare，而真正要做的是关掉 DATA_MAINTENANCE_MODE 并重启进程。
+    """
+    db = _run_screening_with_empty_sync(
+        "run-maintenance-skip",
+        _build_empty_sync_service(skipped_reason="maintenance_mode"),
+    )
+
+    error_summary = db.update_screening_run_status.call_args_list[-1].kwargs["error_summary"]
+    assert "DATA_MAINTENANCE_MODE" in error_summary
+    assert "无可用日线数据" not in error_summary
+
+
+def test_screening_task_service_keeps_no_data_message_without_maintenance_marker():
+    """真正的无数据场景文案保持不变，确认维护窗口分支没有误伤既有诊断。"""
+    db = _run_screening_with_empty_sync(
+        "run-no-data",
+        _build_empty_sync_service(),
+    )
+
+    error_summary = db.update_screening_run_status.call_args_list[-1].kwargs["error_summary"]
+    assert "目标交易日无可用日线数据" in error_summary
+    assert "DATA_MAINTENANCE_MODE" not in error_summary

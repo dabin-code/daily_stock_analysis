@@ -15,18 +15,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connections opened through `DatabaseManager` now enable `PRAGMA
   journal_mode=WAL` (alongside the existing `busy_timeout=30000`), so a
   multi-hour write job no longer blocks every reader with the default rollback
-  journal. Added `scripts/backup_production_db.py`, a whole-database snapshot
+  journal. If the switch to WAL fails — another connection holding a read
+  transaction, a read-only database file, or a database on a network filesystem
+  that cannot host WAL's shared-memory index — the connection is still handed
+  out and a warning is logged; the application stays correct in DELETE mode,
+  merely slower. Added `scripts/backup_production_db.py`, a whole-database snapshot
   via the SQLite backup API (consistent even under concurrent writes), written
-  to `./data/backups` by default. Added the `DATA_MAINTENANCE_MODE` switch
-  (default `false`): while enabled, the daily market-data sync
-  (`MarketDataSyncService.sync_trade_date`) and the K-line governance job
+  to `./data/backups` by default. The snapshot is written to a `.db.tmp` file
+  and renamed into place only after the destination connection closes cleanly,
+  so an interrupted or out-of-disk run leaves no file behind rather than a
+  plausibly-named empty one; free space is checked before any bytes are written,
+  and an existing target name is refused instead of silently overwritten.
+  Added the `DATA_MAINTENANCE_MODE` switch (default `false`): while enabled,
+  the daily market-data sync (`MarketDataSyncService.sync_trade_date`) and the
+  K-line governance job
   (`KlineGovernanceScheduleService.run_daily_governance`) short-circuit and log
   a warning instead of running. Enter the window right before starting a
-  long-running historical backfill; exit it (set `DATA_MAINTENANCE_MODE=false`)
-  as soon as the backfill has produced its results — production data stops
-  updating for as long as the switch is on. Rollback: set
-  `DATA_MAINTENANCE_MODE=false`; WAL can be reverted with
-  `PRAGMA journal_mode=DELETE` on the database file.
+  long-running historical backfill and leave it as soon as the backfill has
+  produced its results — production data stops updating for as long as the
+  switch is on.
+
+  **Operator caveats for the maintenance window.** Read these before using the
+  switch:
+
+  - **Both entering and leaving the window require a process restart.**
+    `Config` is a cached singleton, so changing `DATA_MAINTENANCE_MODE` in the
+    environment has no effect on an already-running API server or scheduler
+    until that process is restarted.
+  - **The switch does not make the database quiet.** Only the two entry points
+    above are guarded. Everything below still reads and writes production data
+    during the window:
+    - scheduled `screening` (the full five-layer pipeline, and by far the
+      heaviest writer), `analysis`, and `board_sync`;
+    - scheduled `kline_deep_audit`, which additionally **always fails** during
+      the window: it requires a passed daily-audit record, and maintenance mode
+      prevents that record from ever being written. The scheduler catches the
+      failure, so the only symptom is one ERROR log per day;
+    - all web data-health operations, including `backfill_to_date`;
+    - `scripts/_kline_window_sync.py` and `scripts/_kline_targeted_repair.py`,
+      which no-op and report `0 synced` — easy to misread as "nothing to do".
+
+    Scheduled `screening` fails during the window with an error that names
+    `DATA_MAINTENANCE_MODE` as the cause, so it is not mistaken for a data-source
+    outage. Gap repair recognises the maintenance skip and does not spend a
+    retry attempt on a run that made no network calls.
+
+  Rollback: revert this commit. Setting `DATA_MAINTENANCE_MODE=false` (plus a
+  process restart) is enough to leave the maintenance window, but it does not
+  undo WAL — the `DatabaseManager` connect listener re-enables
+  `journal_mode=WAL` on every new connection, so running
+  `PRAGMA journal_mode=DELETE` against the database file only holds until the
+  next connection opens.
 - Added the `TUSHARE_QFQ_ENABLED` hard switch (default `false`) guarding
   Tushare front-adjustment. The conversion previously fired unconditionally and
   only degraded to unadjusted prices because free accounts rate-limit

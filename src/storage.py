@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import re
+import sqlite3
 from datetime import datetime, date, timedelta
 from typing import Optional, List, Dict, Any, TYPE_CHECKING, Tuple
 
@@ -1227,7 +1228,14 @@ class DatabaseManager:
                 # WAL 让读写不互相阻塞。历史数据回补是数小时、数千次事务的长作业，
                 # 默认的 rollback journal 会让写锁阻塞全部读，与每日任务相撞即
                 # database is locked。
-                cursor.execute("PRAGMA journal_mode=WAL")
+                # 切换 WAL 需要写库头，会在多种真实场景下失败：升级时另一个连接正持有
+                # 读事务（等满 busy_timeout 后 database is locked）、库文件只读、
+                # 库放在不支持共享内存索引的网络盘。这些情况下 DELETE 模式只是慢，
+                # 应用本身仍然正确，绝不能因此让整个进程拿不到连接。
+                try:
+                    cursor.execute("PRAGMA journal_mode=WAL")
+                except sqlite3.OperationalError as exc:
+                    logger.warning("启用 WAL 失败，沿用当前 journal 模式: %s", exc)
                 cursor.close()
 
         # 创建 Session 工厂

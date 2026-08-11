@@ -541,6 +541,14 @@ class ScreeningTaskService:
                         )
                     )
                 if sync_result["synced"] == 0 and sync_result["skipped"] == 0:
+                    # 维护窗口下同步整体短路，空跑同样命中 synced==0 且 skipped==0。
+                    # 沿用「无可用日线数据」的文案会把运维指向数据源，而真正的原因是
+                    # 那个开关，必须点名说清楚。
+                    if self._is_maintenance_skip(sync_result):
+                        raise ValueError(
+                            "DATA_MAINTENANCE_MODE 已开启，日线同步整体跳过，无法继续筛选；"
+                            "关闭该开关并重启进程后重试"
+                        )
                     raise ValueError("目标交易日无可用日线数据，无法继续筛选")
                 self._log_stage_completed(
                     screening_run_id=run_id,
@@ -1598,6 +1606,11 @@ class ScreeningTaskService:
             else:
                 blocking.append(item)
         return skippable, blocking
+
+    @staticmethod
+    def _is_maintenance_skip(sync_result: Dict[str, Any]) -> bool:
+        """判断一次同步是否被维护窗口整体短路（零网络调用的空跑）。"""
+        return sync_result.get("skipped_reason") == "maintenance_mode"
 
     @staticmethod
     def _is_skippable_sync_error(error: Dict[str, Any]) -> bool:

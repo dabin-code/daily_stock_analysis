@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import date, datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy import select
 
@@ -12,6 +12,9 @@ from src.services.market_data_sync_service import MarketDataSyncService
 from src.storage import DatabaseManager, KlineAuditGap, StockDaily
 
 logger = logging.getLogger(__name__)
+
+# MarketDataSyncService 在维护窗口下整体短路时写入的机读标记。
+MAINTENANCE_SKIP_REASON = "maintenance_mode"
 
 
 class KlineRepairService:
@@ -74,15 +77,22 @@ class KlineRepairService:
             and gap.status == "pending_retry"
             and not self._has_reached_retry_limit(gap)
         ]
-        prefetched_errors = (
-            self._batch_prefetch_symbol_gaps(prefetch_eligible) if prefetch_eligible else {}
-        )
+        prefetched_errors: Dict[str, List[Dict[str, object]]] = {}
+        prefetch_maintenance_skipped = False
+        if prefetch_eligible:
+            prefetched_errors, prefetch_maintenance_skipped = self._batch_prefetch_symbol_gaps(
+                prefetch_eligible
+            )
 
         for gap in unresolved_gaps:
             if gap.status == "pending_retry":
                 if self._has_reached_retry_limit(gap):
                     continue
-                outcome = self._repair_pending_retry_gap(gap, prefetched_errors)
+                outcome = self._repair_pending_retry_gap(
+                    gap,
+                    prefetched_errors,
+                    prefetch_maintenance_skipped=prefetch_maintenance_skipped,
+                )
                 if outcome == "healthy":
                     repaired_gap_count += 1
                     recovered_gap_count += 1
@@ -122,28 +132,50 @@ class KlineRepairService:
         )
         return len(attempt_events) >= self.retry_max_attempts
 
+    @staticmethod
+    def _is_maintenance_skip(sync_result: Dict[str, object]) -> bool:
+        """判断一次同步是否被维护窗口整体短路（零网络调用的空跑）。"""
+        return sync_result.get("skipped_reason") == MAINTENANCE_SKIP_REASON
+
     def _repair_pending_retry_gap(
         self,
         gap: KlineAuditGap,
         prefetched_errors: Optional[Dict[str, List[Dict[str, object]]]] = None,
+        *,
+        prefetch_maintenance_skipped: bool = False,
     ) -> str:
-        repair_result = self._run_gap_repair(gap, prefetched_errors)
-        self.db.append_kline_audit_event(
-            source_run_id=gap.source_run_id,
-            gap_key=gap.gap_key,
-            event_type="repair_attempted",
-            event_status="pending_retry",
-            payload={
-                "gap_scope": gap.gap_scope,
-                "trade_date": gap.trade_date.isoformat() if gap.trade_date else None,
-                "code": gap.code,
-                "missing_date_from": (
-                    gap.missing_date_from.isoformat() if gap.missing_date_from else None
-                ),
-                "missing_date_to": gap.missing_date_to.isoformat() if gap.missing_date_to else None,
-                "error_count": len(repair_result["errors"]),
-            },
+        repair_result = self._run_gap_repair(
+            gap,
+            prefetched_errors,
+            prefetch_maintenance_skipped=prefetch_maintenance_skipped,
         )
+        if repair_result["maintenance_skipped"]:
+            # 维护窗口下同步整体短路，一次请求都没发出。此时照常记 repair_attempted
+            # 会零成本地把 kline_retry_max_attempts 耗光，之后这些缺口被永久跳过、
+            # 只能人工介入。空跑不算一次真实重试。
+            logger.warning(
+                "[GapRepair] DATA_MAINTENANCE_MODE 已开启，缺口 %s 本次补偿未真正执行，不计入重试次数",
+                gap.gap_key,
+            )
+        else:
+            self.db.append_kline_audit_event(
+                source_run_id=gap.source_run_id,
+                gap_key=gap.gap_key,
+                event_type="repair_attempted",
+                event_status="pending_retry",
+                payload={
+                    "gap_scope": gap.gap_scope,
+                    "trade_date": gap.trade_date.isoformat() if gap.trade_date else None,
+                    "code": gap.code,
+                    "missing_date_from": (
+                        gap.missing_date_from.isoformat() if gap.missing_date_from else None
+                    ),
+                    "missing_date_to": (
+                        gap.missing_date_to.isoformat() if gap.missing_date_to else None
+                    ),
+                    "error_count": len(repair_result["errors"]),
+                },
+            )
 
         if self._is_gap_repaired(gap):
             self._mark_gap_healthy(gap)
@@ -158,11 +190,12 @@ class KlineRepairService:
     def _batch_prefetch_symbol_gaps(
         self,
         gaps: List[KlineAuditGap],
-    ) -> Dict[str, List[Dict[str, object]]]:
+    ) -> Tuple[Dict[str, List[Dict[str, object]]], bool]:
         """按交易日聚合所有 symbol_range 缺口,每个交易日只发一次批量同步。
 
-        返回 ``{code: [error, ...]}``,供后续 per-gap 核销直接读取该批次的失败诊断,
-        避免对同一(股票,日期)重复下载。
+        返回 ``({code: [error, ...]}, maintenance_skipped)``:前者供后续 per-gap 核销
+        直接读取该批次的失败诊断,避免对同一(股票,日期)重复下载;后者标记本批次是否
+        被维护窗口整体短路,用于避免把空跑记成一次重试。
         """
         date_to_codes: Dict[date, set[str]] = {}
         for gap in gaps:
@@ -172,8 +205,9 @@ class KlineRepairService:
                 date_to_codes.setdefault(trade_date, set()).add(gap.code)
 
         errors_by_code: Dict[str, List[Dict[str, object]]] = {}
+        maintenance_skipped = False
         if not date_to_codes:
-            return errors_by_code
+            return errors_by_code, maintenance_skipped
 
         total_pairs = sum(len(codes) for codes in date_to_codes.values())
         logger.info(
@@ -194,40 +228,53 @@ class KlineRepairService:
                     f"[GapRepair] 预拉取 {trade_date} 失败,转 per-gap 兜底:{exc}"
                 )
                 continue
+            if self._is_maintenance_skip(result):
+                maintenance_skipped = True
             for error in result.get("errors", []):
                 code = error.get("code")
                 if code:
                     errors_by_code.setdefault(str(code), []).append(error)
 
-        return errors_by_code
+        return errors_by_code, maintenance_skipped
 
     def _run_gap_repair(
         self,
         gap: KlineAuditGap,
         prefetched_errors: Optional[Dict[str, List[Dict[str, object]]]] = None,
+        *,
+        prefetch_maintenance_skipped: bool = False,
     ) -> Dict[str, object]:
         if gap.gap_scope == "market_day_gap":
             result = self.sync_service.sync_trade_date(
                 trade_date=gap.trade_date,
                 force=True,
             )
-            return {"errors": list(result.get("errors", []))}
+            return {
+                "errors": list(result.get("errors", [])),
+                "maintenance_skipped": self._is_maintenance_skip(result),
+            }
 
         if gap.gap_scope == "symbol_range_gap":
             # 已由批量预拉取覆盖:直接复用该批次为本股票产出的失败诊断,不再重复下载。
             if prefetched_errors is not None:
-                return {"errors": list(prefetched_errors.get(gap.code or "", []))}
+                return {
+                    "errors": list(prefetched_errors.get(gap.code or "", [])),
+                    "maintenance_skipped": prefetch_maintenance_skipped,
+                }
 
             # 兜底路径(无预拉取上下文,如直接调用):仅同步仍缺失的交易日。
             errors: List[Dict[str, object]] = []
+            maintenance_skipped = False
             for trade_date in self._missing_dates_for_symbol_gap(gap):
                 result = self.sync_service.sync_trade_date(
                     trade_date=trade_date,
                     stock_codes=[gap.code],
                     force=True,
                 )
+                if self._is_maintenance_skip(result):
+                    maintenance_skipped = True
                 errors.extend(result.get("errors", []))
-            return {"errors": errors}
+            return {"errors": errors, "maintenance_skipped": maintenance_skipped}
 
         raise ValueError(f"Unsupported gap scope: {gap.gap_scope}")
 
