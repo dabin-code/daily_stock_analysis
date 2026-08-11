@@ -456,6 +456,8 @@ class TushareFetcher(BaseFetcher):
           回测取历史窗口时则得到该时点的 point-in-time 前复权，避免未来函数。
         - 若 adj_factor 接口不可用或返回空（如账号权限不足），记录告警并回退为
           不复权数据，保证取数主流程不中断（数据源降级不应拖垮分析流程）。
+        - 本函数默认由 ``TUSHARE_QFQ_ENABLED`` 关闭。它与「stock_daily 存不复权价」
+          的设计冲突：开启后生产写入语义会变成前复权。仅供临时排查使用。
 
         Args:
             df: Tushare daily() 返回的原始 DataFrame（含 trade_date 及价格列）
@@ -466,6 +468,11 @@ class TushareFetcher(BaseFetcher):
         Returns:
             前复权处理后的 DataFrame；无法复权时返回原始不复权 DataFrame。
         """
+        # 硬开关短路必须放在最前：一旦购买 Tushare 积分，adj_factor 就不再限频，
+        # 下面的熔断回退随之失效，生产写入口径会静默从不复权翻转为前复权。
+        if not getattr(get_config(), "tushare_qfq_enabled", False):
+            return df
+
         if df is None or df.empty or 'trade_date' not in df.columns:
             return df
 

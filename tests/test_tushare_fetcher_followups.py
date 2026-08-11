@@ -2,6 +2,7 @@
 """Regression tests for post-merge Tushare follow-up fixes."""
 
 import importlib.util
+import os
 import sys
 import unittest
 from datetime import datetime
@@ -22,10 +23,21 @@ if not json_repair_available and "json_repair" not in sys.modules:
     sys.modules["json_repair"] = MagicMock()
 
 from data_provider.tushare_fetcher import TushareFetcher
+from src.config import Config
 
 
 class TestTushareFetcherFollowUps(unittest.TestCase):
     """Cover rate limiting and cross-day trade-calendar refresh behavior."""
+
+    def setUp(self) -> None:
+        # 这组用例验证 _apply_qfq_adjustment 函数体本身的正确性，因此显式打开开关。
+        # 生产默认关闭由 tests/test_tushare_qfq_switch.py 把关。
+        os.environ["TUSHARE_QFQ_ENABLED"] = "true"
+        Config.reset_instance()
+
+    def tearDown(self) -> None:
+        os.environ.pop("TUSHARE_QFQ_ENABLED", None)
+        Config.reset_instance()
 
     @staticmethod
     def _make_fetcher() -> TushareFetcher:

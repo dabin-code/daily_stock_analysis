@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Added the `TUSHARE_QFQ_ENABLED` hard switch (default `false`) guarding
+  Tushare front-adjustment. The conversion previously fired unconditionally and
+  only degraded to unadjusted prices because free accounts rate-limit
+  `adj_factor`; buying credits would have silently flipped the `stock_daily`
+  price convention from unadjusted to front-adjusted with no way to stop it.
+  Behaviour change: Tushare daily bars are no longer auto-adjusted after a
+  credit purchase. Rollback: set `TUSHARE_QFQ_ENABLED=true`.
 - Added opt-in causal bottom-divergence v2 detection with B+1-frozen MACD/trendline evidence,
   deterministic R1/R2 resistance zones, versioned candidate records, and staged
   `early` / `near_cleared` / `major_actionable` factors. The new strategy

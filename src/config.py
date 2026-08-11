@@ -697,6 +697,11 @@ class Config:
     screening_ingest_failure_threshold: float = 0.20
     screening_market_guard_enabled: bool = True
     screening_market_guard_index: str = "sh000001"
+    # === 复权口径开关 ===
+    # Tushare daily() 返回不复权价。历史上此处会自动转前复权，但该行为与
+    # 「stock_daily 是不复权权威源」的设计冲突，且购买积分后会静默生效。
+    # 默认关闭，待新复权体系（stock_daily_adj）就绪后本开关连同函数一并移除。
+    tushare_qfq_enabled: bool = False
     kline_governance_enabled: bool = False
     kline_governance_schedule_time: str = "17:00"
     kline_governance_run_immediately: bool = False
@@ -1402,6 +1407,7 @@ class Config:
             screening_ingest_failure_threshold=float(os.getenv('SCREENING_INGEST_FAILURE_THRESHOLD', '0.20')),
             screening_market_guard_enabled=parse_env_bool(os.getenv('SCREENING_MARKET_GUARD_ENABLED'), default=True),
             screening_market_guard_index=os.getenv('SCREENING_MARKET_GUARD_INDEX', 'sh000001'),
+            tushare_qfq_enabled=parse_env_bool(os.getenv('TUSHARE_QFQ_ENABLED'), default=False),
             kline_governance_enabled=parse_env_bool(os.getenv('KLINE_GOVERNANCE_ENABLED'), default=False),
             kline_governance_schedule_time=os.getenv('KLINE_GOVERNANCE_SCHEDULE_TIME', '17:00'),
             kline_governance_run_immediately=parse_env_bool(
