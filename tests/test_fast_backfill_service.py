@@ -174,6 +174,37 @@ def test_fast_backfill_to_trade_date_refills_earlier_incomplete_target(tmp_path)
     assert result["backfilled_dates"] == ["2026-05-11"]
 
 
+def test_fast_backfill_converts_tushare_volume_and_amount_units(tmp_path):
+    """Tushare 的 vol 为手、amount 为千元，落库必须换算成股与元。
+
+    漏掉换算会让量比等量能因子在数据源边界上出现 100 倍级断层。
+    """
+    db_path = tmp_path / "stock_analysis.db"
+    _init_stock_daily(db_path)
+    service = FastBackfillService(
+        db_path=str(db_path),
+        tushare_api=_FakeTushareApi(),
+        governance_service=SimpleNamespace(
+            run_daily_governance=lambda **kwargs: {
+                "run_result": "succeeded",
+                "pass_status": "passed",
+            }
+        ),
+        min_full_count=2,
+        sleep=lambda _seconds: None,
+    )
+
+    service.backfill_to_trade_date(date(2026, 5, 11))
+
+    with sqlite3.connect(db_path) as conn:
+        volume, amount = conn.execute(
+            "SELECT volume, amount FROM stock_daily WHERE code='000001' AND date='2026-05-11'"
+        ).fetchone()
+
+    assert volume == 1000 * 100
+    assert amount == 2000 * 1000
+
+
 def test_fast_backfill_to_trade_date_rejects_future_target(tmp_path):
     db_path = tmp_path / "stock_analysis.db"
     _init_stock_daily(db_path)

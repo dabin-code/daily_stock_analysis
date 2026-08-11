@@ -60,6 +60,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   safety gate and the absence of a user-approved non-zero cost model and run
   range. Causal bottom-divergence v2 therefore remains disabled by default.
 
+### 成交量/成交额落库单位统一（修复量能因子跨数据源 100 倍断层）
+
+- Fixed 三条写入路径把数据源的原生单位原样写入 `stock_daily`，而该表 `volume` 的口径是股、`amount` 的口径是元。Tushare `daily` 的 `vol` 单位为手、`amount` 单位为千元；efinance/东财的成交量单位为手。受影响的写入方为 `src/services/market_data_sync_service.py` 的 `_try_bulk_sync`（每日行情同步主路径）、`src/services/fast_backfill_service.py`、`scripts/fast_backfill.py` 与 `data_provider/efinance_fetcher.py` 的历史 K 线归一化。
+- 影响面：量比等量能因子在跨越数据源边界的窗口内会出现 100 倍级断层，系统会把正常成交误判为极度缩量。生产库实测 296.4 万条可判定记录中有 110.0 万条（37.1%）单位错误，其中 `TushareFetcher(bulk)` 写入的 51.4 万条无一正确。
+- Added `data_provider/base.py` 新增 `SHARES_PER_LOT` / `YUAN_PER_THOUSAND_YUAN` 与 `lots_to_shares()` / `thousand_yuan_to_yuan()`，把落库单位口径收敛到单一出处；四条写入路径统一调用，避免约定散落各处再次被遗漏。
+- Added `scripts/repair_volume_amount_units.py` 修正存量数据。按 `amount / (volume × close)`（物理含义为成交均价与收盘价之比，单位正确时必然接近 1）的量级分类，`~0.1` 补 `volume×100` 与 `amount×1000`、`~100` 补 `volume×100`。脚本默认 dry-run，幂等，且带越界守卫。
+- 修正后全部数据源的该比值中位数回到 1.00 附近（此前 `TushareFetcher(bulk)` 为 0.1000、`EfinanceFetcher` 为 100.76）。落在判定区间之外的 397 条（0.013%）保持原样并输出清单待人工确认——其中部分记录的 `amount` 与 `close` 相差恰好 2 倍，疑为复权价与不复权成交额混存，属另一问题。
+
 ### 低位123检测改为段内极值选点（修复下跌中继反弹高点被误判为 P2）
 
 - Fixed `Low123TrendlineDetector` 用"最新摆动点优先"的方式挑选 P1/P2/P3，导致把真实反弹高点之后的**下跌中继反弹高点误选为 P2** 的问题。典型误判：603980 于 2026-07-28 收盘 6.50 站上伪 P2（07-17 反弹高点 6.40）即被报为 `breakout_ready` 最佳买点，而真实结构的 P2（06-24 高点 7.02）远未突破；此前多轮外围补丁（跨度上限、突破时效、破位失效）均未触及该选点根因。

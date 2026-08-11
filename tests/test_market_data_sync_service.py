@@ -1,7 +1,10 @@
 import os
+import sqlite3
+import sys
 import tempfile
 import unittest
 from datetime import date
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
@@ -685,6 +688,72 @@ class MarketDataSyncServiceBulkSentinelTestCase(unittest.TestCase):
             errors_by_code["600519"]["reason"], "not_in_bulk_universe",
             "开关关闭时不应该写入 not_in_bulk_universe",
         )
+
+
+class BulkSyncUnitConversionTestCase(unittest.TestCase):
+    """_try_bulk_sync 是每日行情同步的主路径，不换算单位会污染所有量能因子。"""
+
+    def setUp(self) -> None:
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self._db_path = os.path.join(self._temp_dir.name, "test_bulk_units.db")
+        os.environ["DATABASE_PATH"] = self._db_path
+        os.environ["TUSHARE_TOKEN"] = "test-token"
+
+        Config.reset_instance()
+        DatabaseManager.reset_instance()
+        self.db = DatabaseManager.get_instance()
+
+    def tearDown(self) -> None:
+        DatabaseManager.reset_instance()
+        Config.reset_instance()
+        os.environ.pop("DATABASE_PATH", None)
+        os.environ.pop("TUSHARE_TOKEN", None)
+        self._temp_dir.cleanup()
+
+    def test_bulk_sync_converts_lots_to_shares_and_thousand_yuan_to_yuan(self) -> None:
+        trade_date = date(2026, 3, 13)
+        daily_df = pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20260313",
+                    "open": 12.0,
+                    "high": 12.3,
+                    "low": 11.9,
+                    "close": 12.1,
+                    # 2000 手 = 200000 股，按 12.1 元成交 = 2_420_000 元 = 2420 千元
+                    "vol": 2000.0,
+                    "amount": 2_420.0,
+                    "pct_chg": 1.1,
+                }
+            ]
+        )
+
+        fake_tushare = SimpleNamespace(
+            set_token=lambda _token: None,
+            pro_api=lambda: SimpleNamespace(daily=lambda trade_date: daily_df),
+        )
+
+        service = MarketDataSyncService(db_manager=self.db, fetcher_manager=None)
+        with patch.dict(sys.modules, {"tushare": fake_tushare}):
+            synced, universe = service._try_bulk_sync(trade_date, {"000001"})
+
+        self.assertEqual(synced, 1)
+        self.assertEqual(universe, {"000001"})
+
+        conn = sqlite3.connect(self._db_path)
+        try:
+            volume, amount = conn.execute(
+                "SELECT volume, amount FROM stock_daily WHERE code='000001' AND date='2026-03-13'"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(volume, 2000.0 * 100, "vol 单位是手，落库须转成股")
+        self.assertEqual(amount, 2_420.0 * 1000, "amount 单位是千元，落库须转成元")
+
+        # 成交均价与收盘价之比应接近 1；单位错误会让它偏离一到两个数量级
+        self.assertAlmostEqual(amount / (volume * 12.1), 1.0, places=2)
 
 
 if __name__ == "__main__":

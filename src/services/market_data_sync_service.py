@@ -7,7 +7,12 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from datetime import date
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
-from data_provider.base import DataFetchError, DataFetcherManager
+from data_provider.base import (
+    DataFetchError,
+    DataFetcherManager,
+    lots_to_shares,
+    thousand_yuan_to_yuan,
+)
 from src.storage import DatabaseManager
 
 logger = logging.getLogger(__name__)
@@ -351,7 +356,8 @@ class MarketDataSyncService:
                                 "code": code, "date": date_str,
                                 "open": row.get("open"), "high": row.get("high"),
                                 "low": row.get("low"), "close": row.get("close"),
-                                "volume": row.get("vol"), "amount": row.get("amount"),
+                                "volume": lots_to_shares(row.get("vol")),
+                                "amount": thousand_yuan_to_yuan(row.get("amount")),
                                 "pct_chg": row.get("pct_chg"),
                                 "data_source": "TushareFetcher(bulk)",
                                 "created_at": now_str,

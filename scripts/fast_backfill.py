@@ -28,6 +28,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from data_provider.base import lots_to_shares, thousand_yuan_to_yuan
 from src.services.fast_backfill_service import FastBackfillService
 
 logging.basicConfig(
@@ -144,8 +145,8 @@ def save_day_data(db_path: str, day_df: Any, index_df: Any) -> int:
                     row.get("high"),
                     row.get("low"),
                     row.get("close"),
-                    row.get("vol"),
-                    row.get("amount"),
+                    lots_to_shares(row.get("vol")),
+                    thousand_yuan_to_yuan(row.get("amount")),
                     row.get("pct_chg"),
                     source_name,
                     now,

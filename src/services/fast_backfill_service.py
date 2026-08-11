@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
 
+from data_provider.base import lots_to_shares, thousand_yuan_to_yuan
 from src.config import get_config
 from src.core.trading_calendar import is_market_open
 from src.services.kline_governance_schedule_service import KlineGovernanceScheduleService
@@ -190,8 +191,8 @@ class FastBackfillService:
                         row.get("high"),
                         row.get("low"),
                         row.get("close"),
-                        row.get("vol"),
-                        row.get("amount"),
+                        lots_to_shares(row.get("vol")),
+                        thousand_yuan_to_yuan(row.get("amount")),
                         row.get("pct_chg"),
                         "TushareFetcher",
                         now,

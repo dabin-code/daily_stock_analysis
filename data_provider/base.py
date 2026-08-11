@@ -35,6 +35,36 @@ logger = logging.getLogger(__name__)
 STANDARD_COLUMNS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
 
 
+# === 落库单位口径 ===
+# stock_daily.volume 的口径是「股」，stock_daily.amount 的口径是「元」。
+# 各数据源的原生单位并不一致，落库前必须换算，否则量能类因子（量比、缩量回踩等）
+# 会在数据源边界上出现 100 倍级断层。
+#   Tushare daily：vol 为手、amount 为千元
+#   efinance/东财：成交量为手、成交额为元
+SHARES_PER_LOT = 100
+YUAN_PER_THOUSAND_YUAN = 1000
+
+
+def lots_to_shares(vol: Any) -> Any:
+    """成交量：手 → 股。None 与非数值原样返回，交由上层处理缺失。"""
+    if vol is None:
+        return None
+    try:
+        return float(vol) * SHARES_PER_LOT
+    except (TypeError, ValueError):
+        return vol
+
+
+def thousand_yuan_to_yuan(amount: Any) -> Any:
+    """成交额：千元 → 元。None 与非数值原样返回，交由上层处理缺失。"""
+    if amount is None:
+        return None
+    try:
+        return float(amount) * YUAN_PER_THOUSAND_YUAN
+    except (TypeError, ValueError):
+        return amount
+
+
 def unwrap_exception(exc: Exception) -> Exception:
     """
     Follow chained exceptions and return the deepest non-cyclic cause.

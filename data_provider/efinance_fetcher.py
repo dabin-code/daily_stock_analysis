@@ -53,7 +53,7 @@ except (ValueError, TypeError):
 
 from patch.eastmoney_patch import eastmoney_patch
 from src.config import get_config
-from .base import BaseFetcher, DataFetchError, RateLimitError, STANDARD_COLUMNS,is_bse_code, is_st_stock, is_kc_cy_stock, normalize_stock_code
+from .base import BaseFetcher, DataFetchError, RateLimitError, STANDARD_COLUMNS, SHARES_PER_LOT, is_bse_code, is_st_stock, is_kc_cy_stock, normalize_stock_code
 from .realtime_types import (
     UnifiedRealtimeQuote, RealtimeSource,
     get_realtime_circuit_breaker,
@@ -572,7 +572,10 @@ class EfinanceFetcher(BaseFetcher):
         if 'amount' not in df.columns:
             df['amount'] = 0
 
-        
+        # 成交量单位转换（东财返回的成交量单位是手，需要转换为股；成交额本就是元）
+        if 'volume' in df.columns:
+            df['volume'] = pd.to_numeric(df['volume'], errors='coerce') * SHARES_PER_LOT
+
         # 如果没有 code 列，手动添加
         if 'code' not in df.columns:
             df['code'] = stock_code
