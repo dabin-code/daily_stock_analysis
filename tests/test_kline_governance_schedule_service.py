@@ -141,6 +141,43 @@ class KlineGovernanceScheduleServiceTestCase(unittest.TestCase):
         self.assertEqual(result["pass_status"], "skipped")
         self.assertEqual(result["reason"], "non_trading_day")
 
+    def test_run_daily_governance_skips_when_maintenance_mode_enabled(self) -> None:
+        """维护窗口开启时治理任务整体短路，且不解析交易日、不触发同步。"""
+        sync_service = mock.MagicMock()
+        audit_service = mock.MagicMock()
+        repair_service = mock.MagicMock()
+        service = KlineGovernanceScheduleService(
+            config=self._build_config(data_maintenance_mode=True),
+            market_data_sync_service=sync_service,
+            audit_service=audit_service,
+            repair_service=repair_service,
+            skip_policy_service=mock.MagicMock(),
+            db_manager=mock.MagicMock(),
+        )
+
+        with patch.object(
+            service,
+            "resolve_target_trade_date",
+            side_effect=AssertionError("resolve_target_trade_date must not run in maintenance mode"),
+        ):
+            with self.assertLogs(
+                "src.services.kline_governance_schedule_service",
+                level="WARNING",
+            ) as captured:
+                result = service.run_daily_governance()
+
+        self.assertEqual(result["run_result"], "skipped")
+        self.assertEqual(result["pass_status"], "skipped")
+        self.assertEqual(result["reason"], "maintenance_mode")
+        self.assertIsNone(result["trade_date"])
+        sync_service.sync_trade_date.assert_not_called()
+        audit_service.audit_trade_date.assert_not_called()
+        repair_service.repair_gaps.assert_not_called()
+        self.assertTrue(
+            any("DATA_MAINTENANCE_MODE" in message for message in captured.output),
+            f"expected a maintenance-mode warning, got: {captured.output}",
+        )
+
     def test_run_deep_audit_skips_non_trading_day_without_crashing_scheduler(self) -> None:
         service = KlineGovernanceScheduleService(config=self._build_config())
 

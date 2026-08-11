@@ -13,6 +13,7 @@ from data_provider.base import (
     lots_to_shares,
     thousand_yuan_to_yuan,
 )
+from src.config import get_config
 from src.storage import DatabaseManager
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,13 @@ class MarketDataSyncService:
         4. 每次 API 调用有 _PER_STOCK_FETCH_TIMEOUT 超时
         """
         _ = min_available_ratio  # 保留现有方法签名兼容性，不再参与健康判定或短路逻辑。
+        if getattr(get_config(), "data_maintenance_mode", False):
+            logger.warning(
+                "DATA_MAINTENANCE_MODE 已开启，跳过本次日线同步（trade_date=%s）",
+                trade_date.isoformat(),
+            )
+            return self._build_sync_result(trade_date, codes=[], synced=0, skipped=0, errors=[])
+
         if stock_codes:
             codes = [str(code).strip().upper() for code in stock_codes if str(code).strip()]
         else:

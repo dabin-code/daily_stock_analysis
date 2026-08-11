@@ -109,6 +109,15 @@ class KlineGovernanceScheduleService:
         trade_date: Optional[date] = None,
         market: str = "cn",
     ) -> Dict[str, Any]:
+        if getattr(self.config, "data_maintenance_mode", False):
+            logger.warning("DATA_MAINTENANCE_MODE 已开启，跳过本次 K 线治理任务")
+            return {
+                "trade_date": None,
+                "run_result": "skipped",
+                "pass_status": "skipped",
+                "reason": "maintenance_mode",
+            }
+
         try:
             target_trade_date = self.resolve_target_trade_date(
                 trade_date=trade_date,

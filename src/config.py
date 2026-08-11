@@ -723,6 +723,9 @@ class Config:
     # bulk 哨兵：Tushare bulk 当日 universe 之外的代码直接标 skip_eligible，
     # 避免对已退市等"显然无源"的代码做无谓逐只兜底，提升整体同步速度
     kline_sync_bulk_sentinel_enabled: bool = True
+    # 维护窗口。开启时每日同步与 K 线治理任务跳过执行，
+    # 供长时历史回补独占数据库。开启期间生产数据不再更新，用完必须关闭。
+    data_maintenance_mode: bool = False
     # Discord 机器人状态
     discord_bot_status: str = "A股智能分析 | /help"
 
@@ -1458,6 +1461,7 @@ class Config:
                 os.getenv('KLINE_SYNC_BULK_SENTINEL_ENABLED'),
                 default=True,
             ),
+            data_maintenance_mode=parse_env_bool(os.getenv('DATA_MAINTENANCE_MODE'), default=False),
         )
     
     @classmethod

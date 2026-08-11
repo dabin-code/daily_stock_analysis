@@ -127,6 +127,64 @@ class MarketDataSyncServiceTestCase(unittest.TestCase):
         self.assertEqual(latest[0].date, target_date)
         self.assertEqual(latest[0].data_source, "StubFetcher")
 
+    def test_sync_trade_date_skips_everything_when_maintenance_mode_enabled(self) -> None:
+        """维护窗口开启时同步整体短路，让长时回补独占数据库。"""
+        os.environ["DATA_MAINTENANCE_MODE"] = "true"
+        Config.reset_instance()
+        self.addCleanup(Config.reset_instance)
+        self.addCleanup(os.environ.pop, "DATA_MAINTENANCE_MODE", None)
+
+        fetcher_manager = _StubDataFetcherManager({})
+        service = MarketDataSyncService(db_manager=self.db, fetcher_manager=fetcher_manager)
+
+        with self.assertLogs("src.services.market_data_sync_service", level="WARNING") as captured:
+            result = service.sync_trade_date(trade_date=date(2026, 3, 13))
+
+        self.assertEqual(result["total"], 0)
+        self.assertEqual(result["synced"], 0)
+        self.assertEqual(result["skipped"], 0)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(fetcher_manager.calls, [])
+        self.assertTrue(
+            any("DATA_MAINTENANCE_MODE" in message for message in captured.output),
+            f"expected a maintenance-mode warning, got: {captured.output}",
+        )
+
+    def test_sync_trade_date_runs_normally_when_maintenance_mode_disabled(self) -> None:
+        """未开启维护窗口时行为不变，确认短路不会误伤正常路径。"""
+        os.environ["DATA_MAINTENANCE_MODE"] = "false"
+        Config.reset_instance()
+        self.addCleanup(Config.reset_instance)
+        self.addCleanup(os.environ.pop, "DATA_MAINTENANCE_MODE", None)
+
+        target_date = date(2026, 3, 13)
+        frames = {
+            code: pd.DataFrame(
+                [
+                    {
+                        "date": target_date,
+                        "open": 10.0,
+                        "high": 10.5,
+                        "low": 9.8,
+                        "close": 10.2,
+                        "volume": 1000,
+                        "amount": 10_200,
+                        "pct_chg": 1.0,
+                    }
+                ]
+            )
+            for code in ("600519", "000001")
+        }
+        service = MarketDataSyncService(
+            db_manager=self.db,
+            fetcher_manager=_StubDataFetcherManager(frames),
+        )
+
+        result = service.sync_trade_date(trade_date=target_date)
+
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(result["synced"], 2)
+
     def test_sync_trade_date_skips_codes_with_existing_target_date_when_not_force(self) -> None:
         target_date = date(2026, 3, 13)
         existing = pd.DataFrame(

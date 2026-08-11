@@ -1217,13 +1217,17 @@ class DatabaseManager:
             connect_args={"timeout": 30} if _is_sqlite else {},
         )
 
-        # SQLite: 启用外键约束 + 设置忙等超时
+        # SQLite: 启用外键约束 + 设置忙等超时 + 启用 WAL
         if _is_sqlite:
             @event.listens_for(self._engine, "connect")
             def _set_sqlite_pragma(dbapi_connection, connection_record):
                 cursor = dbapi_connection.cursor()
                 cursor.execute("PRAGMA foreign_keys=ON")
                 cursor.execute("PRAGMA busy_timeout=30000")
+                # WAL 让读写不互相阻塞。历史数据回补是数小时、数千次事务的长作业，
+                # 默认的 rollback journal 会让写锁阻塞全部读，与每日任务相撞即
+                # database is locked。
+                cursor.execute("PRAGMA journal_mode=WAL")
                 cursor.close()
 
         # 创建 Session 工厂

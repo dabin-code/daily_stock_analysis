@@ -11,6 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Added SQLite concurrency protection and long-running data-job safety rails:
+  connections opened through `DatabaseManager` now enable `PRAGMA
+  journal_mode=WAL` (alongside the existing `busy_timeout=30000`), so a
+  multi-hour write job no longer blocks every reader with the default rollback
+  journal. Added `scripts/backup_production_db.py`, a whole-database snapshot
+  via the SQLite backup API (consistent even under concurrent writes), written
+  to `./data/backups` by default. Added the `DATA_MAINTENANCE_MODE` switch
+  (default `false`): while enabled, the daily market-data sync
+  (`MarketDataSyncService.sync_trade_date`) and the K-line governance job
+  (`KlineGovernanceScheduleService.run_daily_governance`) short-circuit and log
+  a warning instead of running. Enter the window right before starting a
+  long-running historical backfill; exit it (set `DATA_MAINTENANCE_MODE=false`)
+  as soon as the backfill has produced its results — production data stops
+  updating for as long as the switch is on. Rollback: set
+  `DATA_MAINTENANCE_MODE=false`; WAL can be reverted with
+  `PRAGMA journal_mode=DELETE` on the database file.
 - Added the `TUSHARE_QFQ_ENABLED` hard switch (default `false`) guarding
   Tushare front-adjustment. The conversion previously fired unconditionally and
   only degraded to unadjusted prices because free accounts rate-limit
