@@ -5,7 +5,6 @@
 备份文件里必须有源库的全部数据，失败时必须不留下一个看起来正常的文件。
 """
 
-import os
 import sqlite3
 import tempfile
 import unittest

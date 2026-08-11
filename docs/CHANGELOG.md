@@ -49,16 +49,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
       heaviest writer), `analysis`, and `board_sync`;
     - scheduled `kline_deep_audit`, which additionally **always fails** during
       the window: it requires a passed daily-audit record, and maintenance mode
-      prevents that record from ever being written. The scheduler catches the
-      failure, so the only symptom is one ERROR log per day;
+      prevents that record from ever being written;
     - all web data-health operations, including `backfill_to_date`;
     - `scripts/_kline_window_sync.py` and `scripts/_kline_targeted_repair.py`,
       which no-op and report `0 synced` — easy to misread as "nothing to do".
 
     Scheduled `screening` fails during the window with an error that names
     `DATA_MAINTENANCE_MODE` as the cause, so it is not mistaken for a data-source
-    outage. Gap repair recognises the maintenance skip and does not spend a
+    outage — and that failure takes the scheduling process down with it, see the
+    next caveat. Gap repair recognises the maintenance skip and does not spend a
     retry attempt on a run that made no network calls.
+  - **A failing scheduled job terminates the scheduling process.** The failure
+    propagates instead of being contained: `Scheduler._safe_run_named_task` logs
+    the ERROR and then re-raises, `Scheduler.run()` does not guard its
+    `run_pending()` call (and neither does the `schedule` library), so the
+    exception reaches `main()`, which logs it and returns exit code 1. Under
+    `--serve --schedule` the API server runs in a daemon thread and dies with the
+    process. Inside the maintenance window this applies to scheduled `screening`
+    — the job that will realistically fire first, default 07:00 — as well as to
+    scheduled `kline_deep_audit`. Disable the scheduled jobs
+    (`SCREENING_SCHEDULE_ENABLED`, `KLINE_DEEP_AUDIT_SCHEDULE_ENABLED`,
+    `SCHEDULE_ENABLED`, `BOARD_SYNC_SCHEDULE_ENABLED`,
+    `KLINE_GOVERNANCE_ENABLED`) **before** enabling `DATA_MAINTENANCE_MODE`, or
+    accept that the scheduling process will exit and rely on whatever supervises
+    it to restart it.
 
   Rollback: revert this commit. Setting `DATA_MAINTENANCE_MODE=false` (plus a
   process restart) is enough to leave the maintenance window, but it does not
