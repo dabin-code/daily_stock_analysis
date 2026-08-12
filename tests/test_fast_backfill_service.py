@@ -7,7 +7,16 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+from src.config import Config
 from src.services.fast_backfill_service import FastBackfillService
+
+
+@pytest.fixture
+def reset_config():
+    """改环境变量前后都要清单例，否则配置会串到别的用例。"""
+    Config.reset_instance()
+    yield
+    Config.reset_instance()
 
 
 def _init_stock_daily(db_path: Path) -> None:
@@ -82,6 +91,47 @@ def _init_staging(db_path: Path) -> None:
         )
         conn.execute(
             "CREATE INDEX ix_staging_date_version ON stock_daily_staging (date, convention_version)"
+        )
+
+
+def _init_calendar(db_path: Path, days: dict) -> None:
+    """建 trading_calendar 并灌入指定的开/休市日。
+
+    刻意只灌测试要的日子：若服务读的是生产库日历（已覆盖 2018-2026），
+    取到的交易日会与这里不同，用例就会因为「读错了库」而失败。
+    """
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE trading_calendar ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, market TEXT NOT NULL, "
+            "trade_date TEXT NOT NULL, is_open INTEGER NOT NULL, "
+            "source TEXT, cross_check TEXT, "
+            "created_at TIMESTAMP, updated_at TIMESTAMP, "
+            "UNIQUE(market, trade_date))"
+        )
+        conn.executemany(
+            "INSERT INTO trading_calendar (market, trade_date, is_open, source) "
+            "VALUES ('cn', ?, ?, 'test')",
+            [(day.isoformat(), 1 if is_open else 0) for day, is_open in days.items()],
+        )
+
+
+def _seed_staging(db_path: Path, trade_date: date, codes: int, convention_version: str) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO stock_daily_staging (code, date, convention_version) VALUES (?, ?, ?)",
+            [
+                (f"{index:06d}", trade_date.isoformat(), convention_version)
+                for index in range(codes)
+            ],
+        )
+
+
+def _seed_production(db_path: Path, trade_date: date, codes: int) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO stock_daily (code, date) VALUES (?, ?)",
+            [(f"{index:06d}", trade_date.isoformat()) for index in range(codes)],
         )
 
 
@@ -407,3 +457,135 @@ def test_save_day_data_rejects_unknown_target_table(tmp_path):
 
     with pytest.raises(ValueError):
         svc._save_day_data(_tushare_fixture_df(), target_table="stock_daily; DROP TABLE stock_daily")
+
+
+def test_staging_date_with_old_convention_is_not_complete(tmp_path):
+    """已有数据但口径版本不匹配时，必须重取而不是跳过。
+
+    这是阶段 C 能否真正拿到 pre_close 的关键：561 天存量的股票数都超过
+    阈值，纯计数判定会把它们全部跳过。
+    """
+    db_path = tmp_path / "backfill.db"
+    _init_staging(db_path)
+    _seed_staging(db_path, date(2026, 5, 8), codes=4000, convention_version="v0_legacy")
+
+    svc = _make_service(db_path)
+
+    assert svc._is_date_complete(date(2026, 5, 8), target_table="stock_daily_staging") is False
+
+
+def test_staging_date_with_current_convention_is_complete(tmp_path):
+    db_path = tmp_path / "backfill.db"
+    _init_staging(db_path)
+    svc = _make_service(db_path)
+    _seed_staging(db_path, date(2026, 5, 8), codes=4000,
+                  convention_version=svc._convention_version)
+
+    assert svc._is_date_complete(date(2026, 5, 8), target_table="stock_daily_staging") is True
+
+
+def test_production_completeness_check_is_unchanged(tmp_path):
+    """既有生产入口的完成判定行为必须原样保留。"""
+    db_path = tmp_path / "backfill.db"
+    _init_stock_daily(db_path)
+    _seed_production(db_path, date(2026, 5, 8), codes=4000)
+
+    svc = _make_service(db_path)
+
+    assert svc._is_date_complete(date(2026, 5, 8)) is True
+
+
+def test_backfill_range_writes_staging_using_trading_calendar(tmp_path):
+    """区间回补按落库日历逐日写 staging，且不碰生产表。
+
+    日历必须来自 trading_calendar，用 SELECT DISTINCT date FROM stock_daily
+    反推的话，2018-2023 这段生产表没有数据，会得到空集。
+    """
+    db_path = tmp_path / "backfill.db"
+    _init_stock_daily(db_path)
+    _init_staging(db_path)
+    # 2019-01-04 真实是交易日，这里刻意标成休市：读到生产日历就会多请求一天
+    _init_calendar(db_path, {
+        date(2019, 1, 2): True,
+        date(2019, 1, 3): True,
+        date(2019, 1, 4): False,
+        date(2019, 1, 5): False,
+    })
+    before = _row_hash(db_path, "stock_daily")
+
+    api = _FakeTushareApi()
+    svc = _make_service(db_path, tushare_api=api)
+    result = svc.backfill_range(date(2019, 1, 1), date(2019, 1, 6), batch_id="batch-2019")
+
+    assert api.requested_dates == ["20190102", "20190103"]
+    assert result["status"] == "completed"
+    assert result["saved_rows"] == 4
+    assert result["backfilled_dates"] == ["2019-01-02", "2019-01-03"]
+    assert _row_hash(db_path, "stock_daily") == before, "production table was modified"
+    assert _query(
+        db_path,
+        "SELECT DISTINCT batch_id, convention_version FROM stock_daily_staging",
+    ) == [("batch-2019", svc._convention_version)]
+
+
+def test_backfill_range_skips_dates_already_written_with_current_convention(tmp_path):
+    """断点续跑：当前口径已写过的日子不重复消耗额度。"""
+    db_path = tmp_path / "backfill.db"
+    _init_staging(db_path)
+    _init_calendar(db_path, {date(2019, 1, 2): True, date(2019, 1, 3): True})
+    api = _FakeTushareApi()
+    svc = _make_service(db_path, tushare_api=api)
+    _seed_staging(db_path, date(2019, 1, 2), codes=3,
+                  convention_version=svc._convention_version)
+
+    result = svc.backfill_range(date(2019, 1, 1), date(2019, 1, 6), batch_id="batch-2019")
+
+    assert api.requested_dates == ["20190103"]
+    assert result["skipped_dates"] == ["2019-01-02"]
+
+
+def test_backfill_range_rejects_unknown_target_table(tmp_path):
+    db_path = tmp_path / "backfill.db"
+    _init_staging(db_path)
+    svc = _make_service(db_path)
+
+    with pytest.raises(ValueError):
+        svc.backfill_range(
+            date(2019, 1, 1),
+            date(2019, 1, 6),
+            batch_id="batch-2019",
+            target_table="stock_daily_tmp",
+        )
+
+
+def test_backfill_sleep_interval_follows_configured_rate_limit(tmp_path, monkeypatch, reset_config):
+    """限速必须来自配置：免费档 45 次/分，高积分账号可以提到 500。"""
+    monkeypatch.setenv("BACKFILL_RATE_LIMIT_PER_MIN", "120")
+    Config.reset_instance()
+
+    db_path = tmp_path / "backfill.db"
+    _init_staging(db_path)
+    _init_calendar(db_path, {date(2019, 1, 2): True})
+    slept: list[float] = []
+    svc = _make_service(db_path, sleep=slept.append)
+
+    svc.backfill_range(date(2019, 1, 1), date(2019, 1, 6), batch_id="batch-2019")
+
+    assert svc._rate_limit_per_min == 120
+    assert slept == [pytest.approx(0.5)]
+
+
+def test_backfill_connections_use_long_busy_timeout(tmp_path):
+    """回补是最可能撞锁的一条路径，忙等超时必须对齐 DatabaseManager 的 30 秒。
+
+    sqlite3 默认只等 5 秒，而 busy_timeout 是连接级设置，
+    不像 WAL 那样能从 DatabaseManager 的连接继承过来。
+    """
+    db_path = tmp_path / "backfill.db"
+    _init_stock_daily(db_path)
+    svc = _make_service(db_path)
+
+    with svc._connect() as conn:
+        busy_timeout_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+
+    assert busy_timeout_ms >= 30000

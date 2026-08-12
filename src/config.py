@@ -729,6 +729,8 @@ class Config:
     # 落库口径版本。变更单位换算、新增必填列时必须递增，
     # 否则续跑逻辑会把旧口径数据误判为已完成而跳过。
     data_convention_version: str = "v1_unadjusted_shares_yuan"
+    # 回补限速（次/分钟）。免费档 45，5000 积分档可提到 500。
+    backfill_rate_limit_per_min: int = 45
     # Discord 机器人状态
     discord_bot_status: str = "A股智能分析 | /help"
 
@@ -1466,6 +1468,7 @@ class Config:
             ),
             data_maintenance_mode=parse_env_bool(os.getenv('DATA_MAINTENANCE_MODE'), default=False),
             data_convention_version=os.getenv('DATA_CONVENTION_VERSION', 'v1_unadjusted_shares_yuan'),
+            backfill_rate_limit_per_min=max(1, int(os.getenv('BACKFILL_RATE_LIMIT_PER_MIN', '45'))),
         )
     
     @classmethod

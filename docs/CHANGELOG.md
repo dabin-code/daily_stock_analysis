@@ -224,6 +224,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ListingLifecycleService().sync_from_baostock()` is run once. Nothing reads
   the column or the service yet. Rollback: revert these commits; the extra
   column and index are harmless if left in place.
+- Added `FastBackfillService.backfill_range(date_from, date_to, batch_id)`, a
+  backward range entry point that writes to `stock_daily_staging`, plus the two
+  config options it needs: `DATA_CONVENTION_VERSION` (default
+  `v1_unadjusted_shares_yuan`) and `BACKFILL_RATE_LIMIT_PER_MIN` (default `45`,
+  the Tushare free tier; a 5000-credit account can raise it to `500`).
+  `_save_day_data` now takes a `target_table` (validated against
+  `stock_daily` / `stock_daily_staging`) and a `batch_id`. **The default stays
+  `stock_daily`**, so the two live production callers of
+  `backfill_to_trade_date` — `POST /api/v1/screening/backfill-to-date` and the
+  data-health `backfill_to_date` action — keep writing to production exactly as
+  before; repointing them at staging would have left them reporting
+  `saved_rows > 0` while production gained nothing. Rows are now written with
+  `executemany` rather than one `execute` per row, which takes a backfill to
+  2018 (~11.6M rows) from tens of minutes to under ten.
+  `_is_date_complete` gained the same `target_table` parameter, and for staging
+  it additionally requires `convention_version` to match the current one. A pure
+  `COUNT(DISTINCT code)` check is useless there: 560 of the 561 dates already
+  stored carry more than 4000 codes, so every one of them would be judged
+  complete and skipped, and the backfill would run to completion having written
+  nothing. Production keeps the count-only check — it has no
+  `convention_version` column. The range entry point takes its trading days from
+  `TradingCalendarService` rather than `SELECT DISTINCT date FROM stock_daily`,
+  which infers the calendar from the bars themselves and yields an empty set for
+  2018-2023, and passes its own `db_path` through so both services read one file.
+  Nothing calls `backfill_range` automatically; it is opt-in from a script or a
+  REPL. Rollback: revert these commits; both new config options are inert when
+  unset.
+
+### Fixed
+
+- Fixed the busy-timeout gap on the two services that talk to SQLite through
+  raw `sqlite3` instead of `DatabaseManager`: `FastBackfillService` and
+  `TradingCalendarService` now open every connection with `timeout=30`, matching
+  the `busy_timeout=30000` configured for `DatabaseManager`, and each service
+  routes all of its connections through a single helper so the next one added
+  cannot miss it. WAL is a persistent file-level setting and was already
+  inherited by these paths, but `busy_timeout` is per-connection and was not, so
+  they were running on Python's 5-second default. This is the path most exposed
+  to lock contention: a multi-hour backfill runs entirely through it while the
+  maintenance window still leaves other writers active.
 
 ### Changed
 

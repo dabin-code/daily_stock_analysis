@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
@@ -12,11 +13,15 @@ from data_provider.base import lots_to_shares, thousand_yuan_to_yuan
 from src.config import get_config
 from src.core.trading_calendar import is_market_open
 from src.services.kline_governance_schedule_service import KlineGovernanceScheduleService
+from src.services.trading_calendar_service import TradingCalendarService
 
 logger = logging.getLogger(__name__)
 
 # 回补允许写入的表。生产表是既有入口的默认目标，staging 供阶段 C 显式选用。
 _ALLOWED_TARGET_TABLES = ("stock_daily", "stock_daily_staging")
+
+# 与 DatabaseManager 的忙等超时对齐（秒）
+_SQLITE_TIMEOUT_SECONDS = 30
 
 
 class FastBackfillService:
@@ -38,6 +43,23 @@ class FastBackfillService:
         self.min_full_count = max(1, int(min_full_count))
         self.sleep = sleep
         self._convention_version = self.config.data_convention_version
+        self._rate_limit_per_min = max(1, int(self.config.backfill_rate_limit_per_min))
+
+    @contextmanager
+    def _connect(self):
+        """连接获取的唯一入口，所有读写方法都必须走这里。
+
+        本服务拿不到 DatabaseManager 的连接配置：WAL 是文件级持久设置能自动继承，
+        busy_timeout 是连接级的，不显式传就只有 sqlite3 默认的 5 秒。
+        数小时的回补全程走这条路径，而其他写入方仍在活动，因此对齐成 30 秒。
+        逐处传参下次加连接必然又漏，所以统一收在这里。
+        """
+        conn = sqlite3.connect(self.db_path, timeout=_SQLITE_TIMEOUT_SECONDS)
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
 
     def backfill_to_trade_date(self, target_trade_date: date, market: str = "cn") -> Dict[str, Any]:
         if target_trade_date > date.today():
@@ -72,28 +94,7 @@ class FastBackfillService:
                 "governance_result": governance_result,
             }
 
-        api = self._get_tushare_api()
-        saved_rows = 0
-        failed_dates: List[str] = []
-        call_count = 0
-        minute_started_at = time.time()
-
-        for current_date in target_dates:
-            if call_count >= 45:
-                elapsed_in_minute = time.time() - minute_started_at
-                if elapsed_in_minute < 65:
-                    self.sleep(65 - elapsed_in_minute)
-                call_count = 0
-                minute_started_at = time.time()
-
-            trade_date_yyyymmdd = current_date.strftime("%Y%m%d")
-            day_df = self._fetch_daily_all(api, trade_date_yyyymmdd)
-            call_count += 1
-            if day_df.empty:
-                failed_dates.append(current_date.isoformat())
-                continue
-            saved_rows += self._save_day_data(day_df)
-            self.sleep(1.3)
+        saved_rows, failed_dates = self._fetch_and_save_dates(target_dates)
 
         governance_result = self._run_target_governance(target_trade_date, market)
         return {
@@ -106,8 +107,94 @@ class FastBackfillService:
             "governance_result": governance_result,
         }
 
+    def backfill_range(
+        self,
+        date_from: date,
+        date_to: date,
+        batch_id: str,
+        target_table: str = "stock_daily_staging",
+    ) -> Dict[str, Any]:
+        """按交易日历逐日回补到 staging。
+
+        与既有 backfill_to_trade_date 的两点差异：
+        1. 起点由调用方指定，而非「最近完整日 + 1」，因此能补 2018-2023
+           这段生产表从未覆盖的区间；
+        2. 默认写 staging，不碰生产表。
+        """
+        if target_table not in _ALLOWED_TARGET_TABLES:
+            raise ValueError(f"不支持的回补写入目标表: {target_table}")
+        if date_from > date_to:
+            raise ValueError("date_from 不能晚于 date_to")
+
+        # 日历取自 trading_calendar，而不是 SELECT DISTINCT date FROM stock_daily：
+        # 后者是用行情反推日历，2018-2023 生产表无数据时会得到空集。
+        # db_path 显式透传，保证与本服务读写同一个库文件。
+        calendar = TradingCalendarService(db_path=self.db_path)
+        trading_days = calendar.get_trading_days(date_from, date_to, market="cn")
+
+        pending: List[date] = []
+        skipped_dates: List[str] = []
+        for current_date in trading_days:
+            if self._is_date_complete(current_date, target_table=target_table):
+                skipped_dates.append(current_date.isoformat())
+                continue
+            pending.append(current_date)
+
+        saved_rows, failed_dates = self._fetch_and_save_dates(
+            pending,
+            target_table=target_table,
+            batch_id=batch_id,
+        )
+        return {
+            "status": "completed" if not failed_dates else "completed_with_errors",
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "batch_id": batch_id,
+            "target_table": target_table,
+            "backfilled_dates": [item.isoformat() for item in pending],
+            "skipped_dates": skipped_dates,
+            "saved_rows": saved_rows,
+            "failed_dates": failed_dates,
+        }
+
+    def _fetch_and_save_dates(
+        self,
+        target_dates: List[date],
+        target_table: str = "stock_daily",
+        batch_id: Optional[str] = None,
+    ) -> tuple[int, List[str]]:
+        """逐日抓取并落库，限速逻辑只此一份，避免两个入口各限各的。"""
+        if not target_dates:
+            return 0, []
+
+        api = self._get_tushare_api()
+        saved_rows = 0
+        failed_dates: List[str] = []
+        call_count = 0
+        minute_started_at = time.time()
+        sleep_seconds = 60.0 / max(1, self._rate_limit_per_min)
+
+        for current_date in target_dates:
+            if call_count >= self._rate_limit_per_min:
+                elapsed_in_minute = time.time() - minute_started_at
+                if elapsed_in_minute < 65:
+                    self.sleep(65 - elapsed_in_minute)
+                call_count = 0
+                minute_started_at = time.time()
+
+            trade_date_yyyymmdd = current_date.strftime("%Y%m%d")
+            day_df = self._fetch_daily_all(api, trade_date_yyyymmdd)
+            call_count += 1
+            if day_df.empty:
+                failed_dates.append(current_date.isoformat())
+                continue
+            saved_rows += self._save_day_data(day_df, target_table=target_table, batch_id=batch_id)
+            self.sleep(sleep_seconds)
+
+        return saved_rows, failed_dates
+
     def _get_latest_complete_date(self) -> Optional[date]:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             row = conn.execute(
                 """
                 SELECT date
@@ -134,12 +221,30 @@ class FastBackfillService:
             current_date += timedelta(days=1)
         return dates
 
-    def _is_date_complete(self, trade_date: date) -> bool:
-        with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute(
-                "SELECT COUNT(DISTINCT code) FROM stock_daily WHERE date=?",
-                (trade_date.isoformat(),),
-            ).fetchone()
+    def _is_date_complete(self, trade_date: date, target_table: str = "stock_daily") -> bool:
+        """该日是否已按**当前口径版本**写入。
+
+        对 staging 而言纯行数判定不够：存量数据行数达标但缺 pre_close，
+        会让回补整段空转（现有 561 天中 560 天都会被误判为已完成）。
+        生产表没有 convention_version 列，沿用原有的纯计数判定。
+        入参保持 date 对象：两个既有调用方传的都是 date，改成 str 会依赖
+        Python 3.12 已废弃的 sqlite3 date 适配器。
+        """
+        if target_table not in _ALLOWED_TARGET_TABLES:
+            raise ValueError(f"不支持的回补写入目标表: {target_table}")
+        date_str = trade_date.isoformat()
+        with self._connect() as conn:
+            if target_table == "stock_daily_staging":
+                row = conn.execute(
+                    "SELECT COUNT(DISTINCT code) FROM stock_daily_staging "
+                    "WHERE date=? AND convention_version=?",
+                    (date_str, self._convention_version),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(DISTINCT code) FROM stock_daily WHERE date=?",
+                    (date_str,),
+                ).fetchone()
         return int(row[0] if row else 0) >= self.min_full_count
 
     def _get_tushare_api(self) -> Any:
@@ -206,7 +311,7 @@ class FastBackfillService:
 
         # 逐行 execute 补到 2018 约 1160 万行需 40 分钟至 1.6 小时，批量写可降到十分钟内
         payload = [self._build_row(row, is_staging, batch_id, now) for _, row in day_df.iterrows()]
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.executemany(
                 f"INSERT OR REPLACE INTO {target_table} ({columns}) VALUES ({placeholders})",
                 payload,

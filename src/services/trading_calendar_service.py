@@ -10,6 +10,9 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
+# 与 DatabaseManager 的忙等超时对齐（秒）
+_SQLITE_TIMEOUT_SECONDS = 30
+
 
 class CalendarNotCoveredError(RuntimeError):
     """查询的日期不在已落库的日历覆盖范围内。
@@ -36,8 +39,13 @@ class TradingCalendarService:
 
     @contextmanager
     def _connect(self):
-        """连接获取的唯一入口，所有读写方法都必须走这里。"""
-        conn = sqlite3.connect(self._db_path)
+        """连接获取的唯一入口，所有读写方法都必须走这里。
+
+        显式传 timeout：WAL 是文件级持久设置能自动继承，busy_timeout 是连接级的，
+        不传就只有 sqlite3 默认的 5 秒，而 DatabaseManager 配的是 30 秒。
+        本服务在数小时的历史回补期间与其他写入方并发，最容易撞锁。
+        """
+        conn = sqlite3.connect(self._db_path, timeout=_SQLITE_TIMEOUT_SECONDS)
         try:
             yield conn
             conn.commit()

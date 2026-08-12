@@ -134,6 +134,22 @@ class TradingCalendarServiceTestCase(unittest.TestCase):
         with self.assertRaises(CalendarNotCoveredError):
             svc.is_trading_day(date(2019, 3, 1))
 
+    def test_connections_use_long_busy_timeout(self) -> None:
+        """忙等超时必须对齐 DatabaseManager 的 30 秒。
+
+        本服务与 FastBackfillService 共用同一个库文件，回补期间还有别的写入方
+        在活动。WAL 是文件级持久设置能自动继承，busy_timeout 是连接级的，
+        不显式传就只有 sqlite3 默认的 5 秒。
+        """
+        from src.services.trading_calendar_service import TradingCalendarService
+
+        svc = TradingCalendarService(db_path=self._db_path)
+
+        with svc._connect() as conn:
+            busy_timeout_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+
+        self.assertGreaterEqual(busy_timeout_ms, 30000)
+
     def test_get_trading_days_range_is_sorted_and_open_only(self) -> None:
         from src.services.trading_calendar_service import TradingCalendarService
 
