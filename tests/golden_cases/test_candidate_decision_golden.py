@@ -156,7 +156,8 @@ class CandidateDecisionGoldenCase(unittest.TestCase):
                     "ma100_breakout_days": 2,
                     "leader_score": 85.0,
                     "extreme_strength_score": 62.0,
-                    "has_stop_loss": True,
+                    # 真实止损来源字段：trend_breakout 由 risk_params 兜底解析
+                    "risk_params": {"stop_loss": 88.0},
                     "is_limit_up": is_limit_up,
                 },
                 matched_strategies=["ma100_60min_combined"],

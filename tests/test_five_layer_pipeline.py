@@ -42,7 +42,8 @@ def _make_candidate(
         "pct_chg": 5.0,
         "leader_score": 75.0,
         "extreme_strength_score": 85.0,
-        "has_stop_loss": True,
+        # 真实止损来源字段，交由 resolve_setup_stop_loss 解析
+        "risk_params": {"stop_loss": 88.0},
         "ma100_breakout_days": 3,
     }
     return ScreeningCandidateRecord(
@@ -452,7 +453,8 @@ class Phase2BDispatchTestCase(unittest.TestCase):
             code="600519", name="贵州茅台", rank=1, rule_score=80.0,
             rule_hits=["hit"],
             factor_snapshot={"pct_chg": 5.0, "leader_score": 75.0,
-                             "extreme_strength_score": 85.0, "has_stop_loss": True},
+                             "extreme_strength_score": 85.0,
+                             "risk_params": {"stop_loss": 88.0}},
             matched_strategies=["gap_limitup_breakout", "bottom_volume"],
             strategy_scores={"gap_limitup_breakout": 60.0, "bottom_volume": 40.0},
             setup_type="gap_breakout",
@@ -485,7 +487,8 @@ class Phase2BDispatchTestCase(unittest.TestCase):
             code="600519", name="贵州茅台", rank=1, rule_score=80.0,
             rule_hits=["hit"],
             factor_snapshot={"pct_chg": 5.0, "leader_score": 75.0,
-                             "extreme_strength_score": 85.0, "has_stop_loss": True,
+                             "extreme_strength_score": 85.0,
+                             "risk_params": {"stop_loss": 88.0},
                              "ma100_breakout_days": 3},
             matched_strategies=[
                 "ma100_60min_combined",
@@ -524,7 +527,8 @@ class Phase2BDispatchTestCase(unittest.TestCase):
             code="600519", name="贵州茅台", rank=1, rule_score=80.0,
             rule_hits=["hit"],
             factor_snapshot={"pct_chg": 5.0, "leader_score": 75.0,
-                             "extreme_strength_score": 85.0, "has_stop_loss": True,
+                             "extreme_strength_score": 85.0,
+                             "risk_params": {"stop_loss": 88.0},
                              "ma100_breakout_days": 3},
             matched_strategies=[
                 "ma100_60min_combined",
@@ -571,7 +575,7 @@ class Phase2BDispatchTestCase(unittest.TestCase):
                 "pct_chg": 4.2,
                 "leader_score": 78.0,
                 "extreme_strength_score": 68.0,
-                "has_stop_loss": True,
+                "risk_params": {"stop_loss": 108.0},
                 "ma100_breakout_days": 2,
             },
             matched_strategies=[
@@ -614,7 +618,7 @@ class Phase2BDispatchTestCase(unittest.TestCase):
                 "pct_chg": 4.2,
                 "leader_score": 78.0,
                 "extreme_strength_score": 68.0,
-                "has_stop_loss": True,
+                "risk_params": {"stop_loss": 108.0},
                 "ma100_breakout_days": 2,
             },
             matched_strategies=[
@@ -718,7 +722,8 @@ class Phase3ATradePlanTestCase(unittest.TestCase):
             code="600519", name="贵州茅台", rank=1, rule_score=80.0,
             rule_hits=["hit"],
             factor_snapshot={"pct_chg": 5.0, "leader_score": 30.0,
-                             "extreme_strength_score": 40.0, "has_stop_loss": True,
+                             "extreme_strength_score": 40.0,
+                             "risk_params": {"stop_loss": 88.0},
                              "ma100_breakout_days": 3},
             matched_strategies=["ma100_60min_combined"],
             strategy_scores={"ma100_60min_combined": 50.0},
@@ -743,6 +748,45 @@ class Phase3ATradePlanTestCase(unittest.TestCase):
         self.assertIsNone(plan["add_rule"])  # probe_entry 无加仓
         self.assertIsNotNone(plan["invalidation_rule"])
 
+    def test_non_v2_setup_with_real_stop_reaches_probe_entry(self) -> None:
+        """反例防线：不写 has_stop_loss 键，只给真实止损字段，
+        非 v2 的 setup 也必须能走到 probe_entry 并产出交易计划。
+
+        修复前这条必然失败——正是它对应线上 652 条候选 0 计划的实测。
+        """
+        svc = self._make_service()
+        factor_snapshot = {
+            "pct_chg": 5.0,
+            "close": 100.0,
+            "leader_score": 30.0,
+            "extreme_strength_score": 40.0,
+            "ma100_breakout_days": 3,
+            "risk_params": {"stop_loss": 88.0},
+        }
+        self.assertNotIn("has_stop_loss", factor_snapshot)
+
+        candidate = ScreeningCandidateRecord(
+            code="600519", name="贵州茅台", rank=1, rule_score=80.0,
+            rule_hits=["hit"],
+            factor_snapshot=factor_snapshot,
+            matched_strategies=["ma100_60min_combined"],
+            strategy_scores={"ma100_60min_combined": 50.0},
+            setup_type="trend_breakout",
+        )
+
+        guard = MarketGuardResult(is_safe=True, index_price=3200.0, index_ma100=3100.0)
+        svc._apply_five_layer_decision(
+            selected=[candidate],
+            snapshot_df=self._make_snapshot_df(),
+            effective_trade_date=date(2026, 3, 31),
+            guard_result=guard,
+        )
+
+        self.assertEqual(candidate.trade_stage, "probe_entry")
+        self.assertIsNotNone(candidate.trade_plan_json)
+        plan = json.loads(candidate.trade_plan_json)
+        self.assertEqual(plan["stop_loss_price"], 88.0)
+
     def test_watch_has_no_trade_plan(self):
         """watch 候选 trade_plan_json 为 None。"""
         svc = self._make_service()
@@ -751,7 +795,7 @@ class Phase3ATradePlanTestCase(unittest.TestCase):
             code="600519", name="贵州茅台", rank=1, rule_score=30.0,
             rule_hits=[],
             factor_snapshot={"pct_chg": 1.0, "leader_score": 10.0,
-                             "extreme_strength_score": 10.0, "has_stop_loss": False},
+                             "extreme_strength_score": 10.0},
             matched_strategies=[],
             strategy_scores={},
             setup_type=None,
@@ -847,10 +891,10 @@ class BottomDivergenceV2RealPipelineTestCase(unittest.TestCase):
         direct_stop: object = 8.8,
         layered_points: list | None = None,
         setup_type: str = "bottom_divergence_layered_entry",
-        has_stop_loss: bool = False,
         leader_score: float = 55.0,
         is_limit_up: bool = False,
         actionability_status: str | None = None,
+        v1_divergence_state: str | None = None,
     ) -> ScreeningCandidateRecord:
         if layered_points is None:
             layered_points = [
@@ -879,7 +923,8 @@ class BottomDivergenceV2RealPipelineTestCase(unittest.TestCase):
             "leader_score": leader_score,
             "extreme_strength_score": 65.0,
             "is_limit_up": is_limit_up,
-            "has_stop_loss": has_stop_loss,
+            # v1 成熟度字段：默认缺失（LOW），仅在需要越过成熟度闸门时给值
+            "bottom_divergence_state": v1_divergence_state,
             "bottom_divergence_v2_stage": stage,
             "bottom_divergence_v2_actionability_status": (
                 actionability_status
@@ -1234,15 +1279,21 @@ class BottomDivergenceV2RealPipelineTestCase(unittest.TestCase):
                 )
                 self.assertEqual(candidate.trade_stage, TradeStage.FOCUS.value)
 
-    def test_v1_still_uses_only_legacy_has_stop_loss(self) -> None:
+    def test_v1_setup_cannot_borrow_v2_stop_and_stays_focus(self) -> None:
+        """v1 setup 不认 v2 的止损字段：解析不出自己的止损就停在 focus。
+
+        成熟度给到 confirmed(HIGH)，把闸门单独留给止损解析——否则
+        成熟度先把候选压在 focus，止损那一步根本没被测到。
+        """
         candidate = self._run(
             stage="early",
             setup_type="bottom_divergence_breakout",
-            has_stop_loss=False,
             direct_stop=8.8,
+            v1_divergence_state="confirmed",
         )
 
         self.assertEqual(candidate.trade_stage, TradeStage.FOCUS.value)
+        self.assertIsNone(candidate.trade_plan_json)
 
 
 if __name__ == "__main__":

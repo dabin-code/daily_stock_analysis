@@ -34,9 +34,9 @@ from src.services._debug_session_logger import write_debug_log
 from src.services.bottom_divergence_v2_trade_support import (
     is_v2_execution_allowed,
     resolve_current_stage_buy_point,
-    resolve_current_stage_stop_loss,
 )
 from src.services.screener_service import ScreeningCandidateRecord, ScreenerService
+from src.services.setup_stop_loss import resolve_setup_stop_loss
 
 logger = logging.getLogger(__name__)
 
@@ -560,14 +560,18 @@ class FiveLayerPipeline:
                 if st == SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY
                 else True
             )
+            # 止损锚点与 TradePlanBuilder 共用同一解析实现：解析不出止损
+            # 才把候选压在 focus。曾经这里读的 has_stop_loss 键从未被写入，
+            # 于是所有非 v2 setup 恒为 False，交易计划恒为空。
+            resolved_stop = resolve_setup_stop_loss(st, fs)
             has_stop = (
                 (
                     v2_execution_allowed
                     and resolve_current_stage_buy_point(fs) is not None
-                    and resolve_current_stage_stop_loss(fs) is not None
+                    and resolved_stop is not None
                 )
                 if st == SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY
-                else bool(fs.get("has_stop_loss", False))
+                else resolved_stop is not None
             )
             trade_stage = stage_judge.judge(
                 env=market_env,
