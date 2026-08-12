@@ -108,6 +108,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added Web cards and backtest labels for v2 stages/resistance ranges, plus
   production AI-review evidence and hard guards for provenance, stale,
   invalidated, extended, and incomplete execution states.
+- Added the `pre_close` and `adj_convention` columns to `stock_daily`.
+  `pre_close` is the previous close price, which Tushare's `daily()` endpoint
+  provides natively and which is the only free basis for reconstructing
+  adjustment factors (`ratio = pre_close(t) / close(prev_observation)`); every
+  write path previously discarded it, leaving the incremental segment unable to
+  reconstruct its own factors. `adj_convention` records the price convention of
+  each individual row (`raw` / `qfq` / `unknown`) because the sources disagree —
+  Tushare returns unadjusted prices while Efinance appears to return
+  front-adjusted ones — so an unlabelled mix produces wrong results exactly at
+  the source boundary. Both columns are nullable and additive; existing clients
+  are unaffected, and nothing populates the columns yet.
+  **Operators must run the migration** on databases that are not recreated from
+  scratch: `python scripts/migrate_stock_daily_pre_close.py --db <path>`
+  (idempotent, supports `--dry-run`). The same migration also runs inline at
+  startup for SQLite. It adds the two columns plus an index on
+  `adj_convention`, and deliberately performs **no backfill** — `pre_close` has
+  no defensible default and legacy rows' convention cannot be determined after
+  the fact, so existing rows stay NULL and are filled by a later re-fetch
+  stage. Note that on a large database the index build rewrites the file and
+  grows it; measure on a copy first. Rollback: revert this commit; the two
+  columns may be left in place, since nothing reads or writes them yet.
 
 ### Changed
 

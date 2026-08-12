@@ -552,6 +552,25 @@ docker exec stock-analyzer python /app/backup_production_db.py --db /app/data/st
 
 > 备份产物和源库在同一磁盘上时不抗硬件故障，重要节点请再往仓库外冷备一份。
 
+### 4.7 `migrate_stock_daily_pre_close.py`
+
+**作用**：`stock_daily` 加 `pre_close`（前收盘价）/ `adj_convention`（该行价格的复权口径：`raw` / `qfq` / `unknown`）两列 + `adj_convention` 索引。`pre_close` 是免费重建复权因子的唯一依据（`ratio = pre_close(t) / close(prev_observation)`）；`adj_convention` 用于标注逐行口径，因为各数据源口径不一致（Tushare 不复权、Efinance 疑似前复权），混存会让复权重建在数据源边界上出错。
+
+**不回填**（有意为之，不要「顺手」补上）：`pre_close` 没有可辩护的默认值，写任何值都是在编造数据，且它直接喂给复权因子重建；存量行的 `adj_convention` 也无法事后判定。存量行保持 NULL，由后续重新抓取的阶段填充。
+
+> 生产库上建索引会重写库文件并使其变大（实测 297 万行、1.23 GiB 的库副本上耗时数秒、文件增长约 26 MB，含 WAL 归并）。先在副本上跑一遍再决定何时对生产库执行。
+
+```powershell
+# 本地
+python scripts/migrate_stock_daily_pre_close.py
+python scripts/migrate_stock_daily_pre_close.py --dry-run
+python scripts/migrate_stock_daily_pre_close.py --db .\data\stock_analysis.db
+
+# docker
+docker cp .\scripts\migrate_stock_daily_pre_close.py stock-analyzer:/app/migrate_stock_daily_pre_close.py
+docker exec stock-analyzer python /app/migrate_stock_daily_pre_close.py --db /app/data/stock_analysis.db
+```
+
 ---
 
 ## 5. 历史回测 / 抽样

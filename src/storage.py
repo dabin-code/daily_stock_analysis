@@ -123,6 +123,16 @@ class StockDaily(Base):
     adj_anchor_date = Column(Date, nullable=True)
     adj_factor_source = Column(String(32), nullable=True, index=True)
 
+    # 前收盘价。Tushare daily() 原生提供，是免费重建复权因子的唯一依据
+    # （ratio = pre_close(t) / close(prev_observation)）。历史上三条写入路径
+    # 全部丢弃了该字段，导致增量段无法自持。
+    pre_close = Column(Float, nullable=True)
+    # 该行价格的复权口径：raw / qfq / unknown（枚举取值见 spec 7.1）。
+    # 阶段 E 只消费 raw 行，写错值等于让整批数据在复权体系里失效。
+    # 实测发现不同数据源口径不一致（Tushare 不复权、Efinance 疑似前复权），
+    # 混存会让复权重建在数据源边界上出错，因此必须逐行标注。
+    adj_convention = Column(String(16), nullable=True, index=True)
+
     # 更新时间
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
@@ -1319,6 +1329,7 @@ class DatabaseManager:
                 self._migrate_sqlite_five_layer_backtest_group_summary_fields()
                 self._migrate_sqlite_five_layer_backtest_evaluation_fields()
                 self._migrate_sqlite_stock_daily_adj_factor_fields()
+                self._migrate_sqlite_stock_daily_pre_close_fields()
         except Exception as exc:
             logger.exception("Inline database migration failed: %s", exc)
             raise
@@ -1494,6 +1505,45 @@ class DatabaseManager:
                     "CREATE INDEX IF NOT EXISTS ix_stock_daily_adj_factor_source "
                     "ON stock_daily(adj_factor_source)"
                 )
+
+    def _migrate_sqlite_stock_daily_pre_close_fields(self) -> None:
+        """向后兼容：给已有 stock_daily 补 pre_close / adj_convention 两列。
+
+        两列都留 NULL，不做任何回填：``pre_close`` 没有可辩护的默认值，写任何
+        值都是在编造数据；``adj_convention`` 同理——存量行的口径无法事后判定，
+        标成 ``raw`` 会让后续只消费 raw 的阶段吃进一整批错口径数据。存量行由
+        重新抓取的阶段填充。
+        """
+        with self._engine.begin() as conn:
+            existing = {
+                row[1]
+                for row in conn.exec_driver_sql(
+                    "PRAGMA table_info(stock_daily)"
+                ).fetchall()
+            }
+            added: List[str] = []
+            if "pre_close" not in existing:
+                conn.exec_driver_sql(
+                    "ALTER TABLE stock_daily ADD COLUMN pre_close FLOAT"
+                )
+                added.append("pre_close")
+            if "adj_convention" not in existing:
+                conn.exec_driver_sql(
+                    "ALTER TABLE stock_daily ADD COLUMN adj_convention VARCHAR(16)"
+                )
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_stock_daily_adj_convention "
+                    "ON stock_daily(adj_convention)"
+                )
+                added.append("adj_convention")
+
+            if not added:
+                return
+
+            logger.info(
+                "Applying inline SQLite migration: added %s to stock_daily",
+                ", ".join(added),
+            )
 
     def _migrate_sqlite_screening_candidates_strategy_fields(self) -> None:
         """Ensure screening_candidates keeps matched strategy names on SQLite."""
