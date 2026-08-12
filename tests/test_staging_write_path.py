@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""stock_daily 新增列与 staging 表的结构测试。"""
+"""stock_daily 新增列的结构与内联迁移测试。"""
 import os
 import sqlite3
 import tempfile
@@ -135,6 +135,82 @@ class LegacyStockDailyMigrationTestCase(unittest.TestCase):
             conn.close()
 
         self.assertEqual(row, (None, None))
+
+
+class MissingIndexOnlyMigrationTestCase(unittest.TestCase):
+    """列已存在但索引缺失：这是可达状态，且只有内联迁移能补。
+
+    SQLite 的 ALTER TABLE ADD COLUMN 即使没有显式 commit 也会落盘，所以离线
+    脚本在几条 ALTER 之后、CREATE INDEX 之前被打断（Ctrl-C / 磁盘满 / 进程被
+    杀）就会留下「列全在、索引没建」的库。此时 create_all 对已存在的表整表
+    跳过，索引一起跳过，缺的索引没有任何别的路径会补。
+    """
+
+    def setUp(self) -> None:
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self._db_path = os.path.join(self._temp_dir.name, "missing_index.db")
+        self._create_db_with_columns_but_no_index()
+
+        # 与 SchemaTestCase 同样的 LIFO 清理顺序，见那里的说明。
+        self.addCleanup(self._temp_dir.cleanup)
+        self.addCleanup(os.environ.pop, "DATABASE_PATH", None)
+        self.addCleanup(Config.reset_instance)
+        self.addCleanup(DatabaseManager.reset_instance)
+
+        os.environ["DATABASE_PATH"] = self._db_path
+        Config.reset_instance()
+        DatabaseManager.reset_instance()
+
+    def _create_db_with_columns_but_no_index(self) -> None:
+        """建一个两组新列都在、但两个索引都没建的 stock_daily。"""
+        conn = sqlite3.connect(self._db_path)
+        try:
+            conn.execute(
+                """
+                CREATE TABLE stock_daily (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code VARCHAR(10) NOT NULL,
+                    date DATE NOT NULL,
+                    open FLOAT,
+                    high FLOAT,
+                    low FLOAT,
+                    close FLOAT,
+                    volume FLOAT,
+                    amount FLOAT,
+                    pct_chg FLOAT,
+                    data_source VARCHAR(50),
+                    adj_factor FLOAT,
+                    adj_anchor_date DATE,
+                    adj_factor_source VARCHAR(32),
+                    pre_close FLOAT,
+                    adj_convention VARCHAR(16),
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # 前置条件：两个索引确实都不存在，否则用例证明不了任何事。
+        indexes = _indexes(self._db_path, "stock_daily")
+        assert "ix_stock_daily_adj_convention" not in indexes
+        assert "ix_stock_daily_adj_factor_source" not in indexes
+
+    def test_inline_migration_creates_adj_convention_index_when_column_exists(self) -> None:
+        DatabaseManager.get_instance()
+
+        self.assertIn(
+            "ix_stock_daily_adj_convention", _indexes(self._db_path, "stock_daily")
+        )
+
+    def test_inline_migration_creates_adj_factor_source_index_when_column_exists(self) -> None:
+        DatabaseManager.get_instance()
+
+        self.assertIn(
+            "ix_stock_daily_adj_factor_source", _indexes(self._db_path, "stock_daily")
+        )
 
 
 if __name__ == "__main__":

@@ -461,7 +461,7 @@ docker exec stock-analyzer python /app/backfill_instrument_boards.py --codes 600
 - **幂等**：重复执行安全。
 - **默认写库**，但都支持 `--dry-run` 只打印计划。
 - 大部分迁移也在 `src/storage.py` 的 `DatabaseManager.__init__` 启动时内联执行；这些脚本是「DB 不在容器内 / 想在服务启动前确定性应用」的离线路径。
-- 默认 DB 路径 `data/stock_analysis.db`，可用 `--db` 覆盖。
+- 默认 DB 路径 `data/stock_analysis.db`，可用 `--db` 覆盖；新脚本按 §9.4 优先取 `DATABASE_PATH`（目前只有 `migrate_stock_daily_pre_close.py` 这么做）。
 
 ### 4.1 `migrate_stock_daily_adj_factor.py`
 
@@ -559,6 +559,8 @@ docker exec stock-analyzer python /app/backup_production_db.py --db /app/data/st
 **不回填**（有意为之，不要「顺手」补上）：`pre_close` 没有可辩护的默认值，写任何值都是在编造数据，且它直接喂给复权因子重建；存量行的 `adj_convention` 也无法事后判定。存量行保持 NULL，由后续重新抓取的阶段填充。
 
 > 生产库上建索引会重写库文件并使其变大（实测 297 万行、1.23 GiB 的库副本上耗时数秒、文件增长约 26 MB，含 WAL 归并）。先在副本上跑一遍再决定何时对生产库执行。
+
+**默认库路径**：不带 `--db` 时优先取 `DATABASE_PATH`，否则回落到仓库内 `data/stock_analysis.db`；最终解析出的路径会以 `[info] Target database: ...` 回显，成功路径也有，用来确认动的是哪个文件。
 
 ```powershell
 # 本地

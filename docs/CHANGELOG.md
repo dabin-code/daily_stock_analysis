@@ -119,16 +119,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   front-adjusted ones — so an unlabelled mix produces wrong results exactly at
   the source boundary. Both columns are nullable and additive; existing clients
   are unaffected, and nothing populates the columns yet.
-  **Operators must run the migration** on databases that are not recreated from
-  scratch: `python scripts/migrate_stock_daily_pre_close.py --db <path>`
-  (idempotent, supports `--dry-run`). The same migration also runs inline at
-  startup for SQLite. It adds the two columns plus an index on
-  `adj_convention`, and deliberately performs **no backfill** — `pre_close` has
-  no defensible default and legacy rows' convention cannot be determined after
-  the fact, so existing rows stay NULL and are filled by a later re-fetch
-  stage. Note that on a large database the index build rewrites the file and
-  grows it; measure on a copy first. Rollback: revert this commit; the two
-  columns may be left in place, since nothing reads or writes them yet.
+  On SQLite the migration **applies automatically at startup**, so a database
+  the service opens needs no operator action. The standalone script
+  `python scripts/migrate_stock_daily_pre_close.py --db <path>` (idempotent,
+  supports `--dry-run`, defaults to `DATABASE_PATH`) remains available for
+  databases the service does not open first — a separate volume, a managed
+  host, or applying the change before deploy. Either path adds the two columns
+  plus an index on `adj_convention`, and deliberately performs **no backfill**
+  — `pre_close` has no defensible default and legacy rows' convention cannot be
+  determined after the fact, so existing rows stay NULL and are filled by a
+  later re-fetch stage. Note that on a large database the index build rewrites
+  the file and grows it; measure on a copy first. Rollback: revert this commit;
+  the two columns may be left in place, since nothing reads or writes them yet.
 
 ### Changed
 

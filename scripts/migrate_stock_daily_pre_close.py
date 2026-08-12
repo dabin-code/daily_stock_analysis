@@ -36,6 +36,12 @@ Usage:
     python scripts/migrate_stock_daily_pre_close.py --db data/stocks.db
     python scripts/migrate_stock_daily_pre_close.py --dry-run
 
+The default database path follows the main program: ``DATABASE_PATH`` if set,
+otherwise ``<repo>/data/stock_analysis.db``. That matters exactly in the
+separate-volume / managed-host case above, where migrating a same-named file
+inside the repo would silently leave the real database untouched. The resolved
+path is echoed on every run.
+
 NOTE: SQLite ALTER TABLE ADD COLUMN auto-commits, so a partial run that
 errors mid-way may leave some columns added. The migration is idempotent
 and re-running will skip the columns already present, so the safest
@@ -44,13 +50,14 @@ recovery path is to re-run without --dry-run.
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 import sys
 from pathlib import Path
 from typing import List, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DB_PATH = REPO_ROOT / "data" / "stock_analysis.db"
+FALLBACK_DB_PATH = REPO_ROOT / "data" / "stock_analysis.db"
 
 TABLE = "stock_daily"
 NEW_COLUMNS: List[Tuple[str, str]] = [
@@ -59,6 +66,19 @@ NEW_COLUMNS: List[Tuple[str, str]] = [
 ]
 INDEX_NAME = "ix_stock_daily_adj_convention"
 INDEX_COLUMN = "adj_convention"
+
+
+def default_db_path() -> Path:
+    """默认库路径复用主程序约定：优先 DATABASE_PATH，否则仓库内 data/。
+
+    读环境变量而不是固定仓库内路径：本脚本的使用场景正是「库不在仓库里」
+    （独立卷 / 托管实例），此时写死仓库内路径会去迁移一个同名的空壳库，
+    满屏 [ok] + 退出码 0，真正的库一个字节没动。
+    """
+    env_path = os.environ.get("DATABASE_PATH")
+    if env_path:
+        return Path(env_path)
+    return FALLBACK_DB_PATH
 
 
 def _columns(cursor: sqlite3.Cursor, table: str) -> list[str]:
@@ -78,7 +98,28 @@ def migrate(db_path: Path, dry_run: bool = False) -> int:
         print(f"[error] Database not found: {db_path}", file=sys.stderr)
         return 1
 
-    conn = sqlite3.connect(str(db_path))
+    # 成功路径也要回显最终解析出的库路径，否则操作员看到一屏 [ok] 却无法
+    # 确认动的是哪个文件。
+    print(f"[info] Target database: {db_path}")
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error as exc:
+        print(f"[error] Cannot open database {db_path}: {exc}", file=sys.stderr)
+        return 1
+
+    # sqlite 的报错（文件不是数据库、只读库、库被锁）转成脚本自己的 [error]
+    # 约定 + 非零退出码，不要甩一坨 traceback；但绝不吞掉错误码。
+    try:
+        return _migrate_open_db(conn, db_path, dry_run=dry_run)
+    except sqlite3.Error as exc:
+        print(f"[error] Migration failed on {db_path}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+
+def _migrate_open_db(conn: sqlite3.Connection, db_path: Path, dry_run: bool) -> int:
     cursor = conn.cursor()
 
     table_check = cursor.execute(
@@ -87,7 +128,6 @@ def migrate(db_path: Path, dry_run: bool = False) -> int:
     ).fetchone()
     if not table_check:
         print(f"[skip] Table {TABLE} does not exist in {db_path} — no migration needed.")
-        conn.close()
         return 0
 
     existing = set(_columns(cursor, TABLE))
@@ -121,11 +161,9 @@ def migrate(db_path: Path, dry_run: bool = False) -> int:
         print(f"[skip] Index {INDEX_NAME} already exists.")
 
     if dry_run:
-        conn.close()
         return 0
 
     conn.commit()
-    conn.close()
 
     if not columns_added and not index_created:
         print("[done] No changes applied — migration already complete.")
@@ -136,11 +174,15 @@ def migrate(db_path: Path, dry_run: bool = False) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    default_db = default_db_path()
     parser.add_argument(
         "--db",
         type=Path,
-        default=DEFAULT_DB_PATH,
-        help=f"Path to SQLite database (default: {DEFAULT_DB_PATH})",
+        default=default_db,
+        help=(
+            f"Path to SQLite database (default: {default_db}; "
+            "taken from $DATABASE_PATH when set)"
+        ),
     )
     parser.add_argument(
         "--dry-run",

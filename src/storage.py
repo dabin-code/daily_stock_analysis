@@ -1445,6 +1445,26 @@ class DatabaseManager:
             )
             logger.info("Inline SQLite migration for updated_at completed")
 
+    @staticmethod
+    def _ensure_sqlite_index(conn, index_name: str, create_sql: str) -> None:
+        """确保 SQLite 索引存在，缺失时创建并记日志。
+
+        调用方必须在「本次是否新增了列」之外独立调用本方法：列已存在而索引
+        缺失是可达状态，而 create_all 对已存在的表整表跳过（索引一起跳过），
+        缺的索引没有别的路径会补。
+        """
+        exists = conn.exec_driver_sql(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+            (index_name,),
+        ).fetchone()
+        if exists:
+            return
+
+        logger.info(
+            "Applying inline SQLite migration: creating index %s", index_name
+        )
+        conn.exec_driver_sql(create_sql)
+
     def _migrate_sqlite_stock_daily_adj_factor_fields(self) -> None:
         """B6: ensure stock_daily carries adj_factor / adj_anchor_date /
         adj_factor_source on SQLite.
@@ -1481,29 +1501,33 @@ class DatabaseManager:
                 )
                 added.append("adj_factor_source")
 
-            if not added:
-                return
+            if added:
+                logger.info(
+                    "Applying inline SQLite migration: added %s to stock_daily",
+                    ", ".join(added),
+                )
+                # Backfill pre-B6 rows so callers can rely on adj_factor being
+                # non-NULL. ``legacy_assume_one`` is intentionally distinct
+                # from ``fetcher_unset`` so analysts can audit how much of the
+                # corpus pre-dates B6.
+                if "adj_factor" in added:
+                    conn.exec_driver_sql(
+                        "UPDATE stock_daily SET adj_factor = 1.0 WHERE adj_factor IS NULL"
+                    )
+                if "adj_factor_source" in added:
+                    conn.exec_driver_sql(
+                        "UPDATE stock_daily SET adj_factor_source = 'legacy_assume_one' "
+                        "WHERE adj_factor_source IS NULL"
+                    )
 
-            logger.info(
-                "Applying inline SQLite migration: added %s to stock_daily",
-                ", ".join(added),
-            )
-            # Backfill pre-B6 rows so callers can rely on adj_factor being
-            # non-NULL. ``legacy_assume_one`` is intentionally distinct
-            # from ``fetcher_unset`` so analysts can audit how much of the
-            # corpus pre-dates B6.
-            if "adj_factor" in added:
-                conn.exec_driver_sql(
-                    "UPDATE stock_daily SET adj_factor = 1.0 WHERE adj_factor IS NULL"
-                )
-            if "adj_factor_source" in added:
-                conn.exec_driver_sql(
-                    "UPDATE stock_daily SET adj_factor_source = 'legacy_assume_one' "
-                    "WHERE adj_factor_source IS NULL"
-                )
-                conn.exec_driver_sql(
+            # 索引独立于「本次是否新增列」判断，理由见 _ensure_sqlite_index。
+            # 放在回填之后，避免在全表 UPDATE 期间还要维护索引。
+            if "adj_factor_source" in existing or "adj_factor_source" in added:
+                self._ensure_sqlite_index(
+                    conn,
+                    "ix_stock_daily_adj_factor_source",
                     "CREATE INDEX IF NOT EXISTS ix_stock_daily_adj_factor_source "
-                    "ON stock_daily(adj_factor_source)"
+                    "ON stock_daily(adj_factor_source)",
                 )
 
     def _migrate_sqlite_stock_daily_pre_close_fields(self) -> None:
@@ -1531,11 +1555,20 @@ class DatabaseManager:
                 conn.exec_driver_sql(
                     "ALTER TABLE stock_daily ADD COLUMN adj_convention VARCHAR(16)"
                 )
-                conn.exec_driver_sql(
-                    "CREATE INDEX IF NOT EXISTS ix_stock_daily_adj_convention "
-                    "ON stock_daily(adj_convention)"
-                )
                 added.append("adj_convention")
+
+            # 索引必须独立判断，不能挂在「本次新增了列」里：列已存在而索引缺失
+            # 是可达状态——SQLite 的 ALTER TABLE ADD COLUMN 即使没有显式 commit
+            # 也会落盘，离线脚本在两条 ALTER 之后、CREATE INDEX 之前被打断就会
+            # 留下这种库。此时 create_all 会整表跳过（索引一起跳过），只有这里
+            # 还能补上。
+            if "adj_convention" in existing or "adj_convention" in added:
+                self._ensure_sqlite_index(
+                    conn,
+                    "ix_stock_daily_adj_convention",
+                    "CREATE INDEX IF NOT EXISTS ix_stock_daily_adj_convention "
+                    "ON stock_daily(adj_convention)",
+                )
 
             if not added:
                 return
