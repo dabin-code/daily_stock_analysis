@@ -726,6 +726,9 @@ class Config:
     # 维护窗口。开启时每日同步与 K 线治理任务跳过执行，
     # 供长时历史回补独占数据库。开启期间生产数据不再更新，用完必须关闭。
     data_maintenance_mode: bool = False
+    # 落库口径版本。变更单位换算、新增必填列时必须递增，
+    # 否则续跑逻辑会把旧口径数据误判为已完成而跳过。
+    data_convention_version: str = "v1_unadjusted_shares_yuan"
     # Discord 机器人状态
     discord_bot_status: str = "A股智能分析 | /help"
 
@@ -1462,6 +1465,7 @@ class Config:
                 default=True,
             ),
             data_maintenance_mode=parse_env_bool(os.getenv('DATA_MAINTENANCE_MODE'), default=False),
+            data_convention_version=os.getenv('DATA_CONVENTION_VERSION', 'v1_unadjusted_shares_yuan'),
         )
     
     @classmethod

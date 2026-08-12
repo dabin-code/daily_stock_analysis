@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 from datetime import date, timedelta
 from pathlib import Path
@@ -41,6 +42,85 @@ def _init_stock_daily(db_path: Path) -> None:
             "INSERT INTO stock_daily (code, date) VALUES (?, ?)",
             rows,
         )
+
+
+def _init_staging(db_path: Path) -> None:
+    """建 stock_daily_staging，DDL 与 storage.py 的 StockDailyStaging 保持一致。"""
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE stock_daily_staging (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT NOT NULL,
+                date DATE NOT NULL,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                volume REAL,
+                amount REAL,
+                pct_chg REAL,
+                ma5 REAL,
+                ma10 REAL,
+                ma20 REAL,
+                volume_ratio REAL,
+                data_source TEXT,
+                adj_factor REAL,
+                adj_anchor_date DATE,
+                adj_factor_source TEXT,
+                pre_close REAL,
+                adj_convention TEXT,
+                batch_id TEXT,
+                convention_version TEXT,
+                created_at DATETIME,
+                updated_at DATETIME
+            )
+            """
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX uix_staging_code_date ON stock_daily_staging (code, date)"
+        )
+        conn.execute(
+            "CREATE INDEX ix_staging_date_version ON stock_daily_staging (date, convention_version)"
+        )
+
+
+def _make_service(db_path: Path, **overrides) -> FastBackfillService:
+    """集中既有用例里重复的构造方式，避免每个测试各写一份。"""
+    kwargs = {
+        "db_path": str(db_path),
+        "tushare_api": _FakeTushareApi(),
+        "governance_service": SimpleNamespace(
+            run_daily_governance=lambda **kw: {
+                "run_result": "succeeded",
+                "pass_status": "passed",
+                "trade_date": kw["trade_date"],
+            }
+        ),
+        "min_full_count": 2,
+        "sleep": lambda _seconds: None,
+    }
+    kwargs.update(overrides)
+    return FastBackfillService(**kwargs)
+
+
+def _query(db_path: Path, sql: str) -> list:
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+
+
+def _row_hash(db_path: Path, table: str) -> str:
+    """整表内容指纹，用于证明生产表一个字节都没被动过。"""
+    rows = _query(db_path, f"SELECT * FROM {table} ORDER BY rowid")
+    return hashlib.sha256(repr(rows).encode("utf-8")).hexdigest()
+
+
+def _tushare_fixture_df(trade_date: str = "20260511") -> pd.DataFrame:
+    """一天的 Tushare daily() 返回，含 pre_close 列。"""
+    return _FakeTushareApi().daily(trade_date)
 
 
 class _FakeTushareApi:
@@ -267,3 +347,63 @@ def test_fast_backfill_to_trade_date_rejects_future_target(tmp_path):
         assert "未来日期" in str(exc)
     else:
         raise AssertionError("future target date should be rejected")
+
+
+def test_save_day_data_defaults_to_production_table(tmp_path):
+    """既有生产入口的行为必须原样保留。
+
+    backfill_to_trade_date 服务于 Web 的「回填至该日」与数据健康治理，
+    改到 staging 会让它们静默失效。
+    """
+    db_path = tmp_path / "backfill.db"
+    _init_stock_daily(db_path)
+    _init_staging(db_path)
+
+    svc = _make_service(db_path)
+    saved = svc._save_day_data(_tushare_fixture_df())
+
+    assert saved > 0
+    assert _query(db_path, "SELECT COUNT(*) FROM stock_daily")[0][0] > 0
+    assert _query(db_path, "SELECT COUNT(*) FROM stock_daily_staging")[0][0] == 0
+
+
+def test_save_day_data_can_target_staging_without_touching_production(tmp_path):
+    """反例测试：阶段 C 绝不能碰生产表。
+
+    生产表 2024-2026 的存量正是判断数据源口径差异的证据本身，
+    被 INSERT OR REPLACE 覆盖后证据就没了。
+    """
+    db_path = tmp_path / "backfill.db"
+    _init_stock_daily(db_path)
+    _init_staging(db_path)
+    before = _row_hash(db_path, "stock_daily")
+
+    svc = _make_service(db_path)
+    svc._save_day_data(
+        _tushare_fixture_df(),
+        target_table="stock_daily_staging",
+        batch_id="test-batch",
+    )
+
+    assert _row_hash(db_path, "stock_daily") == before, "production table was modified"
+    rows = _query(
+        db_path,
+        "SELECT pre_close, adj_convention, batch_id, convention_version "
+        "FROM stock_daily_staging",
+    )
+    assert rows, "staging table is empty"
+    assert rows[0][0] == pytest.approx(10.2)
+    assert rows[0][1] == "raw"
+    assert rows[0][2] == "test-batch"
+    assert rows[0][3] == svc._convention_version
+
+
+def test_save_day_data_rejects_unknown_target_table(tmp_path):
+    """表名要拼进 SQL，只放行两个字面量。"""
+    db_path = tmp_path / "backfill.db"
+    _init_stock_daily(db_path)
+
+    svc = _make_service(db_path)
+
+    with pytest.raises(ValueError):
+        svc._save_day_data(_tushare_fixture_df(), target_table="stock_daily; DROP TABLE stock_daily")

@@ -15,6 +15,9 @@ from src.services.kline_governance_schedule_service import KlineGovernanceSchedu
 
 logger = logging.getLogger(__name__)
 
+# 回补允许写入的表。生产表是既有入口的默认目标，staging 供阶段 C 显式选用。
+_ALLOWED_TARGET_TABLES = ("stock_daily", "stock_daily_staging")
+
 
 class FastBackfillService:
     """按交易日批量回填全市场 K 线到目标日期。"""
@@ -34,6 +37,7 @@ class FastBackfillService:
         self.governance_service = governance_service or KlineGovernanceScheduleService(config=self.config)
         self.min_full_count = max(1, int(min_full_count))
         self.sleep = sleep
+        self._convention_version = self.config.data_convention_version
 
     def backfill_to_trade_date(self, target_trade_date: date, market: str = "cn") -> Dict[str, Any]:
         if target_trade_date > date.today():
@@ -162,58 +166,90 @@ class FastBackfillService:
                 time.sleep(2 ** (attempt + 1))
         return pd.DataFrame()
 
-    def _save_day_data(self, day_df: pd.DataFrame) -> int:
+    def _save_day_data(
+        self,
+        day_df: pd.DataFrame,
+        target_table: str = "stock_daily",
+        batch_id: Optional[str] = None,
+    ) -> int:
+        """把一天的行情写入目标表。
+
+        target_table 默认生产表：backfill_to_trade_date 服务于 Web 回填与
+        数据健康治理，改默认值会让这两条路径静默失效。
+        阶段 C 的 backfill_range 显式传 stock_daily_staging。
+        """
+        # 表名要拼进 SQL。它不是用户输入，但拼接前校验是零成本的。
+        if target_table not in _ALLOWED_TARGET_TABLES:
+            raise ValueError(f"不支持的回补写入目标表: {target_table}")
         if day_df.empty:
             return 0
 
         now = datetime.now().isoformat()
-        rows_saved = 0
+        is_staging = target_table == "stock_daily_staging"
+        # INSERT OR REPLACE 的语义是「删行重插」而非字段级更新，列清单外的
+        # 列会在重写同一 (code, date) 时被清空。本服务由 Web 数据健康页与
+        # /api/v1/screening/backfill-to-date 触发，一次回填就会把整段区间的
+        # pre_close / adj_convention 抹成 NULL，因此两列必须留在清单里。
+        if is_staging:
+            columns = (
+                "code, date, open, high, low, close, volume, amount, pct_chg, "
+                "pre_close, adj_convention, data_source, batch_id, convention_version, "
+                "created_at, updated_at"
+            )
+            placeholders = ", ".join(["?"] * 16)
+        else:
+            columns = (
+                "code, date, open, high, low, close, volume, amount, pct_chg, "
+                "pre_close, adj_convention, data_source, created_at, updated_at"
+            )
+            placeholders = ", ".join(["?"] * 14)
+
+        # 逐行 execute 补到 2018 约 1160 万行需 40 分钟至 1.6 小时，批量写可降到十分钟内
+        payload = [self._build_row(row, is_staging, batch_id, now) for _, row in day_df.iterrows()]
         with sqlite3.connect(self.db_path) as conn:
-            for _, row in day_df.iterrows():
-                ts_code = str(row.get("ts_code", ""))
-                code = ts_code.split(".")[0] if ts_code else ""
-                trade_date_value = str(row.get("trade_date", ""))
-                date_str = (
-                    f"{trade_date_value[:4]}-{trade_date_value[4:6]}-{trade_date_value[6:8]}"
-                    if len(trade_date_value) == 8
-                    else trade_date_value
-                )
-                # INSERT OR REPLACE 的语义是「删行重插」而非字段级更新，列清单外的
-                # 列会在重写同一 (code, date) 时被清空。本服务由 Web 数据健康页与
-                # /api/v1/screening/backfill-to-date 触发，一次回填就会把整段区间的
-                # pre_close / adj_convention 抹成 NULL，因此两列必须留在清单里。
-                #
-                # adj_convention 在这条路上可以硬编码 raw：数据来自 _fetch_daily_all()
-                # → api.daily()，不经过 data_provider/tushare_fetcher.py，
-                # _apply_qfq_adjustment 与 TUSHARE_QFQ_ENABLED 都不在链路上，返回的
-                # 永远是不复权价。
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO stock_daily
-                    (code, date, open, high, low, close, volume, amount, pct_chg,
-                     pre_close, adj_convention, data_source, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        code,
-                        date_str,
-                        row.get("open"),
-                        row.get("high"),
-                        row.get("low"),
-                        row.get("close"),
-                        lots_to_shares(row.get("vol")),
-                        thousand_yuan_to_yuan(row.get("amount")),
-                        row.get("pct_chg"),
-                        row.get("pre_close"),
-                        "raw",
-                        "TushareFetcher",
-                        now,
-                        now,
-                    ),
-                )
-                rows_saved += 1
+            conn.executemany(
+                f"INSERT OR REPLACE INTO {target_table} ({columns}) VALUES ({placeholders})",
+                payload,
+            )
             conn.commit()
-        return rows_saved
+        return len(payload)
+
+    def _build_row(
+        self,
+        row: pd.Series,
+        is_staging: bool,
+        batch_id: Optional[str],
+        now: str,
+    ) -> tuple:
+        ts_code = str(row.get("ts_code", ""))
+        code = ts_code.split(".")[0] if ts_code else ""
+        trade_date_value = str(row.get("trade_date", ""))
+        date_str = (
+            f"{trade_date_value[:4]}-{trade_date_value[4:6]}-{trade_date_value[6:8]}"
+            if len(trade_date_value) == 8
+            else trade_date_value
+        )
+        # adj_convention 在这条路上可以硬编码 raw：数据来自 _fetch_daily_all()
+        # → api.daily()，不经过 data_provider/tushare_fetcher.py，
+        # _apply_qfq_adjustment 与 TUSHARE_QFQ_ENABLED 都不在链路上，返回的
+        # 永远是不复权价。
+        values = (
+            code,
+            date_str,
+            row.get("open"),
+            row.get("high"),
+            row.get("low"),
+            row.get("close"),
+            lots_to_shares(row.get("vol")),
+            thousand_yuan_to_yuan(row.get("amount")),
+            row.get("pct_chg"),
+            row.get("pre_close"),
+            "raw",
+            "TushareFetcher",
+        )
+        if is_staging:
+            return values + (batch_id, self._convention_version, now, now)
+        return values + (now, now)
 
     def _run_target_governance(self, target_trade_date: date, market: str) -> Dict[str, Any]:
         # 优先逐日补跑治理：把审计通过日从最近通过日推进到目标日，避免中间被跳过的
