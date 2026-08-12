@@ -461,7 +461,7 @@ docker exec stock-analyzer python /app/backfill_instrument_boards.py --codes 600
 - **幂等**：重复执行安全。
 - **默认写库**，但都支持 `--dry-run` 只打印计划。
 - 大部分迁移也在 `src/storage.py` 的 `DatabaseManager.__init__` 启动时内联执行；这些脚本是「DB 不在容器内 / 想在服务启动前确定性应用」的离线路径。
-- 默认 DB 路径 `data/stock_analysis.db`，可用 `--db` 覆盖；新脚本按 §9.4 优先取 `DATABASE_PATH`（目前只有 `migrate_stock_daily_pre_close.py` 这么做）。
+- 默认 DB 路径 `data/stock_analysis.db`，可用 `--db` 覆盖；新脚本按 §9.4 优先取 `DATABASE_PATH`（目前是 `migrate_stock_daily_pre_close.py` 与 `migrate_instrument_delist_date.py`）。
 
 ### 4.1 `migrate_stock_daily_adj_factor.py`
 
@@ -571,6 +571,25 @@ python scripts/migrate_stock_daily_pre_close.py --db .\data\stock_analysis.db
 # docker
 docker cp .\scripts\migrate_stock_daily_pre_close.py stock-analyzer:/app/migrate_stock_daily_pre_close.py
 docker exec stock-analyzer python /app/migrate_stock_daily_pre_close.py --db /app/data/stock_analysis.db
+```
+
+### 4.8 `migrate_instrument_delist_date.py`
+
+**作用**：`instrument_master` 加 `delist_date`（退市日期）列 + 索引。没有这一列时，日线里的「停牌 / 退市 / 抓取失败」三类缺口长得一模一样，缺口归因无从下手；更关键的是**幸存者偏差**——2018 年上市、2021 年退市的股票在只看在市名单的历史研究里整体缺席，而它们恰恰是亏损样本的主要来源，样本里只留幸存者会让回测收益虚高。
+
+**不回填**（有意为之）：存量行的退市日期无法事后判定，写任何值都是编造数据。存量行保持 NULL（含义是「未知 / 在市」），由 `ListingLifecycleService.sync_from_baostock()` 全量回填（它连已退市证券一起拉）。
+
+**默认库路径**：不带 `--db` 时优先取 `DATABASE_PATH`，否则回落到仓库内 `data/stock_analysis.db`；最终解析出的路径会以 `[info] Target database: ...` 回显，成功路径也有，用来确认动的是哪个文件。
+
+```powershell
+# 本地
+python scripts/migrate_instrument_delist_date.py
+python scripts/migrate_instrument_delist_date.py --dry-run
+python scripts/migrate_instrument_delist_date.py --db .\data\stock_analysis.db
+
+# docker
+docker cp .\scripts\migrate_instrument_delist_date.py stock-analyzer:/app/migrate_instrument_delist_date.py
+docker exec stock-analyzer python /app/migrate_instrument_delist_date.py --db /app/data/stock_analysis.db
 ```
 
 ---

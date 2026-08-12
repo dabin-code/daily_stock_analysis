@@ -730,6 +730,9 @@ class InstrumentMaster(Base):
     is_st = Column(Boolean, nullable=False, default=False, index=True)
     industry = Column(String(64))
     list_date = Column(Date, nullable=True, index=True)
+    # 退市日期。缺失该字段时无法区分「停牌」「退市」「抓取失败」三类缺口，
+    # 也无法消除幸存者偏差——已退市股票会整体缺席历史回测。
+    delist_date = Column(Date, nullable=True, index=True)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1419,6 +1422,7 @@ class DatabaseManager:
                 self._migrate_sqlite_five_layer_backtest_evaluation_fields()
                 self._migrate_sqlite_stock_daily_adj_factor_fields()
                 self._migrate_sqlite_stock_daily_pre_close_fields()
+                self._migrate_sqlite_instrument_delist_date_field()
         except Exception as exc:
             logger.exception("Inline database migration failed: %s", exc)
             raise
@@ -1666,6 +1670,44 @@ class DatabaseManager:
                 "Applying inline SQLite migration: added %s to stock_daily",
                 ", ".join(added),
             )
+
+    def _migrate_sqlite_instrument_delist_date_field(self) -> None:
+        """向后兼容：给已有 instrument_master 补 delist_date 列与索引。
+
+        不做任何回填：存量行的退市日期无法事后判定，写任何值都是编造数据。
+        列留 NULL 表示「未知/在市」，由 ListingLifecycleService.sync_from_baostock()
+        全量回填。
+        """
+        with self._engine.begin() as conn:
+            existing = {
+                row[1]
+                for row in conn.exec_driver_sql(
+                    "PRAGMA table_info(instrument_master)"
+                ).fetchall()
+            }
+            added = False
+            if "delist_date" not in existing:
+                conn.exec_driver_sql(
+                    "ALTER TABLE instrument_master ADD COLUMN delist_date DATE"
+                )
+                added = True
+
+            # 索引必须独立判断，不能挂在「本次新增了列」里：列已存在而索引缺失
+            # 是可达状态——SQLite 的 ALTER TABLE ADD COLUMN 即使没有显式 commit
+            # 也会落盘，离线脚本在 ALTER 之后、CREATE INDEX 之前被打断就会留下
+            # 这种库。此时 create_all 会整表跳过（索引一起跳过），只有这里还能补上。
+            if added or "delist_date" in existing:
+                self._ensure_sqlite_index(
+                    conn,
+                    "ix_instrument_master_delist_date",
+                    "CREATE INDEX IF NOT EXISTS ix_instrument_master_delist_date "
+                    "ON instrument_master(delist_date)",
+                )
+
+            if added:
+                logger.info(
+                    "Applying inline SQLite migration: added delist_date to instrument_master"
+                )
 
     def _migrate_sqlite_screening_candidates_strategy_fields(self) -> None:
         """Ensure screening_candidates keeps matched strategy names on SQLite."""
