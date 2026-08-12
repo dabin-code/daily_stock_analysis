@@ -662,6 +662,9 @@ class FiveLayerPipeline:
         )
         # ── 五层优先级排序 (D6) ───────────────────────────────────────
         for c in kept:
+            # 覆盖前先留存原始质量分。rule_score 的复合语义有多处下游消费方，
+            # 不动它，只追加。
+            c.raw_rule_score = c.rule_score
             stage_p = _STAGE_PRIORITY.get(c.trade_stage or "", 0)
             pool_p = _POOL_PRIORITY.get(c.candidate_pool_level or "", 0)
             theme_p = _THEME_PRIORITY.get(c.theme_position or "", 0)

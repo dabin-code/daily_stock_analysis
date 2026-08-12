@@ -949,7 +949,11 @@ class ScreeningCandidate(Base):
     code = Column(String(10), nullable=False, index=True)
     name = Column(String(50))
     rank = Column(Integer, nullable=False, index=True)
+    # ``rule_score`` 是五层优先级排序原地覆盖后的复合优先级分
+    # （stage + pool + theme + 原始分 * 0.01），不是 screener 的质量分。
     rule_score = Column(Float, nullable=False, default=0.0)
+    # 覆盖前 screener 产出的原始质量分，供 Rank IC 等连续量分析使用。
+    raw_rule_score = Column(Float, nullable=True)
     selected_for_ai = Column(Boolean, nullable=False, default=False)
     candidate_decision_json = Column(Text)
     matched_strategies_json = Column(Text)
@@ -992,7 +996,9 @@ class ScreeningCandidate(Base):
             "code": self.code,
             "name": self.name,
             "rank": self.rank,
+            # 复合优先级分（stage + pool + theme + 原始质量分 * 0.01）
             "rule_score": self.rule_score,
+            "raw_rule_score": self.raw_rule_score,
             "selected_for_ai": self.selected_for_ai,
             "matched_strategies": json.loads(self.matched_strategies_json) if self.matched_strategies_json else [],
             "rule_hits": json.loads(self.rule_hits_json) if self.rule_hits_json else [],
@@ -1417,6 +1423,7 @@ class DatabaseManager:
                 self._migrate_sqlite_screening_candidates_strategy_fields()
                 self._migrate_sqlite_screening_candidates_ai_review_fields()
                 self._migrate_sqlite_screening_candidates_updated_at_field()
+                self._migrate_sqlite_screening_candidate_raw_rule_score()
                 self._migrate_sqlite_daily_sector_heat_rank_fields()
                 self._migrate_sqlite_five_layer_backtest_group_summary_fields()
                 self._migrate_sqlite_five_layer_backtest_evaluation_fields()
@@ -1537,6 +1544,31 @@ class DatabaseManager:
                 "ON screening_candidates(updated_at)"
             )
             logger.info("Inline SQLite migration for updated_at completed")
+
+    def _migrate_sqlite_screening_candidate_raw_rule_score(self) -> None:
+        """Ensure screening_candidates has the raw_rule_score column on SQLite.
+
+        No back-fill: legacy rows only ever stored the composite priority score,
+        so the pre-overwrite quality score cannot be recovered after the fact.
+        They stay NULL and consumers must treat NULL as "unknown".
+        """
+        with self._engine.begin() as conn:
+            existing = {
+                row[1]
+                for row in conn.exec_driver_sql(
+                    "PRAGMA table_info(screening_candidates)"
+                ).fetchall()
+            }
+            if "raw_rule_score" in existing:
+                return
+
+            logger.info(
+                "Applying inline SQLite migration: adding raw_rule_score to screening_candidates"
+            )
+            conn.exec_driver_sql(
+                "ALTER TABLE screening_candidates ADD COLUMN raw_rule_score FLOAT"
+            )
+            logger.info("Inline SQLite migration for raw_rule_score completed")
 
     @staticmethod
     def _ensure_sqlite_index(conn, index_name: str, create_sql: str) -> None:
@@ -3389,6 +3421,7 @@ class DatabaseManager:
                         name=item.get("name"),
                         rank=int(item.get("rank", 0)),
                         rule_score=float(item.get("rule_score", 0.0)),
+                        raw_rule_score=item.get("raw_rule_score"),
                         selected_for_ai=bool(item.get("selected_for_ai", False)),
                         candidate_decision_json=self._safe_json_dumps(decision_payload),
                         matched_strategies_json=self._safe_json_dumps(item.get("matched_strategies", [])),

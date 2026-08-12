@@ -244,6 +244,26 @@ class PayloadOutputTestCase(unittest.TestCase):
         self.assertIsNone(p["trade_stage"])
         self.assertIsNone(p["market_regime"])
 
+    def test_raw_rule_score_survives_payload_round_trip(self) -> None:
+        """raw_rule_score 必须能过 to_payload -> from_payload 一圈。
+
+        from_payload 是逐字段枚举的，漏一行的后果是入库 payload 里有值、
+        读回来变 0.0——单测全绿而 Rank IC 拿到一列 0。
+        """
+        from src.schemas.trading_types import CandidateDecision
+
+        record = _make_candidate()
+        record.raw_rule_score = 80.0
+        # pipeline 覆盖后的复合优先级分，与原始质量分必须是两个不同的数。
+        record.rule_score = 26.8
+
+        payload = CandidateDecision.from_record(record).to_payload()
+        self.assertAlmostEqual(payload["raw_rule_score"], 80.0, places=4)
+
+        restored = CandidateDecision.from_payload(payload)
+        self.assertAlmostEqual(restored.raw_rule_score, 80.0, places=4)
+        self.assertAlmostEqual(restored.rule_score, 26.8, places=4)
+
 
 class DBSaveTestCase(unittest.TestCase):
     """测试 save_screening_candidates 写入五层字段。"""
@@ -1294,6 +1314,18 @@ class BottomDivergenceV2RealPipelineTestCase(unittest.TestCase):
 
         self.assertEqual(candidate.trade_stage, TradeStage.FOCUS.value)
         self.assertIsNone(candidate.trade_plan_json)
+
+    def test_raw_rule_score_survives_priority_composition(self) -> None:
+        """复合优先级分覆盖 rule_score 后，原始质量分仍须可取。
+
+        Rank IC 需要连续的信号强度；复合分被三个离散优先级主导，
+        取值离散到做不了秩相关。
+        """
+        candidate = self._run(stage="early", layered_points=[])
+
+        # _run 内构造的 ScreeningCandidateRecord 是 rule_score=80.0。
+        self.assertAlmostEqual(candidate.raw_rule_score, 80.0, places=4)
+        self.assertNotAlmostEqual(candidate.rule_score, 80.0, places=4)
 
 
 if __name__ == "__main__":

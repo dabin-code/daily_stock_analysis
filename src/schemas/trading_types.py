@@ -242,6 +242,9 @@ class CandidateDecision:
     recommendation_reason: Optional[str] = None
     # 评分
     rule_score: float = 0.0
+    # 五层优先级排序覆盖 rule_score 之前的原始质量分。rule_score 的复合语义
+    # 有多处下游消费方，因此这里追加而不是替换。
+    raw_rule_score: float = 0.0
     final_score: float = 0.0
     final_rank: int = 0
 
@@ -253,6 +256,7 @@ class CandidateDecision:
             name=getattr(record, "name", ""),
             rank=int(getattr(record, "rank", 0) or 0),
             rule_score=float(getattr(record, "rule_score", 0.0) or 0.0),
+            raw_rule_score=float(getattr(record, "raw_rule_score", 0.0) or 0.0),
             rule_hits=list(getattr(record, "rule_hits", []) or []),
             factor_snapshot=dict(getattr(record, "factor_snapshot", {}) or {}),
             matched_strategies=list(getattr(record, "matched_strategies", []) or []),
@@ -480,6 +484,7 @@ class CandidateDecision:
             recommendation_source=payload.get("recommendation_source"),
             recommendation_reason=payload.get("recommendation_reason"),
             rule_score=float(payload.get("rule_score", 0.0) or 0.0),
+            raw_rule_score=float(payload.get("raw_rule_score", 0.0) or 0.0),
             final_score=float(payload.get("final_score", 0.0) or 0.0),
             final_rank=int(payload.get("final_rank", 0) or 0),
         )

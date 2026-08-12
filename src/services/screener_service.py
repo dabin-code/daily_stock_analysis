@@ -21,6 +21,9 @@ class ScreeningCandidateRecord:
     factor_snapshot: Dict[str, Any]
     matched_strategies: List[str] = field(default_factory=list)
     strategy_scores: Dict[str, float] = field(default_factory=dict)
+    # 五层优先级排序会原地覆盖 rule_score，这里保留 screener 产出的原始质量分，
+    # 供 Rank IC 等连续量分析使用。
+    raw_rule_score: float = 0.0
     # ── 五层决策字段 (Phase 2A) ──
     setup_type: Optional[str] = None
     strategy_family: Optional[str] = None
