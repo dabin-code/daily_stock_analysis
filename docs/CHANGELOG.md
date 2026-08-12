@@ -319,10 +319,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   stage or produce a trade plan. Stop-loss parsing now lives in one place,
   `src/services/setup_stop_loss.py`, shared by the stage judge and the trade
   plan builder, and resolves the real per-setup source fields.
-  **This changes stock selection output**: candidates that previously stopped at
-  `focus` can now reach `probe_entry` and carry a full trade plan. Failing to
-  resolve a stop still returns `None` and still caps the candidate at `focus` —
-  no fallback value is substituted, which would void the gate.
+  **This changes stock selection output.** Measured on a real 2026-08-12 run
+  (`balanced` mode, `candidate_limit=30`, AI disabled), with the only difference
+  being the old stop-loss resolution restored:
+
+  | | before | after |
+  | --- | --- | --- |
+  | candidates | 7 | 20 |
+  | `trade_stage` | 7 `focus` | 13 `probe_entry`, 7 `focus` |
+  | with a trade plan | 0 | 13 |
+
+  Note that the count itself roughly tripled: the old behaviour did not merely
+  cap candidates at `focus`, it dropped whole setup families. Every one of the
+  11 `trend_pullback` and 2 `bottom_divergence_breakout` candidates was absent
+  before and present after, while the 7 `trend_breakout` ones were unaffected.
+  Failing to resolve a stop still returns `None` and still caps the candidate at
+  `focus` — no fallback value is substituted, which would void the gate.
 
 - Fixed the busy-timeout gap on the two services that talk to SQLite through
   raw `sqlite3` instead of `DatabaseManager`: `FastBackfillService` and
