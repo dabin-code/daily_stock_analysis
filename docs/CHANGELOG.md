@@ -252,7 +252,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   REPL. Rollback: revert these commits; both new config options are inert when
   unset.
 
+- Added `screening_candidates.raw_rule_score`, the screener's original quality
+  score as it stood before the five-layer priority sort overwrites `rule_score`
+  in place with `stage + pool + theme + rule_score * 0.01`. `rule_score` keeps
+  its existing meaning — the composite priority score consumed by the
+  notification service, the second-pass gate and the candidate selector — and
+  the new column is purely additive. Rank IC and similar rank-correlation work
+  needs a continuous signal strength; the composite score is dominated by three
+  discrete priorities and is too coarse for it. Rows written before this change
+  hold NULL and cannot be backfilled, because the three priority terms are not
+  separable from the composite value; treat NULL as unknown and exclude it
+  rather than reading it as zero. Apply with
+  `scripts/migrate_screening_candidate_raw_rule_score.py` (idempotent, adds a
+  nullable column, no backfill), or let the inline migration add it on startup.
+
+- Added `code_revision` and `config_hash` to the five-layer backtest run
+  payload, which `FiveLayerBacktestRun.to_dict` exposes to the API and to
+  exports. Four of the five existing version columns had no write path at all,
+  so every run claimed to be reproducible while carrying a single populated
+  field; all seven are now filled when the run row is created, so even a
+  zero-candidate early return leaves no NULL behind. What is not yet
+  versionable is written as the literal `n/a` instead of NULL, so "not
+  applicable" stays distinguishable from "nobody wrote this" after the fact.
+  `code_revision` is recorded for traceability but deliberately does not
+  participate in comparability decisions: a git commit changes for unrelated
+  reasons and would mark two otherwise comparable runs as incomparable — use
+  `data_version` and `config_hash` for that. Both fields are additive; existing
+  clients are unaffected. Apply with `scripts/migrate_backtest_run_versions.py`.
+
 ### Fixed
+
+- Fixed the stop-loss gate that silently capped every non-v2 setup at `focus`.
+  The five-layer pipeline decided whether a candidate had a stop by reading
+  `factor_snapshot['has_stop_loss']`, a key no production code ever wrote, so
+  the answer was always `False` and those setups could never reach an entry
+  stage or produce a trade plan. Stop-loss parsing now lives in one place,
+  `src/services/setup_stop_loss.py`, shared by the stage judge and the trade
+  plan builder, and resolves the real per-setup source fields.
+  **This changes stock selection output**: candidates that previously stopped at
+  `focus` can now reach `probe_entry` and carry a full trade plan. Failing to
+  resolve a stop still returns `None` and still caps the candidate at `focus` —
+  no fallback value is substituted, which would void the gate.
 
 - Fixed the busy-timeout gap on the two services that talk to SQLite through
   raw `sqlite3` instead of `DatabaseManager`: `FastBackfillService` and
@@ -266,6 +306,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   maintenance window still leaves other writers active.
 
 ### Changed
+
+- Top-level backtest group metrics are now computed from the `entry` signal
+  family only. `aggregate_group` used to mix entry's `forward_return_5d` with
+  observation's `risk_avoided_pct` — two different units — into one return
+  series, and count `correct_wait` in the same numerator as `win`.
+  **`win_rate_pct`, `profit_factor`, `avg_return_pct` and `stage_accuracy_rate`
+  will change value for any mixed group, and historical ratings are no longer
+  directly comparable with new ones**; a mixed group of two entries (1 win) and
+  two correct waits reported 75% and now reports 50%. Groups that are already
+  single-family — the `signal_family` rows and the `<dimension>_signal_family`
+  split rows — keep their own family, so observation metrics are not blanked
+  out. `sample_count` and `sample_baseline` still describe the whole group:
+  how many samples a group holds and which family its return metrics represent
+  are separate questions, and shrinking the former would misreport sample
+  adequacy. The old behaviour remains reachable for recomputing historical runs
+  under the original definition by passing `allow_mixed_families=True`, but it
+  is no longer the default: calling `aggregate_group` without a `family_filter`
+  now raises `ValueError` rather than quietly returning mixed-unit numbers.
 
 - The daily incremental sync paths now populate `stock_daily.pre_close` and
   `stock_daily.adj_convention`. The incremental path matters most: without
