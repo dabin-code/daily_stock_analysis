@@ -11,6 +11,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Backfilled `stock_daily_staging` across the full 2018–2026 window: 9,621,460
+  rows over 2,089 trading days from 2018-01-02 to 2026-08-12, every row carrying
+  `pre_close` and `adj_convention='raw'`, in 83 minutes at the free tier's 45
+  calls/minute with **zero failed dates**. `pre_close` is null on 78 rows, all of
+  them a code's first bar in the window (Beijing exchange listings that have no
+  prior close to inherit) — the anchor-day case the adjustment design already
+  exempts. **The production `stock_daily` table was not touched**: it still holds
+  2,974,189 rows over 2024-04-18 to 2026-08-12, and promoting staging is a
+  separate, gated step that has not run. A sample of 200 codes across 2018 shows
+  `close(t-1) != pre_close(t)` on 0.293% of 45,015 comparisons, clustered in the
+  June–August dividend season, which matches both the expected corporate-action
+  rate and the 0.29% break rate measured independently from the production table
+  — evidence that the staged data really is unadjusted, as `adj_convention`
+  claims. Populated `trading_calendar` for the same window: 3,287 days of which
+  2,184 are open, with zero disagreements against `exchange_calendars`.
 - Added SQLite concurrency protection and long-running data-job safety rails:
   connections opened through `DatabaseManager` now enable `PRAGMA
   journal_mode=WAL` (alongside the existing `busy_timeout=30000`), so a
