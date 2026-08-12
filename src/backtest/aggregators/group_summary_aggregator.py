@@ -308,6 +308,7 @@ def aggregate_group(
         evaluations = [e for e in evaluations if e.signal_family == family_filter]
         if not evaluations:
             return None
+
     # Filter to evaluated entries with a return metric
     valid = [e for e in evaluations if _is_aggregatable(e)]
     aggregatable_count = len(valid)
