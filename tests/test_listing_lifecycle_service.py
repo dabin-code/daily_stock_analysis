@@ -217,5 +217,248 @@ class InstrumentDelistDateMigrationScriptTestCase(unittest.TestCase):
         self.assertEqual(module.default_db_path(), self._db_path)
 
 
+class _FakeBaostockResultSet:
+    def __init__(self, fields, rows, error_code="0", error_msg="success"):
+        self.fields = fields
+        self.error_code = error_code
+        self.error_msg = error_msg
+        self._rows = list(rows)
+        self._cursor = -1
+
+    def next(self) -> bool:
+        if self._cursor + 1 >= len(self._rows):
+            return False
+        self._cursor += 1
+        return True
+
+    def get_row_data(self):
+        return self._rows[self._cursor]
+
+
+class _FakeBaostockModule:
+    """只实现 sync_from_baostock 用到的四个接口。"""
+
+    def __init__(self, result_set):
+        self._result_set = result_set
+        self.logged_in = False
+        self.logged_out = False
+        self.query_calls = []
+
+    def login(self):
+        self.logged_in = True
+        return _FakeBaostockResultSet([], [])
+
+    def logout(self):
+        self.logged_out = True
+        return _FakeBaostockResultSet([], [])
+
+    def query_stock_basic(self, *args, **kwargs):
+        # 传了 code 就只返回该只证券，已退市的拉不到；这里记录下来供断言。
+        self.query_calls.append({"args": args, "kwargs": kwargs})
+        return self._result_set
+
+
+class ListingLifecycleServiceTestCase(_TempDatabaseTestCase):
+    def setUp(self) -> None:
+        self._db_path = self._prepare_temp_db()
+        DatabaseManager.get_instance()
+
+    def _service(self):
+        from src.services.listing_lifecycle_service import ListingLifecycleService
+
+        return ListingLifecycleService()
+
+    def test_upsert_writes_list_and_delist_date(self) -> None:
+        svc = self._service()
+        svc.upsert_lifecycle([
+            {"code": "000001", "name": "平安银行", "list_date": date(1991, 4, 3),
+             "delist_date": None, "listing_status": "active"},
+            {"code": "000033", "name": "新都退", "list_date": date(1994, 1, 3),
+             "delist_date": date(2016, 5, 26), "listing_status": "delisted"},
+        ])
+
+        rows = svc.get_lifecycle(["000001", "000033"])
+        self.assertIsNone(rows["000001"]["delist_date"])
+        self.assertEqual(rows["000033"]["delist_date"], date(2016, 5, 26))
+        self.assertEqual(rows["000033"]["listing_status"], "delisted")
+        self.assertEqual(rows["000033"]["list_date"], date(1994, 1, 3))
+
+    def test_delisted_instruments_are_not_dropped_by_universe_sync(self) -> None:
+        """反例测试：幸存者偏差的直接防线。
+
+        已退市股票必须留在 instrument_master，否则历史回测样本里
+        永远看不到它们，亏损样本被系统性抹掉。
+        """
+        svc = self._service()
+        svc.upsert_lifecycle([
+            {"code": "000033", "name": "新都退", "list_date": date(1994, 1, 3),
+             "delist_date": date(2016, 5, 26), "listing_status": "delisted"},
+        ])
+
+        codes = svc.list_codes_alive_on(date(2015, 1, 1))
+        self.assertIn("000033", codes)
+        codes_after = svc.list_codes_alive_on(date(2020, 1, 1))
+        self.assertNotIn("000033", codes_after)
+
+    def test_alive_window_is_half_open_on_the_delisting_date(self) -> None:
+        """区间口径钉死为 [list_date, delist_date)。
+
+        delist_date 是终止上市生效日，该日证券已不在市、不产生 K 线；把它算作
+        在市会让审计期望域每只退市股多出一天「无法归因的缺口」。上市日反过来
+        是首个交易日，必须算在内。
+        """
+        svc = self._service()
+        svc.upsert_lifecycle([
+            {"code": "000033", "name": "新都退", "list_date": date(1994, 1, 3),
+             "delist_date": date(2016, 5, 26), "listing_status": "delisted"},
+        ])
+
+        self.assertIn("000033", svc.list_codes_alive_on(date(2016, 5, 25)))
+        self.assertNotIn("000033", svc.list_codes_alive_on(date(2016, 5, 26)))
+        self.assertIn("000033", svc.list_codes_alive_on(date(1994, 1, 3)))
+        self.assertNotIn("000033", svc.list_codes_alive_on(date(1994, 1, 2)))
+
+    def test_unknown_list_date_is_not_reported_as_alive(self) -> None:
+        """list_date 未知的行不进在市清单：无法断言的时点一律排除。"""
+        svc = self._service()
+        svc.upsert_lifecycle([
+            {"code": "600000", "name": "浦发银行", "list_date": None,
+             "delist_date": None, "listing_status": "active"},
+        ])
+
+        self.assertNotIn("600000", svc.list_codes_alive_on(date(2020, 1, 1)))
+
+    def test_upsert_does_not_erase_known_dates_with_missing_values(self) -> None:
+        """入参缺日期时不得把已知日期擦成 NULL。
+
+        list_date 可能是别处（scripts/_kline_master_data_treatment.py 的 Phase A）
+        用 stock_daily 首个交易日回填出来的；上游某次返回空值就把它清掉，等于
+        用一次抓取抖动换掉一份已有证据。
+        """
+        svc = self._service()
+        svc.upsert_lifecycle([
+            {"code": "000033", "name": "新都退", "list_date": date(1994, 1, 3),
+             "delist_date": date(2016, 5, 26), "listing_status": "delisted"},
+        ])
+
+        svc.upsert_lifecycle([
+            {"code": "000033", "name": "新都退", "list_date": None,
+             "delist_date": None, "listing_status": "delisted"},
+        ])
+
+        rows = svc.get_lifecycle(["000033"])
+        self.assertEqual(rows["000033"]["list_date"], date(1994, 1, 3))
+        self.assertEqual(rows["000033"]["delist_date"], date(2016, 5, 26))
+
+    def test_upsert_clears_delist_date_when_status_is_active(self) -> None:
+        """在市即无退市日期：误标必须能被下一次同步纠正。"""
+        svc = self._service()
+        svc.upsert_lifecycle([
+            {"code": "600000", "name": "浦发银行", "list_date": date(1999, 11, 10),
+             "delist_date": date(2016, 5, 26), "listing_status": "delisted"},
+        ])
+
+        svc.upsert_lifecycle([
+            {"code": "600000", "name": "浦发银行", "list_date": date(1999, 11, 10),
+             "delist_date": None, "listing_status": "active"},
+        ])
+
+        rows = svc.get_lifecycle(["600000"])
+        self.assertIsNone(rows["600000"]["delist_date"])
+        self.assertIn("600000", svc.list_codes_alive_on(date(2020, 1, 1)))
+
+
+class ListingLifecycleSyncTestCase(_TempDatabaseTestCase):
+    """sync_from_baostock 的字段映射与过滤，全部用假 baostock 模块离线跑。"""
+
+    FIELDS = ["code", "code_name", "ipoDate", "outDate", "type", "status"]
+    ROWS = [
+        ["sh.600000", "浦发银行", "1999-11-10", "", "1", "1"],
+        ["sz.000033", "新都退", "1994-01-03", "2016-05-26", "1", "0"],
+        ["sh.000001", "上证综合指数", "1991-07-15", "", "2", "1"],
+        ["sz.159901", "深100ETF", "2006-04-24", "", "5", "1"],
+    ]
+
+    def setUp(self) -> None:
+        self._db_path = self._prepare_temp_db()
+        DatabaseManager.get_instance()
+
+        import sys
+
+        self._fake_bs = _FakeBaostockModule(
+            _FakeBaostockResultSet(self.FIELDS, self.ROWS)
+        )
+        self._previous = sys.modules.get("baostock")
+        sys.modules["baostock"] = self._fake_bs
+        self.addCleanup(self._restore_baostock)
+
+    def _restore_baostock(self) -> None:
+        import sys
+
+        if self._previous is None:
+            sys.modules.pop("baostock", None)
+        else:
+            sys.modules["baostock"] = self._previous
+
+    def test_sync_maps_fields_strips_prefix_and_keeps_delisted(self) -> None:
+        from src.services.listing_lifecycle_service import ListingLifecycleService
+
+        svc = ListingLifecycleService()
+        stats = svc.sync_from_baostock()
+
+        self.assertEqual(stats["total"], 2)
+        self.assertEqual(stats["written"], 2)
+        self.assertEqual(stats["delisted"], 1)
+
+        rows = svc.get_lifecycle(["600000", "000033"])
+        self.assertEqual(
+            set(rows),
+            {"600000", "000033"},
+            "baostock 的 sh./sz. 前缀必须剥离，否则回填出一批匹配不到任何行情的孤儿代码",
+        )
+        self.assertEqual(rows["600000"]["list_date"], date(1999, 11, 10))
+        self.assertIsNone(rows["600000"]["delist_date"])
+        self.assertEqual(rows["600000"]["listing_status"], "active")
+        self.assertEqual(rows["000033"]["delist_date"], date(2016, 5, 26))
+        self.assertEqual(rows["000033"]["listing_status"], "delisted")
+        self.assertTrue(self._fake_bs.logged_out, "登录后必须登出，避免会话泄漏")
+
+    def test_sync_pulls_whole_market_without_code_filter(self) -> None:
+        """query_stock_basic 必须不带 code 调用。
+
+        传 code 就只返回那一只，已退市证券整批拉不到，幸存者偏差原地复发。
+        """
+        from src.services.listing_lifecycle_service import ListingLifecycleService
+
+        ListingLifecycleService().sync_from_baostock()
+
+        self.assertEqual(len(self._fake_bs.query_calls), 1)
+        call = self._fake_bs.query_calls[0]
+        self.assertEqual(call["args"], ())
+        self.assertNotIn("code", call["kwargs"])
+
+    def test_sync_excludes_non_stock_securities(self) -> None:
+        """type != '1' 的指数与基金不能进 instrument_master。"""
+        from src.services.listing_lifecycle_service import ListingLifecycleService
+
+        svc = ListingLifecycleService()
+        svc.sync_from_baostock()
+
+        self.assertEqual(svc.get_lifecycle(["000001", "159901"]), {})
+
+    def test_sync_raises_when_query_fails(self) -> None:
+        """抓取失败必须报错，不能返回 0 行让调用方误判成「全市场为空」。"""
+        from src.services.listing_lifecycle_service import ListingLifecycleService
+
+        import sys
+
+        sys.modules["baostock"] = _FakeBaostockModule(
+            _FakeBaostockResultSet([], [], error_code="10001", error_msg="network down")
+        )
+
+        with self.assertRaises(RuntimeError):
+            ListingLifecycleService().sync_from_baostock()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -186,6 +186,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `TradingCalendarService().sync(...)` once to populate it before anything depends on
   it. Nothing reads the table yet. Rollback: revert this commit and optionally
   `DROP TABLE trading_calendar`; leaving the table in place is harmless.
+- Added `instrument_master.delist_date` and
+  `src/services/listing_lifecycle_service.py`, which backfills listing and
+  delisting dates from baostock's free `query_stock_basic`. Without a delisting
+  date, three very different gaps in the daily bars are indistinguishable — a
+  trading halt, a delisting, and a failed fetch — so gap attribution has nothing
+  to key on. The larger reason is **survivor bias**: a name listed in 2018 and
+  delisted in 2021 is absent from any study that tracks only currently-listed
+  instruments, and that is exactly where the losses concentrate, so a backtest
+  run on a survivors-only universe reports inflated returns. The local database
+  shows the problem concretely — 5489 instruments, of which only 7 are marked
+  `delisted`.
+  `sync_from_baostock()` therefore calls `query_stock_basic` **without a `code`
+  argument**, which is the only way to get delisted securities back (passing a
+  code returns just that one), keeps every row including the delisted ones, and
+  filters to `type == '1'` to exclude indices and funds. `ipoDate` maps to
+  `list_date`, `outDate` to `delist_date`, and `status` (1/0) to
+  `listing_status` (`active` / `delisted`). Missing values never overwrite a
+  known date: `list_date` may have been backfilled elsewhere from the first
+  stored trading day, and letting one empty upstream response erase it would
+  trade existing evidence for a fetch hiccup. A row whose status comes back
+  `active` does get its `delist_date` cleared, so a mislabel can be corrected.
+  `list_codes_alive_on(as_of)` returns the point-in-time listed universe over
+  the **half-open** interval `[list_date, delist_date)`: the listing date counts
+  (it is the first trading day), the delisting date does not (it is the date the
+  listing terminates, so the security produces no bar that day, and counting it
+  would give every delisted name one unattributable one-day gap in the audit's
+  expected domain). Rows with a NULL `list_date` are excluded rather than
+  assumed listed — the same fail-closed stance as the calendar queries.
+  **The `delist_date` migration is applied automatically inline** the next time
+  `DatabaseManager` opens a SQLite database, so it needs no operator action;
+  `scripts/migrate_instrument_delist_date.py` is the deterministic offline path
+  for databases on a separate volume or managed host that should be migrated
+  before the service starts. Existing rows keep `delist_date` NULL — an existing
+  row's delisting date cannot be determined after the fact and any value written
+  would be fabricated — so the column stays empty until
+  `ListingLifecycleService().sync_from_baostock()` is run once. Nothing reads
+  the column or the service yet. Rollback: revert these commits; the extra
+  column and index are harmless if left in place.
 
 ### Changed
 
