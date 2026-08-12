@@ -30,7 +30,11 @@ if TYPE_CHECKING:
     from src.services.theme_mapping_registry import ThemeMappingRegistry
 
 logger = logging.getLogger(__name__)
-MAX_FALLBACK_THEMES = 10
+# 单日识别的主线/次线题材数量上限。
+# 这是 L2 的宽度闸门：题材层不设限会把 L3 的候选输入整体放大，
+# 让五层筛选形同虚设。fallback 与主路径必须共用同一个上限。
+MAX_IDENTIFIED_THEMES = 10
+MAX_FALLBACK_THEMES = MAX_IDENTIFIED_THEMES  # 向后兼容既有引用
 
 
 @dataclass
@@ -123,7 +127,7 @@ class ThemePositionResolver:
                     quality_flags=dict(best_sector.quality_flags or {}),
                 ))
             themes.sort(key=self._theme_sort_key, reverse=True)
-            return themes
+            return themes[:MAX_IDENTIFIED_THEMES]
 
         # 无 registry: 每个板块独立为一个 theme
         themes = [
@@ -140,7 +144,7 @@ class ThemePositionResolver:
             for board_name, position, sector in raw_themes
         ]
         themes.sort(key=self._theme_sort_key, reverse=True)
-        return themes
+        return themes[:MAX_IDENTIFIED_THEMES]
 
     def _build_warm_expand_fallback_themes(self) -> List[tuple]:
         """当日没有 hot 主/次线时，允许 warm+expand/launch 作为次线兜底。"""
