@@ -1,5 +1,7 @@
 import os
+import sqlite3
 import tempfile
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -9,6 +11,46 @@ from src.storage import DatabaseManager
 _LEAKS: list[str] = []
 
 _PRODUCTION_DB = Path(__file__).resolve().parent.parent / "data" / "stock_analysis.db"
+
+_PRODUCTION_OPENS: list[str] = []
+
+
+def _resolve_sqlite_target(database) -> "Path | None":
+    """还原 sqlite3.connect 的第一个参数指向的文件，内存库返回 None。"""
+    if not isinstance(database, (str, os.PathLike)):
+        return None
+    text = os.fspath(database)
+    if text == ":memory:" or text.startswith("file::memory:"):
+        return None
+    if text.startswith("file:"):
+        text = urllib.parse.unquote(text[len("file:") :].split("?", 1)[0])
+    if not text:
+        return None
+    try:
+        return Path(text).resolve()
+    except (OSError, ValueError):
+        return None
+
+
+def _install_production_open_tracker() -> None:
+    """记录本进程里每一次打开生产库的动作。
+
+    必须在收集用例之前装好，否则导入期就建好引擎的模块会漏掉。
+    SQLAlchemy 的 pysqlite 方言拿的是 sqlite3.dbapi2.connect，
+    只包 sqlite3.connect 会漏掉全部 ORM 路径，两个名字都要换。
+    """
+    real_connect = sqlite3.dbapi2.connect
+
+    def tracking_connect(database, *args, **kwargs):
+        if _resolve_sqlite_target(database) == _PRODUCTION_DB:
+            _PRODUCTION_OPENS.append(str(database))
+        return real_connect(database, *args, **kwargs)
+
+    sqlite3.dbapi2.connect = tracking_connect
+    sqlite3.connect = tracking_connect
+
+
+_install_production_open_tracker()
 
 _SESSION_DB_DIR: "tempfile.TemporaryDirectory | None" = None
 _SESSION_DB_PATH: "str | None" = None
@@ -100,27 +142,36 @@ def _database_path_isolation(request):
 
 
 @pytest.fixture(autouse=True)
-def _fail_on_production_write(request):
-    """未标记 real_database 的用例改动了生产库，就地失败。
+def _fail_on_production_access(request):
+    """未标记 real_database 的用例连了生产库，就地失败。
 
     2026-08-12 这个库被并发测试进程写坏过一次：文件头被别的数据页覆盖，
     1.3 GB 的库直接打不开，只能从前一天的备份回滚。事后才发现远比当场
-    拦下昂贵，所以这里不再只是记录，而是直接判失败。
+    拦下昂贵，所以这里不只是记录，而是直接判失败。
 
-    以 mtime 为准而不是内容哈希：1.3 GB 的库每个用例算一次哈希不现实，
-    而任何写入都会推进 mtime。
+    判据是「本进程有没有打开过这个文件」，不是文件 mtime。mtime 是进程
+    无关的：并行跑时一个 worker 里标了 real_database 的用例连上生产库
+    （`PRAGMA journal_mode=WAL` 会写文件头），另外七个 worker 会把这次
+    改动记到自己正在跑的用例头上，一次全量能凭空多出五十个红。
+
+    只读打开同样算违规——它意味着这个用例绕过了会话临时库的重定向，
+    离写坏只差一次代码改动。
+
+    残留盲区：不经 sqlite3 直接改文件的用例（比如 shutil 覆盖）拦不住。
+    真实事故走的是 sqlite 连接，这里按事故的路径设防。
     """
     if request.node.get_closest_marker("real_database") is not None:
         yield
         return
 
-    before = _PRODUCTION_DB.stat().st_mtime_ns if _PRODUCTION_DB.exists() else None
+    _PRODUCTION_OPENS.clear()
     yield
-    after = _PRODUCTION_DB.stat().st_mtime_ns if _PRODUCTION_DB.exists() else None
-    if before != after:
+    if _PRODUCTION_OPENS:
+        opened = ", ".join(sorted(set(_PRODUCTION_OPENS)))
+        _PRODUCTION_OPENS.clear()
         pytest.fail(
-            f"{request.node.nodeid} 改动了生产库 {_PRODUCTION_DB}。"
-            "测试必须走会话临时库；确有必要读真实库的模块请显式加 "
+            f"{request.node.nodeid} 打开了生产库 {_PRODUCTION_DB}（{opened}）。"
+            "测试必须走会话临时库；确有必要访问真实库的模块请显式加 "
             "@pytest.mark.real_database。"
         )
 

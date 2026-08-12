@@ -295,14 +295,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `tests/conftest.py` now points `DATABASE_PATH` at a per-session temporary
   database in `pytest_configure` (before `Config` caches anything), restores
   that default after each test so the `pop` calls no longer leak, and fails any
-  test that changes the production file's mtime. Modules that genuinely need
+  test that opens the production database at all. Modules that genuinely need
   real data — currently only `tests/test_e2e_five_layer_local.py`, whose
   fixtures read the real database directly with `sqlite3` — opt back in with
   `@pytest.mark.real_database`. `tests/test_production_db_guard.py` keeps the
-  guard honest by provoking a production write in a subprocess and asserting it
-  is caught. Run the offline gate as
-  `pytest -m "not network and not real_database"` plus a separate
-  `pytest -m real_database` pass.
+  guard honest by provoking a production open in a subprocess and asserting it
+  is caught, over both the raw `sqlite3` and the SQLAlchemy path.
+
+  The guard tracks opens made by its own process, wrapping `sqlite3.connect` and
+  `sqlite3.dbapi2.connect` — SQLAlchemy's pysqlite dialect binds the latter, so
+  wrapping only the former misses every ORM path, which is the one tests
+  actually fall back through. An earlier revision compared the production file's
+  mtime instead, which is process-global: under `-n 8` a marked test opening the
+  real database (`PRAGMA journal_mode=WAL` writes the header) made the other
+  seven workers blame whatever they happened to be running, for 51 spurious
+  errors in one run. Opening read-only counts as a violation too, since it means
+  the redirection was bypassed.
 
   With production out of the way the suite can also run in parallel:
   `pytest -n 8` takes about 90 seconds against roughly 400 serially, provided
