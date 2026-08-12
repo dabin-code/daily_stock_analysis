@@ -532,7 +532,8 @@ class BottomDivergenceV2E2EReplayTestCase(unittest.TestCase):
         artifacts = {}
 
         for trade_date, expectation in expected.items():
-            with self.subTest(trade_date=trade_date):
+            # date 与枚举一样过不了 xdist 的报告序列化通道，并行下会整条变红。
+            with self.subTest(trade_date=str(trade_date)):
                 artifact = self._run_full_chain(trade_date)
                 artifacts[trade_date] = artifact
                 stage, maturity, structurally_selected = expectation

@@ -754,7 +754,9 @@ class TestTradePlanBuilder(unittest.TestCase):
             SetupType.LIMITUP_STRUCTURE,
         ]
         for st in actionable_setups:
-            with self.subTest(setup_type=st):
+            # 传枚举本身会让 pytest-xdist 的报告序列化失败（execnet 只认内置类型），
+            # 于是整条用例在并行下必红。取值不影响诊断信息。
+            with self.subTest(setup_type=st.value):
                 factor_snapshot = self.base_fs
                 if st == SetupType.BOTTOM_DIVERGENCE_LAYERED_ENTRY:
                     factor_snapshot = {

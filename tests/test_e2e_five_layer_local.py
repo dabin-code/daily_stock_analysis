@@ -26,12 +26,18 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import pytest
 
 # ──────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "stock_analysis.db"
+
+# 本模块的夹具直接用 sqlite3 读 DB_PATH，而被测引擎走 DatabaseManager，
+# 即 DATABASE_PATH。两者必须指向同一个库，否则夹具读到真实数据、
+# 引擎读到空库，用例会以「没有候选」的形式假失败。
+pytestmark = pytest.mark.real_database
 
 
 def get_latest_factor_date() -> str:

@@ -282,6 +282,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Fixed the test suite writing to the production database. Any test that went
+  through `DatabaseManager` without setting `DATABASE_PATH` itself opened
+  `data/stock_analysis.db` directly, and roughly seventy `tearDown` bodies
+  ended with `os.environ.pop("DATABASE_PATH")`, which restores the variable to
+  *unset* rather than to a safe default — so every test that ran afterwards
+  silently fell back to production too. On 2026-08-12 two test processes ran
+  against that file concurrently and corrupted it: page one was overwritten
+  with an unrelated b-tree page, leaving a 1.3 GB file that SQLite refused to
+  open at all, and it had to be restored from the previous day's backup.
+
+  `tests/conftest.py` now points `DATABASE_PATH` at a per-session temporary
+  database in `pytest_configure` (before `Config` caches anything), restores
+  that default after each test so the `pop` calls no longer leak, and fails any
+  test that changes the production file's mtime. Modules that genuinely need
+  real data — currently only `tests/test_e2e_five_layer_local.py`, whose
+  fixtures read the real database directly with `sqlite3` — opt back in with
+  `@pytest.mark.real_database`. `tests/test_production_db_guard.py` keeps the
+  guard honest by provoking a production write in a subprocess and asserting it
+  is caught. Run the offline gate as
+  `pytest -m "not network and not real_database"` plus a separate
+  `pytest -m real_database` pass.
+
+  With production out of the way the suite can also run in parallel:
+  `pytest -n 8` takes about 90 seconds against roughly 400 serially, provided
+  `pytest-xdist` is installed. Each xdist worker gets its own database — a
+  worker inherits the parent's environment, so without that they would all
+  contend for one file and collide during `create_all`. Three `subTest` calls
+  had to stop passing enum and `date` objects as parameters, which xdist cannot
+  serialise across its reporting channel.
+
 - Fixed the stop-loss gate that silently capped every non-v2 setup at `focus`.
   The five-layer pipeline decided whether a candidate had a stop by reading
   `factor_snapshot['has_stop_loss']`, a key no production code ever wrote, so

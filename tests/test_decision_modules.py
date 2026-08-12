@@ -522,7 +522,8 @@ class TradeStageRegressionTestCase(unittest.TestCase):
             ThemePosition.NON_THEME,
         ]
         for tp in non_main_themes:
-            with self.subTest(theme_position=tp):
+            # 同上：枚举无法被 xdist 的报告通道序列化，并行下会整条变红。
+            with self.subTest(theme_position=tp.value):
                 result = self.judge.judge(
                     env=_make_env(MarketRegime.AGGRESSIVE),
                     setup_type=SetupType.TREND_BREAKOUT,
