@@ -5,6 +5,8 @@ import unittest
 from datetime import date
 from types import SimpleNamespace
 
+from sqlalchemy import text
+
 from src.config import Config
 from src.search_service import SearchResponse
 from src.search_service import SearchResult
@@ -98,6 +100,60 @@ class ScreeningStorageTestCase(unittest.TestCase):
         self.assertEqual(candidates[0]["rule_hits"], ["trend_aligned", "volume_expanding"])
         self.assertEqual(candidates[0]["factor_snapshot"]["ma20"], 1480.0)
         self.assertEqual(candidates[0]["ai_query_id"], "query-1")
+
+    def test_raw_rule_score_is_persisted_and_read_back(self) -> None:
+        """入库映射漏掉 raw_rule_score 时，单测会绿但库里全 NULL。
+
+        五层优先级排序把 rule_score 原地覆盖成复合优先级分，
+        raw_rule_score 是唯一还能取到原始质量分的地方；
+        Rank IC 这类连续量分析全靠它。
+        """
+        run_id = self.db.create_screening_run(
+            trade_date=date(2026, 3, 13),
+            market="cn",
+            config_snapshot={"candidate_limit": 30},
+        )
+        saved = self.db.save_screening_candidates(
+            run_id=run_id,
+            candidates=[
+                {
+                    "code": "600519",
+                    "name": "贵州茅台",
+                    "rank": 1,
+                    "rule_score": 26.8,
+                    "raw_rule_score": 80.0,
+                    "rule_hits": ["trend_aligned"],
+                    "factor_snapshot": {"close": 1500.0},
+                },
+                {
+                    "code": "000001",
+                    "name": "平安银行",
+                    "rank": 2,
+                    "rule_score": 15.2,
+                    "rule_hits": [],
+                    "factor_snapshot": {},
+                },
+            ],
+        )
+        self.assertEqual(saved, 2)
+
+        # 必须直查列：to_dict 会把 candidate_decision_json 覆盖到行字段之上，
+        # 而该 JSON 是整个入参的副本，读回来的值可能根本没经过这一列。
+        # Rank IC 要的是可 SQL 聚合的列，不是 JSON blob 里的一个键。
+        with self.db.get_session() as session:
+            rows = session.execute(
+                text(
+                    "SELECT code, rule_score, raw_rule_score "
+                    "FROM screening_candidates WHERE run_id = :run_id"
+                ),
+                {"run_id": run_id},
+            ).all()
+        by_code = {row[0]: row for row in rows}
+        self.assertAlmostEqual(by_code["600519"][2], 80.0, places=4)
+        # 复合优先级分必须原样保留，两个数不能被写成同一个。
+        self.assertAlmostEqual(by_code["600519"][1], 26.8, places=4)
+        # 上游没给原始分时不编造，留 NULL 让下游按「未知」剔除，而不是当 0 参与秩相关。
+        self.assertIsNone(by_code["000001"][2])
 
     def test_find_latest_screening_run_ignores_runtime_ingest_context_in_identity(self) -> None:
         run_id = self.db.create_screening_run(
