@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 from src.services.fast_backfill_service import FastBackfillService
 
@@ -22,6 +23,8 @@ def _init_stock_daily(db_path: Path) -> None:
                 volume REAL,
                 amount REAL,
                 pct_chg REAL,
+                pre_close REAL,
+                adj_convention TEXT,
                 data_source TEXT,
                 created_at TEXT,
                 updated_at TEXT,
@@ -55,6 +58,7 @@ class _FakeTushareApi:
                     "high": 11,
                     "low": 9,
                     "close": 10.5,
+                    "pre_close": 10.2,
                     "vol": 1000,
                     "amount": 2000,
                     "pct_chg": 1.5,
@@ -66,6 +70,7 @@ class _FakeTushareApi:
                     "high": 21,
                     "low": 19,
                     "close": 20.5,
+                    "pre_close": 20.1,
                     "vol": 3000,
                     "amount": 4000,
                     "pct_chg": 2.5,
@@ -203,6 +208,44 @@ def test_fast_backfill_converts_tushare_volume_and_amount_units(tmp_path):
 
     assert volume == 1000 * 100
     assert amount == 2000 * 1000
+
+
+def test_fast_backfill_rewrite_does_not_wipe_pre_close_and_convention(tmp_path):
+    """重写同一 (code, date) 不能把 pre_close / adj_convention 清成 NULL。
+
+    本服务用 ``INSERT OR REPLACE`` + 显式列清单落库，语义是「删行重插」，清单外的
+    列会被清空。该路径由 Web 数据健康页与 /api/v1/screening/backfill-to-date 触发，
+    一旦两列掉出清单，一次回填就会抹掉整段区间复权重建唯一的免费依据。
+    """
+    db_path = tmp_path / "stock_analysis.db"
+    _init_stock_daily(db_path)
+    api = _FakeTushareApi()
+    service = FastBackfillService(
+        db_path=str(db_path),
+        tushare_api=api,
+        governance_service=SimpleNamespace(
+            run_daily_governance=lambda **kwargs: {
+                "run_result": "succeeded",
+                "pass_status": "passed",
+            }
+        ),
+        min_full_count=2,
+        sleep=lambda _seconds: None,
+    )
+
+    service.backfill_to_trade_date(date(2026, 5, 11))
+    # 第二次回填走同一条写入语句重写同一 (code, date)
+    service._save_day_data(api.daily("20260511"))
+
+    with sqlite3.connect(db_path) as conn:
+        pre_close, adj_convention = conn.execute(
+            "SELECT pre_close, adj_convention FROM stock_daily "
+            "WHERE code='000001' AND date='2026-05-11'"
+        ).fetchone()
+
+    assert pre_close == pytest.approx(10.2)
+    # 数据来自 api.daily()，不经过 TushareFetcher，永远是不复权价
+    assert adj_convention == "raw"
 
 
 def test_fast_backfill_to_trade_date_rejects_future_target(tmp_path):

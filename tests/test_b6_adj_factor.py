@@ -214,14 +214,36 @@ class TestSaveDailyDataPreCloseAndConvention(unittest.TestCase):
         self.assertEqual(bar.adj_convention, "unknown")
         self.assertAlmostEqual(bar.pre_close, 99.5, places=4)
 
-    def test_convention_supplied_by_fetcher_is_persisted_verbatim(self):
-        self.db.save_daily_data(
-            self._row(pre_close=99.5, adj_convention="raw"),
-            code="600519",
-            data_source="test",
-        )
+    def test_convention_supplied_by_fetcher_is_persisted_when_in_enum(self):
+        """取数路径声明的口径只要落在枚举内就原样保留。"""
+        for convention in ("raw", "qfq", "unknown"):
+            with self.subTest(convention=convention):
+                self.db.save_daily_data(
+                    self._row(pre_close=99.5, adj_convention=convention),
+                    code=f"6005{convention}",
+                    data_source="test",
+                )
+                bar = self._query_one(f"6005{convention}", date(2024, 1, 16))
+                self.assertEqual(bar.adj_convention, convention)
+
+    def test_convention_outside_enum_is_downgraded_to_unknown_with_warning(self):
+        """枚举外的口径（如 unadjusted 这类近义词）必须降级并告警。
+
+        原样落库会在后续复权重建阶段被当作 unverifiable 静默排除，整批数据失效
+        却没有任何信号。
+        """
+        with self.assertLogs("src.storage", level="WARNING") as captured:
+            self.db.save_daily_data(
+                self._row(pre_close=99.5, adj_convention="unadjusted"),
+                code="600519",
+                data_source="test",
+            )
         bar = self._query_one("600519", date(2024, 1, 16))
-        self.assertEqual(bar.adj_convention, "raw")
+        self.assertEqual(bar.adj_convention, "unknown")
+        self.assertTrue(
+            any("unadjusted" in message for message in captured.output),
+            f"warning must name the offending value, got {captured.output}",
+        )
 
     def test_missing_pre_close_is_stored_as_null_not_zero(self):
         """落 0.0 会让 ratio = pre_close / close 静默得到 0，必须是 NULL。"""
@@ -229,12 +251,37 @@ class TestSaveDailyDataPreCloseAndConvention(unittest.TestCase):
         bar = self._query_one("600519", date(2024, 1, 16))
         self.assertIsNone(bar.pre_close)
 
-    def test_nan_pre_close_is_normalized_to_null(self):
+    def test_insert_with_nan_pre_close_ends_up_null(self):
+        """新增分支带 NaN 时最终必须是 NULL。
+
+        注意这条用例不足以守住 save_daily_data 里的 NaN 归一化：sqlite3 自己就会
+        把 NaN 写成 NULL，删掉归一化它依然通过。真正需要守的是下面的更新分支。
+        """
         self.db.save_daily_data(
             self._row(pre_close=float("nan")), code="600519", data_source="test"
         )
         bar = self._query_one("600519", date(2024, 1, 16))
         self.assertIsNone(bar.pre_close)
+
+    def test_update_with_nan_pre_close_preserves_existing_value(self):
+        """NaN 不是 None，会通过更新分支的 `is not None` 判断。
+
+        不在写入前归一成 None，一次带 NaN 的重写就会把已落库的 pre_close 覆盖成
+        NULL，也就是擦掉复权重建唯一的免费依据。
+        """
+        self.db.save_daily_data(
+            self._row(pre_close=99.5, adj_convention="raw"),
+            code="600519",
+            data_source="test",
+        )
+        self.db.save_daily_data(
+            self._row(pre_close=float("nan"), close=101.0),
+            code="600519",
+            data_source="test",
+        )
+        bar = self._query_one("600519", date(2024, 1, 16))
+        self.assertIsNotNone(bar.pre_close)
+        self.assertAlmostEqual(bar.pre_close, 99.5, places=4)
 
     def test_update_without_pre_close_preserves_existing_value(self):
         """已落库的 pre_close 不能被一次没带该字段的重写擦掉。

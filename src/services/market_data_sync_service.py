@@ -362,6 +362,12 @@ class MarketDataSyncService:
                         # 因此 pre_close / adj_convention 必须留在清单里，否则后续
                         # 每日同步会静默擦掉它们。
                         #
+                        # 注意：清单目前仍然不含 updated_at / ma5 / ma10 / ma20 /
+                        # volume_ratio / adj_factor / adj_anchor_date /
+                        # adj_factor_source，这些列在每次重写时依然会被清成 NULL。
+                        # 这是本函数既有的行为（其中均线、量比属于可重算的派生值），
+                        # 不要误以为清单已经补齐。
+                        #
                         # adj_convention 在这条路上可以硬编码 raw：本函数直接调
                         # api.daily()（见上方），不经过 data_provider/tushare_fetcher.py，
                         # _apply_qfq_adjustment 与 TUSHARE_QFQ_ENABLED 都不在链路上，

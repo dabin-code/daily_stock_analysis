@@ -178,11 +178,21 @@ class FastBackfillService:
                     if len(trade_date_value) == 8
                     else trade_date_value
                 )
+                # INSERT OR REPLACE 的语义是「删行重插」而非字段级更新，列清单外的
+                # 列会在重写同一 (code, date) 时被清空。本服务由 Web 数据健康页与
+                # /api/v1/screening/backfill-to-date 触发，一次回填就会把整段区间的
+                # pre_close / adj_convention 抹成 NULL，因此两列必须留在清单里。
+                #
+                # adj_convention 在这条路上可以硬编码 raw：数据来自 _fetch_daily_all()
+                # → api.daily()，不经过 data_provider/tushare_fetcher.py，
+                # _apply_qfq_adjustment 与 TUSHARE_QFQ_ENABLED 都不在链路上，返回的
+                # 永远是不复权价。
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO stock_daily
-                    (code, date, open, high, low, close, volume, amount, pct_chg, data_source, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (code, date, open, high, low, close, volume, amount, pct_chg,
+                     pre_close, adj_convention, data_source, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         code,
@@ -194,6 +204,8 @@ class FastBackfillService:
                         lots_to_shares(row.get("vol")),
                         thousand_yuan_to_yuan(row.get("amount")),
                         row.get("pct_chg"),
+                        row.get("pre_close"),
+                        "raw",
                         "TushareFetcher",
                         now,
                         now,

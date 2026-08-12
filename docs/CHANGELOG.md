@@ -118,7 +118,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Tushare returns unadjusted prices while Efinance appears to return
   front-adjusted ones — so an unlabelled mix produces wrong results exactly at
   the source boundary. Both columns are nullable and additive; existing clients
-  are unaffected, and nothing populates the columns yet.
+  are unaffected, and no reader consumes them yet — the write paths that
+  populate them are described under **Changed** below.
   On SQLite the migration **applies automatically at startup**, so a database
   the service opens needs no operator action. The standalone script
   `python scripts/migrate_stock_daily_pre_close.py --db <path>` (idempotent,
@@ -129,8 +130,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   — `pre_close` has no defensible default and legacy rows' convention cannot be
   determined after the fact, so existing rows stay NULL and are filled by a
   later re-fetch stage. Note that on a large database the index build rewrites
-  the file and grows it; measure on a copy first. Rollback: revert this commit;
-  the two columns may be left in place, since nothing reads or writes them yet.
+  the file and grows it; measure on a copy first. Rollback: revert this commit,
+  but note that the write paths described under **Changed** populate these
+  columns, so they must be reverted together — dropping the columns while those
+  paths still name them would break every daily write. The columns themselves
+  may safely be left in place: they are nullable and no reader consumes them.
 - Added the `stock_daily_staging` table, a staging area for the historical daily-bar
   backfill. The backfill must not write straight into `stock_daily`, because doing so
   would overwrite the existing 2024-2026 rows — and those rows are themselves the
@@ -158,24 +162,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - The daily incremental sync paths now populate `stock_daily.pre_close` and
-  `stock_daily.adj_convention` (superseding the "nothing populates the columns
-  yet" note above). The incremental path matters most: without `pre_close` the
-  incremental segment has no free way to reconstruct adjustment factors once
-  the paid Tushare quota expires, so a backfill-only fix would leave that
-  segment permanently NULL and unable to rebuild its own factors.
-  `MarketDataSyncService._try_bulk_sync` and `scripts/fast_backfill.py` record
-  `adj_convention='raw'`: both call Tushare's `daily()` endpoint directly rather
-  than going through `TushareFetcher`, so `_apply_qfq_adjustment` and
-  `TUSHARE_QFQ_ENABLED` are not on those paths and the prices are always
-  unadjusted. Both statements also had to add the two columns to their
-  `INSERT OR REPLACE` column lists — that statement deletes and reinserts the
-  row, so any unlisted column is reset to NULL on every rewrite of the same
-  `(code, date)`.
+  `stock_daily.adj_convention`. The incremental path matters most: without
+  `pre_close` the incremental segment has no free way to reconstruct adjustment
+  factors once the paid Tushare quota expires, so a backfill-only fix would
+  leave that segment permanently NULL and unable to rebuild its own factors.
+  `MarketDataSyncService._try_bulk_sync`, `FastBackfillService._save_day_data`
+  (the service behind `POST /api/v1/screening/backfill-to-date` and the web
+  data-health page's "backfill to date" action) and `scripts/fast_backfill.py`
+  record `adj_convention='raw'`: all three call Tushare's `daily()` endpoint
+  directly rather than going through `TushareFetcher`, so
+  `_apply_qfq_adjustment` and `TUSHARE_QFQ_ENABLED` are not on those paths and
+  the prices are always unadjusted. All three statements also had to add the two
+  columns to their `INSERT OR REPLACE` column lists — that statement deletes and
+  reinserts the row, so any unlisted column is reset to NULL on every rewrite of
+  the same `(code, date)`.
   `DatabaseManager.save_daily_data`, the per-stock fallback path, records
-  `adj_convention='unknown'` unless the fetcher declares a value, because its
-  data may come from either efinance (apparently front-adjusted) or Tushare
-  (front-adjusted when the flag is on) and the convention is not knowable from
-  the source name; guessing would be misreporting. A later adjustment-rebuild
+  `adj_convention='unknown'` whenever the incoming row does not declare a
+  convention — which today is always the case: `STANDARD_COLUMNS` in
+  `data_provider/base.py` lists neither `pre_close` nor `adj_convention`, and
+  every fetcher filters its frame to `['code'] + STANDARD_COLUMNS`, so
+  `_normalize_data` strips both fields before `save_daily_data` ever sees them.
+  The present-day outcome on this path is therefore always `pre_close=NULL` and
+  `adj_convention='unknown'`; widening `STANDARD_COLUMNS` across the providers
+  is a separate follow-up. The convention is deliberately not inferred from the
+  data-source name, because the data may come from either efinance (apparently
+  front-adjusted) or Tushare (front-adjusted when the flag is on); guessing
+  would be misreporting. A declared convention is honoured only if it is one of
+  `raw` / `qfq` / `unknown`; any other value is logged as a warning and stored
+  as `unknown`, so a plausible synonym such as `unadjusted` cannot silently slip
+  through and invalidate a whole batch downstream. A later adjustment-rebuild
   stage treats any non-`raw` row as unverifiable and excludes it, which is the
   intended outcome for this path. A missing `pre_close` is stored as NULL, never
   `0.0`, so it cannot silently produce a ratio of zero. On update, that function

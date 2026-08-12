@@ -55,6 +55,10 @@ from src.config import get_config
 
 logger = logging.getLogger(__name__)
 
+# stock_daily.adj_convention 的合法取值（见 spec 7.1）。清单外的值会被后续
+# 复权重建阶段当作 unverifiable 静默丢弃，所以落库前必须拦下来并告警。
+VALID_ADJ_CONVENTIONS = frozenset({'raw', 'qfq', 'unknown'})
+
 # SQLAlchemy ORM 基类
 Base = declarative_base()
 
@@ -4089,6 +4093,8 @@ class DatabaseManager:
 
                     # pre_close 是免费重建复权因子的唯一依据；缺失必须落 NULL，
                     # 落 0.0 会让 ratio = pre_close / close 静默得到 0。
+                    # NaN 必须在这里归一成 None：NaN 不是 None，会通过下面更新分支的
+                    # `if pre_close is not None` 判断，把已落库的值覆盖成 NULL。
                     pre_close = row.get('pre_close')
                     if pre_close is not None and pd.isna(pre_close):
                         pre_close = None
@@ -4097,6 +4103,15 @@ class DatabaseManager:
                     # 猜测等于谎报，因此未声明一律落 unknown。
                     adj_convention = row.get('adj_convention')
                     if not adj_convention or pd.isna(adj_convention):
+                        adj_convention = 'unknown'
+                    elif adj_convention not in VALID_ADJ_CONVENTIONS:
+                        # 枚举外的值（例如 unadjusted 这类近义词）原样落库，会在
+                        # 后续复权重建阶段被当作 unverifiable 静默排除，整批数据
+                        # 失效却没有任何信号。降级成 unknown 并告警。
+                        logger.warning(
+                            f"{code} adj_convention 取值 {adj_convention!r} 不在 "
+                            f"{sorted(VALID_ADJ_CONVENTIONS)} 内，降级为 unknown"
+                        )
                         adj_convention = 'unknown'
 
                     if existing:
