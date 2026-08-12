@@ -76,6 +76,11 @@ class SectorHeatEngine:
                     "has_code_column": bool(snapshot_df is not None and "code" in snapshot_df.columns),
                 },
             )
+            logger.warning(
+                "L2 板块热度快照不可用（snapshot_empty=%s，has_code_column=%s），本日 L2 整层降级为空结果",
+                bool(snapshot_df is None or getattr(snapshot_df, "empty", True)),
+                bool(snapshot_df is not None and "code" in snapshot_df.columns),
+            )
             return []
 
         boards = self._db.list_active_boards_with_member_count(
@@ -92,6 +97,11 @@ class SectorHeatEngine:
                     "min_sector_stock_count": MIN_SECTOR_STOCK_COUNT,
                     "snapshot_rows": int(len(snapshot_df)),
                 },
+            )
+            logger.warning(
+                "L2 板块热度无可用板块（min_member_count=%s，快照 %s 行），本日 L2 整层降级为空结果",
+                MIN_SECTOR_STOCK_COUNT,
+                len(snapshot_df),
             )
             return []
 
