@@ -118,7 +118,13 @@ class CandidateDecisionGoldenCase(unittest.TestCase):
         self.assertIn("MA20=24.80", plan.execution_note)
         self.assertIn("MA100=22.00", plan.execution_note)
 
-    def test_pipeline_golden_case_builds_complete_candidate_decision(self) -> None:
+    def _run_pipeline_golden_case(self, *, is_limit_up: bool):
+        """跑通完整五层链路并返回 (payload, result)。
+
+        is_limit_up 单独参数化：它是 CandidatePoolClassifier 进 leader_pool
+        的准入条件，正例与反例只差这一个字段，其余构造必须完全一致，
+        否则证不出档位差异来自涨停与否。
+        """
         snapshot_df = pd.DataFrame([
             {
                 "code": "600519",
@@ -151,6 +157,7 @@ class CandidateDecisionGoldenCase(unittest.TestCase):
                     "leader_score": 85.0,
                     "extreme_strength_score": 62.0,
                     "has_stop_loss": True,
+                    "is_limit_up": is_limit_up,
                 },
                 matched_strategies=["ma100_60min_combined"],
                 strategy_scores={"ma100_60min_combined": 91.0},
@@ -209,7 +216,10 @@ class CandidateDecisionGoldenCase(unittest.TestCase):
             )
 
         decision = CandidateDecisionBuilder.build_initial(result.candidates)[0]
-        payload = decision.to_payload()
+        return decision.to_payload(), result
+
+    def test_pipeline_golden_case_builds_complete_candidate_decision(self) -> None:
+        payload, result = self._run_pipeline_golden_case(is_limit_up=True)
 
         self.assertEqual(payload["market_regime"], "balanced")
         self.assertTrue(payload["environment_ok"])
@@ -221,4 +231,15 @@ class CandidateDecisionGoldenCase(unittest.TestCase):
         self.assertEqual(payload["strategy_scores"], {"ma100_60min_combined": 91.0})
         self.assertEqual(payload["trade_plan"]["execution_note"], "围绕趋势延续与关键均线支撑执行，现价100.00，MA20=94.00，MA100=88.00")
         self.assertEqual(result.decision_context["market_environment"]["index_price"], 3200.0)
+
+    def test_non_limit_up_main_theme_stays_in_focus_list(self) -> None:
+        """反例：主线题材但未涨停，只能到 focus_list。
+
+        这条钉住的是 CandidatePoolClassifier 的核心准入规则。
+        没有它，分类器把涨停条件删掉也不会有任何测试变红。
+        """
+        payload, _ = self._run_pipeline_golden_case(is_limit_up=False)
+
+        self.assertEqual(payload["theme_position"], "main_theme")
+        self.assertEqual(payload["candidate_pool_level"], "focus_list")
 
