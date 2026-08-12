@@ -56,6 +56,18 @@ class SchemaTestCase(unittest.TestCase):
         self.assertIn("pre_close", StockDaily.__table__.columns)
         self.assertIn("adj_convention", StockDaily.__table__.columns)
 
+    def test_staging_table_exists_and_mirrors_stock_daily(self) -> None:
+        staging = _columns(self._db_path, "stock_daily_staging")
+        production = _columns(self._db_path, "stock_daily")
+
+        self.assertTrue(staging, "stock_daily_staging table missing")
+        # staging 必须是生产表的超集：提升时逐列对应，缺列会让提升语句写不出来
+        missing = production - staging
+        self.assertEqual(missing, set(), f"staging missing production columns: {missing}")
+        # staging 独有的批次追踪列
+        self.assertIn("batch_id", staging)
+        self.assertIn("convention_version", staging)
+
 
 class LegacyStockDailyMigrationTestCase(unittest.TestCase):
     """存量库走的是迁移路径，不是 create_all，必须单独覆盖。

@@ -169,6 +169,57 @@ class StockDaily(Base):
         }
 
 
+class StockDailyStaging(Base):
+    """日线回补暂存区。
+
+    阶段 C 的回补只写这里，生产表 stock_daily 由阶段 C2 经闸门原子提升。
+    这样做的原因：回补要覆写 2024-2026 的存量，而这批存量正是判断
+    数据源口径差异的证据本身，直接 INSERT OR REPLACE 会把证据抹掉。
+    """
+    __tablename__ = 'stock_daily_staging'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    date = Column(Date, nullable=False, index=True)
+
+    open = Column(Float)
+    high = Column(Float)
+    low = Column(Float)
+    close = Column(Float)
+
+    volume = Column(Float)  # 成交量（股）
+    amount = Column(Float)  # 成交额（元）
+    pct_chg = Column(Float)  # 涨跌幅（%）
+
+    ma5 = Column(Float)
+    ma10 = Column(Float)
+    ma20 = Column(Float)
+    volume_ratio = Column(Float)  # 量比
+
+    data_source = Column(String(50))
+
+    # 与 stock_daily 同义，语义见 StockDaily 上的说明
+    adj_factor = Column(Float, nullable=True)
+    adj_anchor_date = Column(Date, nullable=True)
+    adj_factor_source = Column(String(32), nullable=True, index=True)
+    pre_close = Column(Float, nullable=True)
+    adj_convention = Column(String(16), nullable=True, index=True)
+
+    # 回补批次，用于断点续跑与按批回滚
+    batch_id = Column(String(64), nullable=True, index=True)
+    # 写入时的口径版本，供 _is_date_complete 判定「该日是否已按当前口径写过」
+    convention_version = Column(String(32), nullable=True, index=True)
+
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'date', name='uix_staging_code_date'),
+        Index('ix_staging_code_date', 'code', 'date'),
+        Index('ix_staging_date_version', 'date', 'convention_version'),
+    )
+
+
 class NewsIntel(Base):
     """
     新闻情报数据模型

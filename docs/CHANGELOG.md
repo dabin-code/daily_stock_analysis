@@ -131,6 +131,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   later re-fetch stage. Note that on a large database the index build rewrites
   the file and grows it; measure on a copy first. Rollback: revert this commit;
   the two columns may be left in place, since nothing reads or writes them yet.
+- Added the `stock_daily_staging` table, a staging area for the historical daily-bar
+  backfill. The backfill must not write straight into `stock_daily`, because doing so
+  would overwrite the existing 2024-2026 rows — and those rows are themselves the
+  evidence used to determine how the sources' price conventions differ, so an
+  `INSERT OR REPLACE` into production would destroy that evidence before it could be
+  examined. Rows therefore land in staging first and a later gated step promotes them
+  into production; the table mirrors every `stock_daily` column (so the promotion can
+  be written column by column) and adds `batch_id` for resumable, per-batch-revertible
+  runs plus `convention_version` to record which price convention a row was written
+  under. The table is created automatically by `create_all` the next time the service
+  opens the database, so it needs **no operator action and no migration script**; it
+  arrives empty and nothing reads or writes it yet. Rollback: revert this commit and
+  optionally `DROP TABLE stock_daily_staging`; leaving the empty table in place is
+  harmless.
 
 ### Changed
 
