@@ -357,13 +357,23 @@ class MarketDataSyncService:
                         td = str(row.get("trade_date", ""))
                         date_str = f"{td[:4]}-{td[4:6]}-{td[6:8]}" if len(td) == 8 else td
 
+                        # INSERT OR REPLACE 的语义是「删行重插」而非字段级更新，
+                        # 列清单里没有的列会在每次重写同一 (code, date) 时被清空。
+                        # 因此 pre_close / adj_convention 必须留在清单里，否则后续
+                        # 每日同步会静默擦掉它们。
+                        #
+                        # adj_convention 在这条路上可以硬编码 raw：本函数直接调
+                        # api.daily()（见上方），不经过 data_provider/tushare_fetcher.py，
+                        # _apply_qfq_adjustment 与 TUSHARE_QFQ_ENABLED 都不在链路上，
+                        # 返回的永远是不复权价。这个结论只对本函数成立，不要外推到
+                        # 走 TushareFetcher / 多数据源的写入路径。
                         conn.execute(
                             text(
                                 "INSERT OR REPLACE INTO stock_daily "
                                 "(code, date, open, high, low, close, volume, amount, pct_chg, "
-                                "data_source, created_at) "
+                                "pre_close, adj_convention, data_source, created_at) "
                                 "VALUES (:code, :date, :open, :high, :low, :close, :volume, :amount, :pct_chg, "
-                                ":data_source, :created_at)"
+                                ":pre_close, :adj_convention, :data_source, :created_at)"
                             ),
                             {
                                 "code": code, "date": date_str,
@@ -372,6 +382,8 @@ class MarketDataSyncService:
                                 "volume": lots_to_shares(row.get("vol")),
                                 "amount": thousand_yuan_to_yuan(row.get("amount")),
                                 "pct_chg": row.get("pct_chg"),
+                                "pre_close": row.get("pre_close"),
+                                "adj_convention": "raw",
                                 "data_source": "TushareFetcher(bulk)",
                                 "created_at": now_str,
                             },

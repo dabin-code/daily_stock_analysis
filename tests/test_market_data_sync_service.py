@@ -833,5 +833,94 @@ class BulkSyncUnitConversionTestCase(unittest.TestCase):
         self.assertAlmostEqual(amount / (volume * 12.1), 1.0, places=2)
 
 
+class BulkSyncAdjustmentMetadataTestCase(unittest.TestCase):
+    """_try_bulk_sync 必须落 pre_close / adj_convention，否则增量段无法自持。
+
+    INSERT OR REPLACE 带显式列清单的语义是「删行重插」，列清单里没有的列会在
+    每次重写同一 (code, date) 时被清空。所以这两列不是「顺手补」，而是不补就会
+    被后续每日同步反复擦掉。
+    """
+
+    def setUp(self) -> None:
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self._db_path = os.path.join(self._temp_dir.name, "test_bulk_adj_meta.db")
+        os.environ["DATABASE_PATH"] = self._db_path
+        os.environ["TUSHARE_TOKEN"] = "test-token"
+
+        Config.reset_instance()
+        DatabaseManager.reset_instance()
+        self.db = DatabaseManager.get_instance()
+
+    def tearDown(self) -> None:
+        DatabaseManager.reset_instance()
+        Config.reset_instance()
+        os.environ.pop("DATABASE_PATH", None)
+        os.environ.pop("TUSHARE_TOKEN", None)
+        self._temp_dir.cleanup()
+
+    def _run_bulk_sync(self, daily_df: pd.DataFrame, trade_date: date):
+        fake_tushare = SimpleNamespace(
+            set_token=lambda _token: None,
+            pro_api=lambda: SimpleNamespace(daily=lambda trade_date: daily_df),
+        )
+        service = MarketDataSyncService(db_manager=self.db, fetcher_manager=None)
+        with patch.dict(sys.modules, {"tushare": fake_tushare}):
+            return service._try_bulk_sync(trade_date, {"000001"})
+
+    @staticmethod
+    def _daily_frame(trade_date_str: str) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": trade_date_str,
+                    "open": 12.1,
+                    "high": 12.4,
+                    "low": 12.0,
+                    "close": 12.3,
+                    "pre_close": 12.0,
+                    "vol": 2000.0,
+                    "amount": 2_460.0,
+                    "pct_chg": 2.5,
+                }
+            ]
+        )
+
+    def _read_row(self, code: str, date_str: str):
+        conn = sqlite3.connect(self._db_path)
+        try:
+            return conn.execute(
+                "SELECT pre_close, adj_convention FROM stock_daily "
+                "WHERE code = ? AND date = ?",
+                (code, date_str),
+            ).fetchone()
+        finally:
+            conn.close()
+
+    def test_bulk_sync_persists_pre_close_and_convention(self) -> None:
+        """pre_close 是免费重建复权因子的唯一依据，必须落库。"""
+        trade_date = date(2026, 5, 8)
+        synced, _universe = self._run_bulk_sync(self._daily_frame("20260508"), trade_date)
+        self.assertEqual(synced, 1)
+
+        row = self._read_row("000001", "2026-05-08")
+        self.assertIsNotNone(row)
+        self.assertAlmostEqual(row[0], 12.0, places=4)
+        # bulk 路径直接调 api.daily()，不经过 TushareFetcher._apply_qfq_adjustment，
+        # 因此永远是不复权价，raw 是可以硬编码的确定值。
+        self.assertEqual(row[1], "raw")
+
+    def test_bulk_sync_rewrite_does_not_wipe_pre_close(self) -> None:
+        """同一 (code, date) 被再次 bulk 同步后，两列不能被 INSERT OR REPLACE 清空。"""
+        trade_date = date(2026, 5, 8)
+        self._run_bulk_sync(self._daily_frame("20260508"), trade_date)
+        self._run_bulk_sync(self._daily_frame("20260508"), trade_date)
+
+        row = self._read_row("000001", "2026-05-08")
+        self.assertIsNotNone(row)
+        self.assertAlmostEqual(row[0], 12.0, places=4)
+        self.assertEqual(row[1], "raw")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -157,6 +157,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- The daily incremental sync paths now populate `stock_daily.pre_close` and
+  `stock_daily.adj_convention` (superseding the "nothing populates the columns
+  yet" note above). The incremental path matters most: without `pre_close` the
+  incremental segment has no free way to reconstruct adjustment factors once
+  the paid Tushare quota expires, so a backfill-only fix would leave that
+  segment permanently NULL and unable to rebuild its own factors.
+  `MarketDataSyncService._try_bulk_sync` and `scripts/fast_backfill.py` record
+  `adj_convention='raw'`: both call Tushare's `daily()` endpoint directly rather
+  than going through `TushareFetcher`, so `_apply_qfq_adjustment` and
+  `TUSHARE_QFQ_ENABLED` are not on those paths and the prices are always
+  unadjusted. Both statements also had to add the two columns to their
+  `INSERT OR REPLACE` column lists — that statement deletes and reinserts the
+  row, so any unlisted column is reset to NULL on every rewrite of the same
+  `(code, date)`.
+  `DatabaseManager.save_daily_data`, the per-stock fallback path, records
+  `adj_convention='unknown'` unless the fetcher declares a value, because its
+  data may come from either efinance (apparently front-adjusted) or Tushare
+  (front-adjusted when the flag is on) and the convention is not knowable from
+  the source name; guessing would be misreporting. A later adjustment-rebuild
+  stage treats any non-`raw` row as unverifiable and excludes it, which is the
+  intended outcome for this path. A missing `pre_close` is stored as NULL, never
+  `0.0`, so it cannot silently produce a ratio of zero. On update, that function
+  refreshes `adj_convention` (the label must follow the prices it describes,
+  which the update overwrites) but keeps an existing `pre_close` when the new
+  fetch does not supply one, so a forced re-sync or K-line repair cannot erase a
+  value the bulk path wrote. No columns were added and no reader consumes the
+  columns yet, so existing clients are unaffected. Rollback: revert this commit;
+  rows written in the meantime keep their values harmlessly.
 - Preserved legacy v1 detector, factors, strategy, API, and Web rendering
   unchanged while exposing v2 through additive `bottom_divergence_v2_*`
   fields and the existing screening API.

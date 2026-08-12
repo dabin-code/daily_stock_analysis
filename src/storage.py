@@ -4087,6 +4087,18 @@ class DatabaseManager:
                             adj_anchor_date, 'date'
                         ) else adj_anchor_date
 
+                    # pre_close 是免费重建复权因子的唯一依据；缺失必须落 NULL，
+                    # 落 0.0 会让 ratio = pre_close / close 静默得到 0。
+                    pre_close = row.get('pre_close')
+                    if pre_close is not None and pd.isna(pre_close):
+                        pre_close = None
+                    # 口径必须由取数路径显式声明。这条路的数据源可能是 efinance
+                    # （疑似前复权）或 Tushare（开关打开时为 qfq），按数据源名字
+                    # 猜测等于谎报，因此未声明一律落 unknown。
+                    adj_convention = row.get('adj_convention')
+                    if not adj_convention or pd.isna(adj_convention):
+                        adj_convention = 'unknown'
+
                     if existing:
                         # 更新现有记录
                         existing.open = row.get('open')
@@ -4104,6 +4116,16 @@ class DatabaseManager:
                         existing.adj_factor = adj_factor
                         existing.adj_anchor_date = adj_anchor_date
                         existing.adj_factor_source = adj_factor_source
+                        # 口径标签必须跟着价格走：上面的 OHLC 已被本次取数覆盖，
+                        # 沿用旧标签会把新数据源的价格贴上别人的口径。未声明就
+                        # 降级为 unknown——可用性损失可接受，错误标注不可接受。
+                        existing.adj_convention = adj_convention
+                        # pre_close 相反：本次没带就保留已有值，不覆盖成 NULL。
+                        # 兜底路径的 DataFrame 经 _normalize_data 后通常不含该字段，
+                        # 无条件覆盖会让任何 force 重同步或 K 线修复擦掉 bulk 写入的
+                        # pre_close，也就是复权重建唯一的免费依据。
+                        if pre_close is not None:
+                            existing.pre_close = pre_close
                         existing.updated_at = datetime.now()
                     else:
                         # 创建新记录
@@ -4125,6 +4147,8 @@ class DatabaseManager:
                             adj_factor=adj_factor,
                             adj_anchor_date=adj_anchor_date,
                             adj_factor_source=adj_factor_source,
+                            pre_close=pre_close,
+                            adj_convention=adj_convention,
                         )
                         session.add(record)
                         saved_count += 1

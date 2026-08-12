@@ -134,10 +134,17 @@ def save_day_data(db_path: str, day_df: Any, index_df: Any) -> int:
             td = str(row.get("trade_date", ""))
             date_str = f"{td[:4]}-{td[4:6]}-{td[6:8]}" if len(td) == 8 else td
 
+            # INSERT OR REPLACE 带显式列清单的语义是「删行重插」，清单外的列会在
+            # 重写同一 (code, date) 时被清空，因此 pre_close / adj_convention 必须在列内。
+            #
+            # adj_convention 在本脚本可以硬编码 raw：数据来自 fetch_daily_all() →
+            # api.daily()，不经过 data_provider/tushare_fetcher.py，_apply_qfq_adjustment
+            # 与 TUSHARE_QFQ_ENABLED 都不在链路上，返回的永远是不复权价。
             cur.execute(
                 "INSERT OR REPLACE INTO stock_daily "
-                "(code, date, open, high, low, close, volume, amount, pct_chg, data_source, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(code, date, open, high, low, close, volume, amount, pct_chg, "
+                "pre_close, adj_convention, data_source, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     code,
                     date_str,
@@ -148,6 +155,8 @@ def save_day_data(db_path: str, day_df: Any, index_df: Any) -> int:
                     lots_to_shares(row.get("vol")),
                     thousand_yuan_to_yuan(row.get("amount")),
                     row.get("pct_chg"),
+                    row.get("pre_close"),
+                    "raw",
                     source_name,
                     now,
                     now,

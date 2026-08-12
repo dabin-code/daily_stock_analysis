@@ -162,6 +162,113 @@ class TestSaveDailyDataAdjFactor(unittest.TestCase):
 
 
 @pytest.mark.unit
+class TestSaveDailyDataPreCloseAndConvention(unittest.TestCase):
+    """save_daily_data 是逐只兜底路径的写入口，必须落 pre_close / adj_convention。
+
+    这条路的数据可能来自 efinance（疑似前复权）或 Tushare（开关打开时为 qfq），
+    口径无法从数据源名字反推，所以未声明一律落 unknown 而不是猜一个值。
+    """
+
+    def setUp(self):
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self._db_path = os.path.join(self._temp_dir.name, "test_pre_close_save.db")
+        os.environ["DATABASE_PATH"] = self._db_path
+        from src.config import Config
+        Config._instance = None
+        from src.storage import DatabaseManager
+        DatabaseManager.reset_instance()
+        self.db = DatabaseManager.get_instance()
+
+    def tearDown(self):
+        from src.storage import DatabaseManager
+        from src.config import Config
+        DatabaseManager.reset_instance()
+        Config._instance = None
+        os.environ.pop("DATABASE_PATH", None)
+        self._temp_dir.cleanup()
+
+    def _query_one(self, code, d):
+        from sqlalchemy import select, and_
+        from src.storage import StockDaily
+        with self.db.get_session() as session:
+            return session.execute(
+                select(StockDaily).where(
+                    and_(StockDaily.code == code, StockDaily.date == d),
+                )
+            ).scalar_one()
+
+    @staticmethod
+    def _row(**overrides):
+        row = {
+            "date": "2024-01-16",
+            "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5,
+            "volume": 1000.0, "amount": 100500.0, "pct_chg": 0.5,
+        }
+        row.update(overrides)
+        return pd.DataFrame([row])
+
+    def test_convention_defaults_to_unknown_when_fetcher_does_not_declare_it(self):
+        """未声明口径就落 unknown：按数据源名字猜口径等于谎报。"""
+        self.db.save_daily_data(self._row(pre_close=99.5), code="600519", data_source="test")
+        bar = self._query_one("600519", date(2024, 1, 16))
+        self.assertEqual(bar.adj_convention, "unknown")
+        self.assertAlmostEqual(bar.pre_close, 99.5, places=4)
+
+    def test_convention_supplied_by_fetcher_is_persisted_verbatim(self):
+        self.db.save_daily_data(
+            self._row(pre_close=99.5, adj_convention="raw"),
+            code="600519",
+            data_source="test",
+        )
+        bar = self._query_one("600519", date(2024, 1, 16))
+        self.assertEqual(bar.adj_convention, "raw")
+
+    def test_missing_pre_close_is_stored_as_null_not_zero(self):
+        """落 0.0 会让 ratio = pre_close / close 静默得到 0，必须是 NULL。"""
+        self.db.save_daily_data(self._row(), code="600519", data_source="test")
+        bar = self._query_one("600519", date(2024, 1, 16))
+        self.assertIsNone(bar.pre_close)
+
+    def test_nan_pre_close_is_normalized_to_null(self):
+        self.db.save_daily_data(
+            self._row(pre_close=float("nan")), code="600519", data_source="test"
+        )
+        bar = self._query_one("600519", date(2024, 1, 16))
+        self.assertIsNone(bar.pre_close)
+
+    def test_update_without_pre_close_preserves_existing_value(self):
+        """已落库的 pre_close 不能被一次没带该字段的重写擦掉。
+
+        兜底路径的 DataFrame 经过 _normalize_data 后通常不含 pre_close
+        （STANDARD_COLUMNS 里没有它），若无条件覆盖，任何 force 重同步或
+        K线修复都会把 bulk 写入的 pre_close 清成 NULL。
+        """
+        self.db.save_daily_data(
+            self._row(pre_close=99.5, adj_convention="raw"),
+            code="600519",
+            data_source="test",
+        )
+        self.db.save_daily_data(self._row(close=101.0), code="600519", data_source="test")
+        bar = self._query_one("600519", date(2024, 1, 16))
+        self.assertAlmostEqual(bar.pre_close, 99.5, places=4)
+
+    def test_update_downgrades_convention_when_new_write_does_not_declare_it(self):
+        """价格被新数据覆盖后，口径标签必须跟着价格走，不能沿用旧的 raw。
+
+        否则 efinance 的前复权价会被贴上 raw 标签，在复权重建里被当成
+        不复权价消费。降级成 unknown 是可用性损失，但沿用 raw 是错误数据。
+        """
+        self.db.save_daily_data(
+            self._row(pre_close=99.5, adj_convention="raw"),
+            code="600519",
+            data_source="test",
+        )
+        self.db.save_daily_data(self._row(close=101.0), code="600519", data_source="test")
+        bar = self._query_one("600519", date(2024, 1, 16))
+        self.assertEqual(bar.adj_convention, "unknown")
+
+
+@pytest.mark.unit
 class TestDataVersionComposition(unittest.TestCase):
     """B6.4: data_version composition from per-eval distributions."""
 
