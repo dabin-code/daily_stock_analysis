@@ -113,6 +113,45 @@ def test_factor_cache_matches_uncached_results_and_isolates_parameter_hash():
     assert list(actual["code"]) == ["000001", "000002"]
 
 
+def test_v1_and_v2_legs_share_one_base_factor_pass():
+    """两条不同策略的 leg 必须共用同一次基础因子计算。
+
+    这是历史重放在算力上能否成立的前提，不是优化项：实测 500 股单日因子
+    14.8 秒，串行外推全期约 82 小时，每条 leg 各算一遍因子直接不可行。
+
+    成立的原因是 base 缓存键剔除了 `bottom_divergence_v2_enabled`，
+    v1（关闭）与 v2（开启）因此落在同一个 base 分区上。既有用例只覆盖了
+    同策略不同网格参数的情形，而 CLI 真正跑的第一条 leg 是 v1，
+    把它加回缓存键不会让任何结果变错，只会让全期成本翻倍——静默且昂贵。
+    """
+    groups = {"000001": _bars("000001")}
+    trade_date = groups["000001"].iloc[-2]["date"]
+    universe = pd.DataFrame([{"code": "000001", "name": "A"}])
+    v1_config = Config(bottom_divergence_v2_enabled=False)
+    v2_config = Config(bottom_divergence_v2_enabled=True)
+
+    cache = ValidationFactorCache.from_groups(
+        data_version="data-a",
+        trade_dates=(trade_date,),
+        bar_groups=groups,
+    )
+
+    cache.build_factor_snapshot(
+        config=v1_config, universe=universe, trade_date=trade_date
+    )
+    builds_after_v1 = cache.stats["base_snapshot_builds"]
+
+    cache.build_factor_snapshot(
+        config=v2_config, universe=universe, trade_date=trade_date
+    )
+
+    assert builds_after_v1 == 1, "第一条 leg 应当算一次基础因子"
+    assert cache.stats["base_snapshot_builds"] == 1, (
+        "第二条 leg 重算了基础因子，跨策略的因子复用已失效"
+    )
+    assert cache.stats["sql_bar_queries"] == 0
+
+
 def test_cache_keys_isolate_data_candidate_asof_algorithm_and_parameter():
     group = _bars("000001")
     dates = (group.iloc[-2]["date"], group.iloc[-1]["date"])
