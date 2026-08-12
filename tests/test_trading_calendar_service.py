@@ -6,6 +6,7 @@ import sqlite3
 import tempfile
 import unittest
 from datetime import date
+from unittest.mock import patch
 
 from src.config import Config
 from src.storage import DatabaseManager
@@ -163,6 +164,52 @@ class TradingCalendarServiceTestCase(unittest.TestCase):
         days = svc.get_trading_days(date(2026, 8, 7), date(2026, 8, 10))
 
         self.assertEqual(days, [date(2026, 8, 7), date(2026, 8, 10)])
+
+    def test_sync_does_not_fabricate_days_beyond_source_coverage(self) -> None:
+        """信源只到 2026 年底时，2027 年不能被写成「休市」。
+
+        源里「不在开市日集合中」有两种含义：覆盖范围内是休市，范围外是未知。
+        混为一谈会让 fail-closed 查询对未知日期给出确定答案——首次同步
+        2018–2027 时实测凭空写出 365 天假休市，正是这条路径。
+        """
+        from src.services.trading_calendar_service import TradingCalendarService
+
+        svc = TradingCalendarService(db_path=self._db_path)
+        # 源覆盖 12-28 至 12-31，其中 12-29、12-30 是区间内的休市日。
+        source_days = [date(2026, 12, 28), date(2026, 12, 31)]
+
+        with patch.object(svc, "_fetch_source_open_days", return_value=source_days):
+            svc.sync(date(2026, 12, 28), date(2027, 12, 31), market="cn")
+
+        with sqlite3.connect(self._db_path) as conn:
+            rows = conn.execute(
+                "SELECT trade_date, is_open FROM trading_calendar ORDER BY trade_date"
+            ).fetchall()
+
+        self.assertEqual(
+            [r[0] for r in rows],
+            ["2026-12-28", "2026-12-29", "2026-12-30", "2026-12-31"],
+            "超出信源覆盖范围的日期不应落库",
+        )
+        self.assertEqual(
+            [r[1] for r in rows],
+            [1, 0, 0, 1],
+            "覆盖范围内的休市日仍要如实写成 0",
+        )
+
+    def test_sync_reports_the_range_it_actually_covered(self) -> None:
+        """调用方要能看出请求区间被裁剪了，否则缺口会被当成休市。"""
+        from src.services.trading_calendar_service import TradingCalendarService
+
+        svc = TradingCalendarService(db_path=self._db_path)
+
+        with patch.object(
+            svc, "_fetch_source_open_days", return_value=[date(2026, 12, 31)]
+        ):
+            result = svc.sync(date(2026, 12, 30), date(2027, 6, 30), market="cn")
+
+        self.assertEqual(result["covered_to"], "2026-12-31")
+        self.assertEqual(result["requested_to"], "2027-06-30")
 
 
 if __name__ == "__main__":

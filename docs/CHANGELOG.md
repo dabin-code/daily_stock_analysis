@@ -168,8 +168,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `TradingCalendarService.is_trading_day` therefore raises `CalendarNotCoveredError`
   for any date the table does not cover instead of returning a default, and
   `get_trading_days` returns only the open days in a range, sorted.
-  `sync(date_from, date_to)` fetches from akshare, writes one row per calendar day, and
-  cross-checks each day against `exchange_calendars`, recording the verdict in
+  `sync(date_from, date_to)` fetches from akshare, writes one row per calendar day
+  **within the source's own coverage**, and returns `covered_from` / `covered_to`
+  alongside the requested range so a clamp is visible to the caller. Outside that
+  coverage a date is unknown, not closed, and writing it as closed would hand the
+  fail-closed queries a confident wrong answer — the first real sync asked for
+  2018–2027 and would otherwise have invented 365 closed days across 2027, which
+  neither akshare nor `exchange_calendars` reaches. Each day is
+  cross-checked against `exchange_calendars`, recording the verdict in
   `cross_check` (`match` / `mismatch` / `unchecked`). A disagreement is **never
   auto-adjudicated**: the row is marked `mismatch` and a warning is logged, because the
   calendar is the baseline for all gap attribution and silently picking a winner would

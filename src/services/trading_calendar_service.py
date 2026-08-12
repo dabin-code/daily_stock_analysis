@@ -105,13 +105,18 @@ class TradingCalendarService:
         return [date.fromisoformat(str(r[0])) for r in rows]
 
     # ── 抓取 ────────────────────────────────────────────────────────────
-    def sync(self, date_from: date, date_to: date, market: str = "cn") -> Dict[str, int]:
+    def sync(self, date_from: date, date_to: date, market: str = "cn") -> Dict[str, object]:
         """akshare 主源抓取，exchange_calendars 对照。
 
         对照不一致时**不自动裁决**，只记录 cross_check='mismatch' 并告警——
         日历是所有缺口归因的基准，静默取其一会让后续全部结论建立在猜测上。
+
+        请求区间超出信源覆盖时按信源裁剪，返回值里的 `covered_to` 给出实际
+        写到哪天。同理由：源里「不在开市日集合中」在覆盖范围内表示休市，
+        范围外只表示未知，两者混同会让 fail-closed 查询对未知日期给出确定答案。
         """
-        days = self._fetch_from_akshare(date_from, date_to)
+        source_days = self._fetch_source_open_days()
+        days = self._to_calendar_rows(source_days, date_from, date_to)
         written = self.upsert_days(market, days, source="akshare")
         mismatches = self._cross_check(market, days)
         if mismatches:
@@ -120,21 +125,55 @@ class TradingCalendarService:
                 len(mismatches),
                 [d.isoformat() for d in mismatches[:10]],
             )
-        return {"written": written, "mismatch": len(mismatches)}
+        covered_to = days[-1][0] if days else None
+        return {
+            "written": written,
+            "mismatch": len(mismatches),
+            "requested_from": date_from.isoformat(),
+            "requested_to": date_to.isoformat(),
+            "covered_from": days[0][0].isoformat() if days else None,
+            "covered_to": covered_to.isoformat() if covered_to else None,
+        }
 
-    def _fetch_from_akshare(self, date_from: date, date_to: date) -> List[Tuple[date, bool]]:
+    def _fetch_source_open_days(self) -> List[date]:
+        """主源的全部开市日，不做区间过滤——覆盖边界由调用方判定。"""
         import akshare as ak
 
         df = ak.tool_trade_date_hist_sina()
-        open_days = {
-            d for d in (
-                _as_date(v) for v in df["trade_date"].tolist()
+        return sorted(
+            d for d in (_as_date(v) for v in df["trade_date"].tolist()) if d is not None
+        )
+
+    def _to_calendar_rows(
+        self,
+        source_days: Sequence[date],
+        date_from: date,
+        date_to: date,
+    ) -> List[Tuple[date, bool]]:
+        if not source_days:
+            logger.warning("trading_calendar source returned no open days, nothing to write")
+            return []
+
+        open_days = set(source_days)
+        start = max(date_from, min(source_days))
+        end = min(date_to, max(source_days))
+        if end < date_to:
+            logger.warning(
+                "trading_calendar source only covers up to %s, "
+                "requested %s; dates beyond are left unknown rather than closed",
+                end.isoformat(),
+                date_to.isoformat(),
             )
-            if d is not None and date_from <= d <= date_to
-        }
+        if start > date_from:
+            logger.warning(
+                "trading_calendar source starts at %s, requested %s",
+                start.isoformat(),
+                date_from.isoformat(),
+            )
+
         result: List[Tuple[date, bool]] = []
-        cursor = date_from
-        while cursor <= date_to:
+        cursor = start
+        while cursor <= end:
             result.append((cursor, cursor in open_days))
             cursor += timedelta(days=1)
         return result
