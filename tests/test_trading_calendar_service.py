@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """交易日历表与 fail-closed 查询测试。"""
 import os
+import shutil
 import sqlite3
 import tempfile
 import unittest
+from datetime import date
 
 from src.config import Config
 from src.storage import DatabaseManager
@@ -79,6 +81,72 @@ class TradingCalendarSchemaTestCase(unittest.TestCase):
             conn.commit()
         finally:
             conn.close()
+
+
+class TradingCalendarServiceTestCase(unittest.TestCase):
+    """fail-closed 语义测试。
+
+    这三条用例定义了本服务与既有 src/core/trading_calendar.py 的根本差异：
+    未覆盖的日期必须报错，而不是猜一个答案。
+    """
+
+    def setUp(self) -> None:
+        """建临时库并建表。
+
+        **必须把 db_path 显式传给服务**：服务缺省会从 config 取
+        database_path，那是生产库；无参构造会让这些用例写脏生产数据。
+        """
+        self._tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmp, True)
+        self._db_path = os.path.join(self._tmp, "cal.db")
+        conn = sqlite3.connect(self._db_path)
+        try:
+            conn.execute(
+                "CREATE TABLE trading_calendar ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, market TEXT NOT NULL, "
+                "trade_date TEXT NOT NULL, is_open INTEGER NOT NULL, "
+                "source TEXT, cross_check TEXT, "
+                "created_at TIMESTAMP, updated_at TIMESTAMP, "
+                "UNIQUE(market, trade_date))"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_is_trading_day_reads_from_table(self) -> None:
+        from src.services.trading_calendar_service import TradingCalendarService
+
+        svc = TradingCalendarService(db_path=self._db_path)
+        svc.upsert_days("cn", [(date(2026, 8, 10), True), (date(2026, 8, 9), False)])
+
+        self.assertTrue(svc.is_trading_day(date(2026, 8, 10)))
+        self.assertFalse(svc.is_trading_day(date(2026, 8, 9)))
+
+    def test_uncovered_date_raises_instead_of_guessing(self) -> None:
+        from src.services.trading_calendar_service import (
+            CalendarNotCoveredError,
+            TradingCalendarService,
+        )
+
+        svc = TradingCalendarService(db_path=self._db_path)
+        svc.upsert_days("cn", [(date(2026, 8, 10), True)])
+
+        with self.assertRaises(CalendarNotCoveredError):
+            svc.is_trading_day(date(2019, 3, 1))
+
+    def test_get_trading_days_range_is_sorted_and_open_only(self) -> None:
+        from src.services.trading_calendar_service import TradingCalendarService
+
+        svc = TradingCalendarService(db_path=self._db_path)
+        svc.upsert_days("cn", [
+            (date(2026, 8, 10), True),
+            (date(2026, 8, 8), False),
+            (date(2026, 8, 7), True),
+        ])
+
+        days = svc.get_trading_days(date(2026, 8, 7), date(2026, 8, 10))
+
+        self.assertEqual(days, [date(2026, 8, 7), date(2026, 8, 10)])
 
 
 if __name__ == "__main__":

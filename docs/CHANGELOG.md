@@ -158,6 +158,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   it with the named unique index; `create_all` skips existing tables wholesale,
   indexes included, so it will otherwise keep the old shape. The old shape enforces
   uniqueness identically — the only loss is discoverability by name.
+- Added the `trading_calendar` table and `src/services/trading_calendar_service.py`,
+  a local authoritative trading calendar with **fail-closed** queries. The existing
+  `src/core/trading_calendar.py` is built on `exchange_calendars` and fails *open*:
+  when the library is missing, the market is unknown, or the date lies outside the
+  calendar's range, it reports the day as a trading day. That default is unusable for
+  historical backfill and gap attribution, where treating an unknown date as a trading
+  day manufactures phantom data gaps and puts every downstream conclusion on a guess.
+  `TradingCalendarService.is_trading_day` therefore raises `CalendarNotCoveredError`
+  for any date the table does not cover instead of returning a default, and
+  `get_trading_days` returns only the open days in a range, sorted.
+  `sync(date_from, date_to)` fetches from akshare, writes one row per calendar day, and
+  cross-checks each day against `exchange_calendars`, recording the verdict in
+  `cross_check` (`match` / `mismatch` / `unchecked`). A disagreement is **never
+  auto-adjudicated**: the row is marked `mismatch` and a warning is logged, because the
+  calendar is the baseline for all gap attribution and silently picking a winner would
+  hide the disagreement rather than resolve it. `(market, trade_date)` uniqueness is a
+  named unique index (`uix_calendar_market_date`) for the same discoverability reason as
+  `stock_daily_staging` above.
+  The service takes an explicit `db_path` (defaulting to the configured
+  `database_path`) and talks to SQLite through raw `sqlite3` rather than
+  `DatabaseManager`, so it shares one database file with the other backfill services;
+  `DatabaseManager` is a singleton and constructing it with a different URL does not
+  switch files. The table is created automatically by `create_all` the next time the
+  service opens the database, so it needs **no operator action and no migration
+  script** — but it arrives empty, and an empty calendar means every query raises. Call
+  `TradingCalendarService().sync(...)` once to populate it before anything depends on
+  it. Nothing reads the table yet. Rollback: revert this commit and optionally
+  `DROP TABLE trading_calendar`; leaving the table in place is harmless.
 
 ### Changed
 
