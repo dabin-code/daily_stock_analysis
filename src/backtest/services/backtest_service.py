@@ -39,6 +39,7 @@ from src.backtest.repositories.summary_repo import SummaryRepository
 from src.backtest.services.candidate_selector import CandidateSelector
 from src.backtest.services.sample_bucket_service import SampleBucketService
 from src.backtest.utils.summary_metrics import get_aggregatable_sample_count
+from src.config import get_config
 from src.repositories.stock_repo import (
     DEFAULT_GAP_TOLERANCE_FACTOR,
     ForwardBarsMeta,
@@ -273,6 +274,98 @@ def _build_data_version(
     return f"{schema_tag}|{parts}|total:{total}"
 
 
+_VERSION_NOT_APPLICABLE = "n/a"
+
+# config_hash 只吃回测行为相关的配置项，不是整个 Config：
+# 一是 Config 里带密钥，不该进指纹；二是理由同 code_revision——
+# 把无关配置（日志级别、通知渠道）算进去，会让两次本可对比的运行
+# 因为一个不影响结果的开关而被判为不可比。
+_CONFIG_HASH_FIELDS: Tuple[str, ...] = (
+    "backtest_enabled",
+    "backtest_eval_window_days",
+    "backtest_min_age_days",
+    "backtest_engine_version",
+    "backtest_neutral_band_pct",
+    "backtest_buy_cost_bps",
+    "backtest_sell_cost_bps",
+    "backtest_slippage_bps",
+)
+
+
+def _config_to_dict(config: Any) -> Dict[str, Any]:
+    """Project the backtest-relevant slice of the config into a plain dict."""
+    if config is None:
+        return {}
+    return {
+        field: getattr(config, field, None)
+        for field in _CONFIG_HASH_FIELDS
+    }
+
+
+def _hash_config(config: Any) -> str:
+    import hashlib
+
+    payload = json.dumps(
+        _config_to_dict(config), sort_keys=True, ensure_ascii=False, default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def _resolve_code_revision() -> str:
+    import subprocess
+
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, timeout=5,
+        ).decode().strip()
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def _resolve_theme_mapping_version() -> str:
+    """主题映射目前没有版本化载体（无快照表、无内容哈希），显式返回 n/a。
+
+    等历史数据阶段把主题映射快照化之后，这里换成快照哈希即可，
+    调用方与列定义都不用改。
+    """
+    return _VERSION_NOT_APPLICABLE
+
+
+def _resolve_candidate_snapshot_version() -> str:
+    """候选快照的内容哈希依赖快照链路，本阶段尚不存在，显式返回 n/a。
+
+    建行时也确实拿不到：候选集是在 create_run 之后才选出来的。
+    """
+    return _VERSION_NOT_APPLICABLE
+
+
+def _resolve_rules_version() -> str:
+    """五层规则集本身还没有版本号载体，显式返回 n/a。
+
+    刻意不借用 ``backtest_engine_version``——那是旧版回测引擎的版本，
+    与五层规则集不是同一样东西，拿它冒充会给出一个看着有值实际说谎的版本。
+    规则里可配置的部分由 config_hash 覆盖。
+    """
+    return _VERSION_NOT_APPLICABLE
+
+
+def _build_run_versions(config: Any, data_version: str) -> Dict[str, str]:
+    """产出全部版本字段。不适用的显式写 n/a，绝不留 None。
+
+    留 None 与「这一项确实不适用」在事后无法区分，
+    而这正是判断两次运行可否比较时最需要分清的。
+    """
+    return {
+        "data_version": data_version,
+        "market_data_version": data_version,   # 复用重放切片的内容哈希
+        "theme_mapping_version": _resolve_theme_mapping_version(),
+        "candidate_snapshot_version": _resolve_candidate_snapshot_version(),
+        "rules_version": _resolve_rules_version(),
+        "code_revision": _resolve_code_revision(),
+        "config_hash": _hash_config(config),
+    }
+
+
 def _resolve_forward_quality_reason(meta: ForwardBarsMeta) -> Optional[str]:
     """Translate a :class:`ForwardBarsMeta` into a suppression reason or
     ``None`` if the window is healthy enough to evaluate.
@@ -421,6 +514,7 @@ class FiveLayerBacktestService:
 
     def __init__(self, db_manager: Optional[DatabaseManager] = None):
         self.db = db_manager or DatabaseManager.get_instance()
+        self.config = get_config()
         self.run_repo = RunRepository(self.db)
         self.eval_repo = EvaluationRepository(self.db)
         self.summary_repo = SummaryRepository(self.db)
@@ -444,6 +538,15 @@ class FiveLayerBacktestService:
         **kwargs,
     ) -> FiveLayerBacktestRun:
         backtest_run_id = f"flbt-{uuid.uuid4().hex[:12]}"
+        # 版本字段在建行时就写满，保证任何早退路径（0 候选、异常）拿到的行
+        # 也不含 NULL。data_version 此刻还拿不到真值（要等重放切片算出内容
+        # 哈希），先写 n/a 占位，由后续 update_run_status 用真实哈希覆盖。
+        # 调用方显式传入的版本字段优先，不被默认值盖掉。
+        versions = _build_run_versions(self.config, data_version=_VERSION_NOT_APPLICABLE)
+        versions.update({
+            k: v for k, v in kwargs.items() if k in versions and v is not None
+        })
+        kwargs.update(versions)
         return self.run_repo.create_run(
             backtest_run_id=backtest_run_id,
             evaluation_mode=evaluation_mode,
@@ -562,6 +665,9 @@ class FiveLayerBacktestService:
                 }
             ),
             data_version=data_version,
+            # 重放切片的内容哈希同时就是行情数据版本，建行时的 n/a 占位
+            # 到这里被真实哈希覆盖。
+            market_data_version=data_version,
             completed_at=datetime.now(),
         )
 
@@ -673,6 +779,9 @@ class FiveLayerBacktestService:
                 }
             ),
             data_version=data_version,
+            # 重放切片的内容哈希同时就是行情数据版本，建行时的 n/a 占位
+            # 到这里被真实哈希覆盖。
+            market_data_version=data_version,
             completed_at=datetime.now(),
         )
 

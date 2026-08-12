@@ -1427,6 +1427,7 @@ class DatabaseManager:
                 self._migrate_sqlite_daily_sector_heat_rank_fields()
                 self._migrate_sqlite_five_layer_backtest_group_summary_fields()
                 self._migrate_sqlite_five_layer_backtest_evaluation_fields()
+                self._migrate_sqlite_five_layer_backtest_run_version_fields()
                 self._migrate_sqlite_stock_daily_adj_factor_fields()
                 self._migrate_sqlite_stock_daily_pre_close_fields()
                 self._migrate_sqlite_instrument_delist_date_field()
@@ -1840,6 +1841,38 @@ class DatabaseManager:
                     "WHERE leader_pool_win_share IS NULL "
                     "AND top_k_hit_rate IS NOT NULL"
                 )
+
+    def _migrate_sqlite_five_layer_backtest_run_version_fields(self) -> None:
+        """Ensure five-layer backtest runs expose code_revision / config_hash on SQLite.
+
+        No backfill: legacy rows were produced before these were recorded, so
+        any value written now would be invented. They stay NULL and are
+        distinguishable from the explicit ``n/a`` new runs write.
+        """
+        with self._engine.begin() as conn:
+            existing = {
+                row[1]
+                for row in conn.exec_driver_sql(
+                    "PRAGMA table_info(five_layer_backtest_runs)"
+                ).fetchall()
+            }
+            new_columns = {
+                "code_revision": (
+                    "ALTER TABLE five_layer_backtest_runs "
+                    "ADD COLUMN code_revision VARCHAR(64)"
+                ),
+                "config_hash": (
+                    "ALTER TABLE five_layer_backtest_runs "
+                    "ADD COLUMN config_hash VARCHAR(64)"
+                ),
+            }
+            for col_name, ddl in new_columns.items():
+                if col_name not in existing:
+                    logger.info(
+                        "Applying inline SQLite migration: adding %s to five_layer_backtest_runs",
+                        col_name,
+                    )
+                    conn.exec_driver_sql(ddl)
 
     def _migrate_sqlite_five_layer_backtest_evaluation_fields(self) -> None:
         """Ensure five-layer evaluations expose the latest entry timing metrics on SQLite."""

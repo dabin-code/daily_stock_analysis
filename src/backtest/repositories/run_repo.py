@@ -63,7 +63,20 @@ class RunRepository:
         started_at: Optional[datetime] = None,
         completed_at: Optional[datetime] = None,
         data_version: Optional[str] = None,
+        market_data_version: Optional[str] = None,
+        theme_mapping_version: Optional[str] = None,
+        candidate_snapshot_version: Optional[str] = None,
+        rules_version: Optional[str] = None,
+        code_revision: Optional[str] = None,
+        config_hash: Optional[str] = None,
     ) -> Optional[FiveLayerBacktestRun]:
+        """Update a run row. Every argument is optional; omitted ones are left
+        untouched.
+
+        All seven version fields are writable here, not just ``data_version``:
+        the other six previously had no write path at all, so a run could only
+        ever carry one seventh of the provenance the schema promised.
+        """
         with self.db.get_session() as session:
             run = (
                 session.query(FiveLayerBacktestRun)
@@ -90,6 +103,18 @@ class RunRepository:
                 run.completed_at = completed_at
             if data_version is not None:
                 run.data_version = data_version
+            if market_data_version is not None:
+                run.market_data_version = market_data_version
+            if theme_mapping_version is not None:
+                run.theme_mapping_version = theme_mapping_version
+            if candidate_snapshot_version is not None:
+                run.candidate_snapshot_version = candidate_snapshot_version
+            if rules_version is not None:
+                run.rules_version = rules_version
+            if code_revision is not None:
+                run.code_revision = code_revision
+            if config_hash is not None:
+                run.config_hash = config_hash
             session.commit()
             session.refresh(run)
             return run

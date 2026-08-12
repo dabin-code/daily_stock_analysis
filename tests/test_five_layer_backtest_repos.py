@@ -94,6 +94,50 @@ class TestRunRepository(unittest.TestCase):
         self.assertEqual(updated.status, "running")
         self.assertEqual(updated.sample_count, 100)
 
+    def test_update_run_status_writes_every_version_field(self):
+        """所有 7 个版本字段都必须有写入通道。
+
+        原先只有 data_version 能写，其余 4 个列虽然存在却无人可写，
+        运行行于是宣称自己被版本化但拿不出证据。断言用直查列的方式做，
+        不经过任何合并式读回路径。
+        """
+        from sqlalchemy import text
+
+        from src.backtest.repositories.run_repo import RunRepository
+        repo = RunRepository(self.db)
+        repo.create_run(
+            backtest_run_id="run-r005",
+            evaluation_mode="historical_snapshot",
+            execution_model="conservative",
+            trade_date_from=date(2024, 1, 1),
+            trade_date_to=date(2024, 1, 31),
+            market="cn",
+        )
+        expected = {
+            "data_version": "adj1|fetcher_provided:3|total:3",
+            "market_data_version": "adj1|fetcher_provided:3|total:3",
+            "theme_mapping_version": "theme-2024-01",
+            "candidate_snapshot_version": "snap-abc123",
+            "rules_version": "rules-v7",
+            "code_revision": "0" * 40,
+            "config_hash": "f" * 32,
+        }
+        repo.update_run_status("run-r005", **expected)
+
+        with self.db.get_session() as session:
+            row = session.execute(
+                text(
+                    "SELECT data_version, market_data_version, theme_mapping_version, "
+                    "candidate_snapshot_version, rules_version, code_revision, config_hash "
+                    "FROM five_layer_backtest_runs WHERE backtest_run_id = :rid"
+                ),
+                {"rid": "run-r005"},
+            ).fetchone()
+        self.assertIsNotNone(row)
+        for index, field in enumerate(expected):
+            with self.subTest(field=field):
+                self.assertEqual(row[index], expected[field])
+
     def test_list_runs_by_date_range(self):
         """Should filter runs by date range."""
         from src.backtest.repositories.run_repo import RunRepository

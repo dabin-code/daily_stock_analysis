@@ -86,6 +86,10 @@ class FiveLayerRunResponse(BaseModel):
     theme_mapping_version: Optional[str] = None
     candidate_snapshot_version: Optional[str] = None
     rules_version: Optional[str] = None
+    # code_revision 只是记录运行时的 git HEAD，不参与可比性判定；
+    # 判断两次运行能否比较看 data_version 与 config_hash。
+    code_revision: Optional[str] = None
+    config_hash: Optional[str] = None
     sample_baseline: Optional[SampleBaselineResponse] = None
     # A1: structured filter snapshot — source / screening_run_ids / market /
     # evaluation_mode / execution_model / eval_window_days. Lets API consumers

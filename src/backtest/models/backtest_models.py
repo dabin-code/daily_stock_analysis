@@ -47,6 +47,13 @@ class FiveLayerBacktestRun(Base):
     candidate_snapshot_version = Column(String(64))
     rules_version = Column(String(64))
 
+    # 代码版本与配置指纹。没有这两项，「同一份数据同一套代码」无法证明。
+    # 注意：code_revision 仅作记录，**不参与可比性判定**——
+    # spec 5.3 指出 git commit 会因无关改动而变化，用它当键会把
+    # 本可对比的两次运行误判为不可比。可比性看 data_version 与 config_hash。
+    code_revision = Column(String(64))
+    config_hash = Column(String(64))
+
     # Config
     config_json = Column(Text)
     candidate_filter_json = Column(Text)
@@ -80,6 +87,8 @@ class FiveLayerBacktestRun(Base):
             "theme_mapping_version": self.theme_mapping_version,
             "candidate_snapshot_version": self.candidate_snapshot_version,
             "rules_version": self.rules_version,
+            "code_revision": self.code_revision,
+            "config_hash": self.config_hash,
             "config_json": self.config_json,
             "candidate_filter_json": self.candidate_filter_json,
             "status": self.status,
