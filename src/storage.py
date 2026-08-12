@@ -746,6 +746,36 @@ class InstrumentMaster(Base):
         }
 
 
+class TradingCalendar(Base):
+    """交易日历权威表。
+
+    既有 src/core/trading_calendar.py 依赖第三方库且 fail-open，
+    不能用于回补与缺口归因——把未知日期当作开市会制造假缺口。
+    本表落库后，日历查询改为 fail-closed：查不到即报错，不猜。
+    """
+
+    __tablename__ = "trading_calendar"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    market = Column(String(16), nullable=False, default="cn", index=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    is_open = Column(Boolean, nullable=False, default=True)
+    source = Column(String(32), nullable=False, default="akshare")
+    # 与 exchange_calendars 对照的结果：match / mismatch / unchecked
+    cross_check = Column(String(16), nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        # 与 StockDailyStaging 同样的取舍：用 Index(unique=True) 而不是
+        # UniqueConstraint。后者在 SQLite 上落成 sqlite_autoindex_trading_calendar_1，
+        # 给定的名字只出现在建表 DDL 里，PRAGMA index_list 查不到，排查时会误判成
+        # 「约束没建」；命名唯一索引在唯一性与 INSERT OR REPLACE 冲突消解上等价，
+        # 且顺带省掉一条与其完全重复的普通索引。请勿改回 UniqueConstraint。
+        Index('uix_calendar_market_date', 'market', 'trade_date', unique=True),
+    )
+
+
 class BoardMaster(Base):
     """股票所属板块主数据。"""
 
