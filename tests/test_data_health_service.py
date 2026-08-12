@@ -1,14 +1,27 @@
 from datetime import date
 
 import pandas as pd
+import pytest
 
 from src.services.data_health_service import DataHealthService
 from src.storage import DatabaseManager
 
 
-def _build_db(tmp_path):
+@pytest.fixture
+def db(tmp_path):
+    """构造隔离的 DatabaseManager 并在用例结束后还原全局单例。
+
+    DatabaseManager 是单例，直接构造会把临时库装成全局实例。
+    不还原的话，后续所有 get_instance() 的调用者都会读到这个
+    已被删除的临时库——这正是 test_e2e_five_layer_local 的板块热度
+    用例在全量套件里失败、单独跑却通过的原因。
+    """
     DatabaseManager.reset_instance()
-    return DatabaseManager(f"sqlite:///{tmp_path / 'data_health.db'}")
+    manager = DatabaseManager(f"sqlite:///{tmp_path / 'data_health.db'}")
+    try:
+        yield manager
+    finally:
+        DatabaseManager.reset_instance()
 
 
 def _seed_instruments(db: DatabaseManager) -> None:
@@ -85,8 +98,7 @@ def _save_daily(db: DatabaseManager, code: str, dates: list[date]) -> None:
     db.save_daily_data(pd.DataFrame(rows), code, data_source="test")
 
 
-def test_data_health_summary_reports_screening_readiness_and_gaps(tmp_path):
-    db = _build_db(tmp_path)
+def test_data_health_summary_reports_screening_readiness_and_gaps(db):
     _seed_instruments(db)
     _save_daily(db, "000001", [date(2025, 6, 3)])
     _save_daily(db, "000001", [date(2026, 5, 8), date(2026, 5, 11)])
@@ -142,8 +154,7 @@ def test_data_health_summary_reports_screening_readiness_and_gaps(tmp_path):
     assert summary["screening_ready_date"] == "2026-05-08"
 
 
-def test_data_health_lists_coverage_and_gap_details(tmp_path):
-    db = _build_db(tmp_path)
+def test_data_health_lists_coverage_and_gap_details(db):
     _seed_instruments(db)
     _save_daily(db, "000001", [date(2026, 5, 8), date(2026, 5, 11)])
     _save_daily(db, "000002", [date(2026, 5, 8)])
@@ -198,8 +209,7 @@ def test_data_health_lists_coverage_and_gap_details(tmp_path):
     assert gaps["items"][0]["missing_date_from"] == "2026-05-11"
 
 
-def test_data_health_gap_list_defaults_to_unresolved_gaps(tmp_path):
-    db = _build_db(tmp_path)
+def test_data_health_gap_list_defaults_to_unresolved_gaps(db):
     _seed_instruments(db)
     run = db.create_kline_audit_run(
         run_id="audit-003",
