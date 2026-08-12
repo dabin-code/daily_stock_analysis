@@ -219,7 +219,7 @@ class TestGroupSummaryAggregation(unittest.TestCase):
             _make_eval(forward_return_5d=-3.0, outcome="loss", mae=-5.0, mfe=1.0),
             _make_eval(forward_return_5d=2.0, outcome="win", mae=-1.0, mfe=4.0),
         ]
-        result = aggregate_group(evals)
+        result = aggregate_group(evals, family_filter="entry")
         self.assertIsNotNone(result)
         self.assertEqual(result["sample_count"], 3)
         self.assertAlmostEqual(result["win_rate_pct"], 66.67, places=1)
@@ -230,7 +230,7 @@ class TestGroupSummaryAggregation(unittest.TestCase):
             _make_eval(forward_return_5d=10.0),
             _make_eval(forward_return_5d=20.0),
         ]
-        result = aggregate_group(evals)
+        result = aggregate_group(evals, family_filter="entry")
         self.assertAlmostEqual(result["avg_return_pct"], 15.0, places=2)
 
     def test_aggregate_group_empty(self):
@@ -244,7 +244,7 @@ class TestGroupSummaryAggregation(unittest.TestCase):
             _make_eval(forward_return_5d=v, trade_date=date(2026, 3, d))
             for d, v in [(2, 5.0), (3, -1.0), (9, 3.0), (10, -2.0), (16, 4.0)]
         ]
-        result = aggregate_group(evals)
+        result = aggregate_group(evals, family_filter="entry")
         self.assertIn("p25_return_pct", result)
         self.assertIn("extreme_sample_ratio", result)
 
@@ -254,7 +254,8 @@ class TestGroupSummaryAggregation(unittest.TestCase):
             _make_eval(forward_return_5d=None, risk_avoided_pct=3.0, outcome="win"),
             _make_eval(forward_return_5d=None, risk_avoided_pct=-1.0, outcome="loss"),
         ]
-        result = aggregate_group(evals)
+        # 这条钉的是旧混族口径：族标记为 entry 但收益取自 risk_avoided_pct
+        result = aggregate_group(evals, allow_mixed_families=True)
         self.assertIsNotNone(result)
         self.assertEqual(result["sample_count"], 2)
 

@@ -10,6 +10,7 @@ Aggregates evaluations into group summaries by:
 - strategy_cohort (primary_strategy+sample_bucket+snapshot context)
 """
 
+import itertools
 import json
 import os
 import tempfile
@@ -17,6 +18,41 @@ import unittest
 from datetime import date, timedelta
 
 import pytest
+
+
+_EVAL_SEQUENCE = itertools.count(1000)
+
+
+def _make_eval(
+    signal_family: str = "entry",
+    forward_return_5d=None,
+    risk_avoided_pct=None,
+    outcome: str = "win",
+    snapshot_trade_stage: str = "probe_entry",
+    stage_success=None,
+):
+    """Build a real evaluation ORM row so it can be persisted by the repository.
+
+    Deliberately not a MagicMock: ``EvaluationRepository.save_batch`` needs a
+    mapped instance, and the aggregator is exercised through the persisted
+    round-trip.
+    """
+    from src.backtest.models.backtest_models import FiveLayerBacktestEvaluation
+
+    seq = next(_EVAL_SEQUENCE)
+    return FiveLayerBacktestEvaluation(
+        screening_candidate_id=seq,
+        trade_date=date(2024, 5, 1) + timedelta(days=seq % 20),
+        code=f"9{seq:05d}",
+        signal_family=signal_family,
+        evaluator_type=signal_family,
+        snapshot_trade_stage=snapshot_trade_stage,
+        forward_return_5d=forward_return_5d,
+        risk_avoided_pct=risk_avoided_pct,
+        stage_success=stage_success,
+        outcome=outcome,
+        eval_status="evaluated",
+    )
 
 
 @pytest.mark.unit
@@ -445,7 +481,12 @@ class TestGroupSummaryAggregator(unittest.TestCase):
         self.assertAlmostEqual(entry.stage_accuracy_rate, 0.5)
 
     def test_overall_summary_stage_accuracy_uses_entry_and_observation_rules(self):
-        """Overall stage accuracy should combine profitable entries and successful observations."""
+        """Stage accuracy applies the entry rule (profitable) at the top level and
+        keeps the observation rule (``stage_success``) in ``family_breakdown``.
+
+        The top-level column is entry-only like every other metric on a mixed
+        row; the per-family rules stay readable through the breakdown.
+        """
         from src.backtest.aggregators.group_summary_aggregator import GroupSummaryAggregator
         from src.backtest.repositories.evaluation_repo import EvaluationRepository
         from src.backtest.repositories.summary_repo import SummaryRepository
@@ -453,7 +494,13 @@ class TestGroupSummaryAggregator(unittest.TestCase):
         summaries = agg.compute_all_summaries("run-agg")
         overall = next(s for s in summaries if s.group_type == "overall" and s.group_key == "all")
 
+        # entry: +5.0 profitable, -2.0 not → 0.5
         self.assertAlmostEqual(overall.stage_accuracy_rate, 0.5)
+
+        metrics = json.loads(overall.metrics_json)
+        self.assertAlmostEqual(metrics["family_breakdown"]["entry"]["stage_accuracy_rate"], 0.5)
+        # observation: one stage_success=True, one False → 0.5
+        self.assertAlmostEqual(metrics["family_breakdown"]["observation"]["stage_accuracy_rate"], 0.5)
 
     def test_market_regime_signal_family_split_summaries(self):
         """Single-dimension summaries should also emit signal-family split rows."""
@@ -592,8 +639,10 @@ class TestGroupSummaryAggregator(unittest.TestCase):
 
         trend_pullback_boundary = "ps=trend_pullback|sb=boundary|mr=balanced|cp=tier2|em=medium"
         self.assertIn(trend_pullback_boundary, cohorts)
+        # 整组 2 条（entry −2.0 + observation 8.0），sample_count 描述整组…
         self.assertEqual(cohorts[trend_pullback_boundary].sample_count, 2)
-        self.assertAlmostEqual(cohorts[trend_pullback_boundary].avg_return_pct, 3.0)
+        # …但顶层收益只代表 entry 族，所以是 −2.0 而不是两族混合后的 3.0
+        self.assertAlmostEqual(cohorts[trend_pullback_boundary].avg_return_pct, -2.0)
 
     def test_strategy_cohort_summary_includes_family_breakdown_for_mixed_samples(self):
         """Mixed-family strategy cohort should persist family breakdown in metrics_json."""
@@ -786,6 +835,104 @@ class TestGroupSummaryAggregator(unittest.TestCase):
         self.assertEqual(metrics["sample_baseline"]["aggregatable_sample_count"], 0)
         self.assertEqual(metrics["sample_baseline"]["suppressed_sample_count"], 2)
         self.assertFalse(metrics["threshold_check"]["can_display"])
+
+    def _persist_and_read(self, group_type: str, group_key: str, evaluations):
+        """Persist a fresh run of ``evaluations`` and read one summary back."""
+        from src.backtest.aggregators.group_summary_aggregator import GroupSummaryAggregator
+        from src.backtest.repositories.evaluation_repo import EvaluationRepository
+        from src.backtest.repositories.run_repo import RunRepository
+        from src.backtest.repositories.summary_repo import SummaryRepository
+
+        run_id = f"run-family-{group_type}-{group_key}"
+        RunRepository(self.db).create_run(
+            backtest_run_id=run_id,
+            evaluation_mode="historical_snapshot",
+            execution_model="conservative",
+            trade_date_from=date(2024, 5, 1),
+            trade_date_to=date(2024, 5, 31),
+            market="cn",
+        )
+        for evaluation in evaluations:
+            evaluation.backtest_run_id = run_id
+        EvaluationRepository(self.db).save_batch(evaluations)
+
+        summary_repo = SummaryRepository(self.db)
+        GroupSummaryAggregator(EvaluationRepository(self.db), summary_repo).compute_all_summaries(run_id)
+        return next(
+            s for s in summary_repo.get_by_run(run_id)
+            if s.group_type == group_type and s.group_key == group_key
+        )
+
+    def _read_summary_columns(self, run_id: str, group_type: str, group_key: str):
+        """Read the persisted summary columns directly, bypassing the ORM path."""
+        from sqlalchemy import text
+
+        with self.db.get_session() as session:
+            return session.execute(
+                text(
+                    "SELECT sample_count, avg_return_pct, win_rate_pct, stage_accuracy_rate "
+                    "FROM five_layer_backtest_group_summaries "
+                    "WHERE backtest_run_id = :run_id AND group_type = :group_type "
+                    "AND group_key = :group_key"
+                ),
+                {"run_id": run_id, "group_type": group_type, "group_key": group_key},
+            ).fetchone()
+
+    def test_mixed_group_top_level_metrics_exclude_observation(self) -> None:
+        """真正混族的分组，顶层 win_rate / profit_factor 只能来自 entry 族。
+
+        observation 的 risk_avoided_pct 与 entry 的 forward_return 量纲不同，
+        且 correct_wait 并进胜率分子会把评级系统性抬高。
+        """
+        evals = [
+            _make_eval(signal_family="entry", forward_return_5d=5.0, outcome="win"),
+            _make_eval(signal_family="entry", forward_return_5d=-3.0, outcome="loss"),
+            _make_eval(signal_family="observation", risk_avoided_pct=8.0, outcome="correct_wait"),
+            _make_eval(signal_family="observation", risk_avoided_pct=6.0, outcome="correct_wait"),
+        ]
+
+        summary = self._persist_and_read(group_type="trade_stage", group_key="probe_entry",
+                                         evaluations=evals)
+
+        # entry 族 2 条中 1 胜 → 50%；混入两条 correct_wait 会变成 75%
+        self.assertAlmostEqual(summary.win_rate_pct, 50.0, places=2)
+        self.assertAlmostEqual(summary.avg_return_pct, 1.0, places=2)
+        # 顶层收益只代表 entry，但样本数仍须描述整组 4 条，否则读报告的人
+        # 会以为样本量不足
+        self.assertEqual(summary.sample_count, 4)
+
+        # 直查落库列，确认上面的断言不是读回路径合并出来的
+        row = self._read_summary_columns(
+            "run-family-trade_stage-probe_entry", "trade_stage", "probe_entry",
+        )
+        self.assertEqual(row[0], 4)
+        self.assertAlmostEqual(row[1], 1.0, places=2)
+        self.assertAlmostEqual(row[2], 50.0, places=2)
+
+    def test_single_family_group_keeps_its_own_family_metrics(self) -> None:
+        """反例：observation 行不能被 entry 过滤清空。
+
+        没有这条，「顶层只算 entry」的改法会把整类分组行的指标抹成 None。
+        """
+        evals = [
+            _make_eval(signal_family="observation", risk_avoided_pct=8.0, outcome="correct_wait"),
+            _make_eval(signal_family="observation", risk_avoided_pct=-2.0, outcome="missed_opportunity"),
+        ]
+
+        summary = self._persist_and_read(group_type="signal_family", group_key="observation",
+                                         evaluations=evals)
+
+        self.assertAlmostEqual(summary.win_rate_pct, 50.0, places=2)
+        self.assertIsNotNone(summary.avg_return_pct)
+
+    def test_mixed_family_aggregation_requires_explicit_opt_in(self) -> None:
+        """反例：默认不允许混族。旧口径必须显式声明才能拿到。"""
+        from src.backtest.aggregators.group_summary_aggregator import aggregate_group
+
+        with self.assertRaises(ValueError):
+            aggregate_group([
+                _make_eval(signal_family="entry", forward_return_5d=1.0),
+            ])
 
     def _seed_pattern_code_run(self):
         from src.backtest.models.backtest_models import FiveLayerBacktestEvaluation

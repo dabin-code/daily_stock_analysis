@@ -200,7 +200,12 @@ class GroupSummaryAggregator:
         Always persists the summary. Threshold info is stored as advisory
         metadata in metrics_json — gating is the RecommendationEngine's job.
         """
-        metrics = aggregate_group(evaluations)
+        # 本行若本就单族（signal_family 行、<维度>_signal_family 拆分行），
+        # 就用它自己的族；只有真正混族的行，顶层才只代表 entry——
+        # observation 的“正确观望”不是收益，并进来会把胜率系统性抬高。
+        families = {e.signal_family for e in evaluations if e.signal_family}
+        family_filter = next(iter(families)) if len(families) == 1 else "entry"
+        metrics = aggregate_group(evaluations, family_filter=family_filter)
         if metrics is None:
             return None
 
@@ -259,17 +264,21 @@ class GroupSummaryAggregator:
 def aggregate_group(
     evaluations: List[FiveLayerBacktestEvaluation],
     family_filter: Optional[str] = None,
+    *,
+    allow_mixed_families: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Compute aggregate metrics for a group of evaluations.
 
     Args:
         evaluations: candidate-level evaluation rows.
-        family_filter: when provided, only the matching ``signal_family`` rows
-            are aggregated. ``None`` keeps the legacy mixed-family behaviour
-            (kept for backward compatibility — read ``family_breakdown`` for
-            the family-aware metrics).
+        family_filter: only the matching ``signal_family`` rows feed the return
+            and outcome based metrics. Required unless ``allow_mixed_families``
+            is set.
+        allow_mixed_families: opt in to the deprecated mixed-family metric so
+            historical runs can still be recomputed under the original
+            definition for comparison.
 
-    DEPRECATED MIX (family_filter=None):
+    DEPRECATED MIX (allow_mixed_families=True):
         ``avg_return_pct / win_rate_pct / profit_factor / stage_accuracy_rate``
         below mix entry's forward_return_5d with observation's risk_avoided_pct
         and combine ``win`` + ``correct_wait`` into the same numerator. They are
@@ -283,14 +292,22 @@ def aggregate_group(
     if raw_count == 0:
         return None
 
+    # 样本口径与指标口径分离：sample_count / sample_baseline 始终描述整组，
+    # 族过滤只影响收益类指标的取数来源。
+    sample_baseline = _build_sample_baseline(evaluations)
+
+    if family_filter is None and not allow_mixed_families:
+        raise ValueError(
+            "aggregate_group without family_filter mixes entry forward returns with "
+            "observation risk_avoided_pct and merges 'win' with 'correct_wait'. "
+            "Pass family_filter='entry'/'observation', or allow_mixed_families=True "
+            "if you explicitly want the deprecated legacy metric."
+        )
+
     if family_filter is not None:
         evaluations = [e for e in evaluations if e.signal_family == family_filter]
         if not evaluations:
             return None
-        raw_count = len(evaluations)
-
-    sample_baseline = _build_sample_baseline(evaluations)
-
     # Filter to evaluated entries with a return metric
     valid = [e for e in evaluations if _is_aggregatable(e)]
     aggregatable_count = len(valid)
