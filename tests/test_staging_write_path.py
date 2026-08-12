@@ -17,6 +17,18 @@ def _columns(db_path: str, table: str) -> set:
         conn.close()
 
 
+def _column_specs(db_path: str, table: str) -> dict:
+    """列名 -> (声明类型, notnull)。_columns 只取列名，看不出类型漂移。"""
+    conn = sqlite3.connect(db_path)
+    try:
+        return {
+            row[1]: (row[2], row[3])
+            for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+    finally:
+        conn.close()
+
+
 def _indexes(db_path: str, table: str) -> set:
     conn = sqlite3.connect(db_path)
     try:
@@ -67,6 +79,54 @@ class SchemaTestCase(unittest.TestCase):
         # staging 独有的批次追踪列
         self.assertIn("batch_id", staging)
         self.assertIn("convention_version", staging)
+
+    def test_staging_shared_columns_match_stock_daily_types(self) -> None:
+        """共有列的类型与非空必须一致，光比列名不够。
+
+        SQLite 不校验 VARCHAR 长度，长度漂移无害；但亲和性漂移是真的数据损坏：
+        open 从 FLOAT 变成 VARCHAR 会让该列取得 TEXT 亲和性，价格以字符串入库，
+        之后所有比较、聚合以及逐列提升本身都会静默算错。
+        """
+        staging = _column_specs(self._db_path, "stock_daily_staging")
+        production = _column_specs(self._db_path, "stock_daily")
+
+        shared = sorted(set(staging) & set(production))
+        self.assertTrue(shared, "no shared columns between staging and stock_daily")
+        diverged = {
+            name: {"stock_daily": production[name], "staging": staging[name]}
+            for name in shared
+            if production[name] != staging[name]
+        }
+        self.assertEqual(
+            diverged, {}, f"staging columns diverge in (type, notnull): {diverged}"
+        )
+
+    def test_staging_unique_index_is_discoverable(self) -> None:
+        """唯一约束必须以命名索引存在，PRAGMA index_list 查得到。
+
+        换成 UniqueConstraint 时它会落成 sqlite_autoindex_stock_daily_staging_1，
+        给定的名字只留在建表 DDL 里，排查的人会误判成「约束根本没建」。
+        """
+        self.assertIn(
+            "uix_staging_code_date", _indexes(self._db_path, "stock_daily_staging")
+        )
+
+    def test_staging_rejects_duplicate_code_date(self) -> None:
+        """命名唯一索引仍要真的挡住重复 (code, date)，不只是名字好看。"""
+        conn = sqlite3.connect(self._db_path)
+        try:
+            conn.execute(
+                "INSERT INTO stock_daily_staging (code, date, close)"
+                " VALUES ('600519', '2026-03-16', 1688.0)"
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO stock_daily_staging (code, date, close)"
+                    " VALUES ('600519', '2026-03-16', 1699.0)"
+                )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 class LegacyStockDailyMigrationTestCase(unittest.TestCase):

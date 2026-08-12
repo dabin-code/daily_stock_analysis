@@ -214,8 +214,12 @@ class StockDailyStaging(Base):
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
     __table_args__ = (
-        UniqueConstraint('code', 'date', name='uix_staging_code_date'),
-        Index('ix_staging_code_date', 'code', 'date'),
+        # 用 Index(unique=True) 而不是 UniqueConstraint：后者在 SQLite 上落成
+        # sqlite_autoindex_stock_daily_staging_1，给定的名字只出现在建表 DDL 的
+        # CONSTRAINT 子句里，PRAGMA index_list 查不到，排查时会误判成「约束没建」。
+        # 命名唯一索引在唯一性约束与 INSERT OR REPLACE 冲突消解上等价，且顺带
+        # 省掉一条与其完全重复的 ix_staging_code_date。请勿改回 UniqueConstraint。
+        Index('uix_staging_code_date', 'code', 'date', unique=True),
         Index('ix_staging_date_version', 'date', 'convention_version'),
     )
 

@@ -145,6 +145,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   arrives empty and nothing reads or writes it yet. Rollback: revert this commit and
   optionally `DROP TABLE stock_daily_staging`; leaving the empty table in place is
   harmless.
+  The `(code, date)` uniqueness is declared as a named unique index
+  (`uix_staging_code_date`) rather than a `UniqueConstraint`, because SQLite
+  materialises a table-level `UNIQUE` constraint as `sqlite_autoindex_*` and the
+  given name is then invisible to `PRAGMA index_list`. **If your deployment already
+  opened the database and created the empty `stock_daily_staging` table before this
+  change**, drop it once (`DROP TABLE stock_daily_staging`) so `create_all` rebuilds
+  it with the named unique index; `create_all` skips existing tables wholesale,
+  indexes included, so it will otherwise keep the old shape. The old shape enforces
+  uniqueness identically — the only loss is discoverability by name.
 
 ### Changed
 
