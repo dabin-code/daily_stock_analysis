@@ -339,4 +339,5 @@ provenance——这是**回落**而不是合取，候选级只要给出非空值
 | prior 窗口的锚 | 「forward / prior 用同一个锚 D」 | prior 侧**做不到**，改为按窗口自身末行归一（见 Task 2 第 2 条） | prior 窗口止于 `signal_date - 1`，接回 D 需要 `pre_close(D)` 而因子快照只给 `close(D)`；两种锚只差常数，该窗口两个消费方对常数免疫（波动率是收益率标准差、流动性用 `amount`），但这是**刻意偏离**，前提写在正文里 |
 | 样本级 fail-closed | 只定义到「整只标 unknown」 | 补样本级判据：前瞻 / 前置窗口 `_all_trusted` 为假即返回**空窗口**（见 4.5） | 前瞻窗口没有传递通道，`ValidationSample` 无 adjustment 字段；「没有前瞻窗口」比「有个错的收益」安全 |
 | fail-closed 的写法 | 「不 ffill、不按 1.0 补」 | 补「**也不能保留取数时的来源标记**」（见 4.5） | 原文只挡住了造假因子，没挡住「什么都不做」；`tushare_native` 已在白名单里，保留它等于让没复权的价格顶着可信标记进检测器 |
+| `adj_convention` 消费方 | 未提 | 读取路径入口对非 `raw`（含**缺列** / NULL / `unknown` / `qfq`）整窗 fail-closed；三条读取路径补该列；`_HASH_BAR_FIELDS` 一并补上 | 三条写入路径维护这一列、零个读取路径消费它。efinance 降级写死 `fqt=1`，覆写一行即「qfq 的 `close` + 残留的 raw `pre_close`」，混着成链算出的因子不越界、不断链、不报错，**只是错**；D 恰好是这样一行时整窗价格水平一起偏。缺列取拒绝而非放行：放行等于让守卫被「忘了 SELECT 一列」整体关掉，而代价（`mark_unadjustable` → `adjustment_unknown`）是退回 gate-3 之前那个安全状态 |
 | 候选级 / 整组级 provenance | 未提 | `_compute_bottom_divergence_v2_factors` 的两级判定由**回落**改为**合取**（见 Task 4） | 候选级 `zone_metadata` 冻结到 A/B 前缀，看不见落在 A 之前的断链前缀；而阻力区在整个可见窗口上找摆动高点。同样是本计划让这个洞从死条款变成活漏洞 |

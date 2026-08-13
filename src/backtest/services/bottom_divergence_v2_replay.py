@@ -83,6 +83,11 @@ class ReplayDependencies:
 #
 # 不改 `stock_repo.py`：那是共享仓储层，五层流水线（`backtest_service`）也在
 # 用它，在那里施加会把波及面扩到本计划之外。
+#
+# `adj_convention` 不参与缩放，但必须随窗口一起进来：它是复权链的口径守卫的
+# 输入（`adjustment_chain.convention_reject_reason`），缺了这一列整窗会被判成
+# 不可复权。`StockDaily` 本来就有这个属性，`stock_repo.py` 取的是整行 ORM
+# 对象，所以这里只是别把它在转 DataFrame 时丢掉。
 _ADJUSTABLE_BAR_FIELDS = (
     "date",
     "open",
@@ -92,6 +97,7 @@ _ADJUSTABLE_BAR_FIELDS = (
     "pre_close",
     "volume",
     "amount",
+    "adj_convention",
 )
 
 
@@ -202,6 +208,7 @@ def _adjusted_forward_bars(
     的收益是个错数，比「这个样本没有前瞻窗口」更糟。
     """
     from src.services.adjustment_chain import (
+        RAW_CONVENTION,
         apply_read_adjustment_from_anchor,
     )
 
@@ -216,6 +223,14 @@ def _adjusted_forward_bars(
         # 首行的 pre_close 从不参与计算（`analyze_window` 的 ratio[0] 恒为
         # 1），填 close 只是为了不给窗口留一个语义不明的空值。
         "pre_close": anchor_close,
+        # 锚不是库里的一行，是因子快照给出的 `entry_close`，所以它的口径标签
+        # 只能由调用链断言而不能从数据里读出来。标 raw 断言的正是「close(D) 是
+        # 原始价」——这是 `ratio(D+1) = close(D)/pre_close(D+1)` 有意义的前提，
+        # 而 `pre_close(D+1)` 已由下面的守卫确认是 raw。这个断言是**继承来的**：
+        # D 所在的因子窗口走的是同一道守卫，那里出现非 raw 行时整组会被判成
+        # 不可复权。缺口在于回放侧并不过滤 `adjustment_unknown` 的候选，见
+        # 交付说明里登记的残留风险。
+        "adj_convention": RAW_CONVENTION,
     })
     if combined is None:
         return []

@@ -103,6 +103,9 @@ def _raw_bars(
             "data_source": "fixture",
             "adj_factor": 1.0,
             "adj_factor_source": "legacy_assume_one",
+            # 口径守卫的输入：非 raw（含缺列）时整窗 fail-closed。晋升后的
+            # 生产表全库都是 raw，夹具照实声明。
+            "adj_convention": "raw",
         })
     return rows
 
@@ -353,6 +356,7 @@ def _dividend_sample(config: Config):
             "pre_close": pre_close,
             "volume": 1_000_000.0,
             "amount": close * 1_000_000.0,
+            "adj_convention": "raw",
         })
     prior_rows = [
         {
@@ -364,6 +368,7 @@ def _dividend_sample(config: Config):
             "open": entry_close,
             "high": entry_close,
             "low": entry_close,
+            "adj_convention": "raw",
         }
         for index in range(20)
     ]
@@ -432,6 +437,7 @@ def test_forward_window_keeps_real_moves_after_the_dividend():
             "pre_close": pre_close,
             "volume": 1_000_000.0,
             "amount": close * 1_000_000.0,
+            "adj_convention": "raw",
         })
 
     adjusted = _adjusted_forward_bars(
@@ -464,6 +470,9 @@ def test_forward_window_fails_closed_on_a_broken_chain():
             "pre_close": 25.0 if index == 2 else 20.0,
             "volume": 1_000_000.0,
             "amount": 20_000_000.0,
+            # 口径必须声明成 raw，否则这条用例会因为口径守卫而通过，
+            # 断链判定本身反而没被测到。
+            "adj_convention": "raw",
         }
         for index in range(5)
     ]
@@ -500,6 +509,7 @@ def test_prior_window_dividend_does_not_inflate_volatility():
             "pre_close": pre_close,
             "volume": 1_000_000.0,
             "amount": 1_000_000.0,
+            "adj_convention": "raw",
         })
 
     raw_volatility, raw_liquidity = compute_pre_signal_features(
@@ -572,6 +582,198 @@ def test_second_application_is_refused_rather_than_squared():
     twice = apply_read_adjustment(once)
 
     pd.testing.assert_frame_equal(once, twice)
+
+
+def _relabel_one_row(db, convention: str) -> None:
+    """把窗口中间一行的 `adj_convention` 改掉。
+
+    这就是 efinance 降级覆写留下的形状：`data_provider/efinance_fetcher.py`
+    写死 `fqt=1`（前复权），覆写后那一行是「qfq 的 close + 上一次同步留下的
+    raw `pre_close`」，而 `src/storage.py` 对未声明口径的行落 `unknown`。
+    """
+    with db.get_session() as session:
+        target = (
+            session.query(StockDaily)
+            .filter(StockDaily.code == _CODE)
+            .order_by(StockDaily.date)
+            .all()[30]
+        )
+        target.adj_convention = convention
+        session.commit()
+
+
+@pytest.mark.parametrize("convention", ["qfq", "unknown", None])
+def test_production_path_fails_closed_on_a_foreign_convention(
+    seeded_database, convention
+):
+    """承重：生产因子路径必须把混口径窗口整窗判成不可复权。
+
+    这条同时钉住取数列清单——`build_factor_snapshot` 不 SELECT
+    `adj_convention` 的话，守卫在生产路径上完全是空转，这里会红。
+    """
+    db, rows = seeded_database
+    _relabel_one_row(db, convention)
+
+    group = _production_group(db, Config())
+
+    assert set(group["adj_factor_source"]) == {ANOMALOUS_SOURCE}
+    assert group["adj_factor"].isna().all()
+    # 价格原样保留：fail-closed 是「不施加」，不是「改成别的数」。
+    assert list(group["close"].astype(float)) == pytest.approx(
+        [row["close"] for row in rows]
+    )
+    assert list(group["volume"].astype(float)) == pytest.approx(
+        [row["volume"] for row in rows]
+    )
+
+
+def test_backtest_from_database_carries_the_convention_column(seeded_database):
+    """`from_database` 必须把 `adj_convention` 带进来。
+
+    它取的是 `select(*StockDaily.__table__.columns)`，所以这一列本来就在；这条
+    用例把「本来就在」变成有测试守着的事实——有人把它收窄成显式列清单时会红。
+    只钉 fail-closed 的用例挡不住这种改法：列丢了同样是 fail-closed，看起来
+    还是绿的，代价却是所有正常窗口一起失去复权。
+    """
+    db, _rows = seeded_database
+    cache = ValidationFactorCache.from_database(
+        db_manager=db,
+        data_version="fixture",
+        trade_dates=(_TRADE_DATE,),
+        codes=[_CODE],
+        lookback_days=Config().screening_factor_lookback_days,
+    )
+    try:
+        frame = cache._bar_groups[_CODE]
+    finally:
+        cache.close()
+
+    assert "adj_convention" in frame.columns
+    assert set(frame["adj_convention"]) == {"raw"}
+
+
+def test_backtest_window_fails_closed_on_a_foreign_convention(seeded_database):
+    """回测因子路径同生产路径：混口径整窗判不可复权。"""
+    db, rows = seeded_database
+    _relabel_one_row(db, "qfq")
+
+    window = _backtest_window(db, Config())
+
+    assert set(window["adj_factor_source"]) == {ANOMALOUS_SOURCE}
+    assert window["adj_factor"].isna().all()
+    assert list(window["close"].astype(float)) == pytest.approx(
+        [row["close"] for row in rows]
+    )
+
+
+def test_two_read_paths_agree_on_the_fail_closed_window(seeded_database):
+    """混口径时两条路径也必须给出同一个结论。
+
+    一条 fail-closed、另一条照常施加，就又回到「实盘与回测两套口径」——
+    只是这次两套的差别不是缩放系数，而是「有没有复权」。
+    """
+    db, _rows = seeded_database
+    _relabel_one_row(db, "qfq")
+
+    production = _production_group(db, Config())
+    backtest = _backtest_window(db, Config())
+
+    assert len(production) == len(backtest)
+    for column in ("close", "volume", "adj_factor"):
+        pd.testing.assert_series_equal(
+            production[column].reset_index(drop=True).astype(float),
+            backtest[column].reset_index(drop=True).astype(float),
+            check_names=False,
+            obj=f"两条路径的 {column} 不一致",
+        )
+    assert list(production["adj_factor_source"]) == list(
+        backtest["adj_factor_source"]
+    )
+
+
+def test_forward_and_prior_windows_fail_closed_on_a_foreign_convention():
+    """承重：前瞻 / 前置窗口里出现一行非 raw，整窗作废（返回空列表）。
+
+    这条同时钉住 `_ADJUSTABLE_BAR_FIELDS`——把 `adj_convention` 从清单里拿掉，
+    转 DataFrame 时这一列就丢了，守卫在这条路径上变成缺列拒绝（仍然安全），
+    但对照组的「整窗 raw 照常施加」会一起红，说明清单被改坏了。
+    """
+    signal_date = date(2026, 8, 5)
+
+    def rows(convention_of_third: str | None):
+        return [
+            {
+                "date": signal_date + timedelta(days=index + 1),
+                "open": 20.0,
+                "high": 20.0,
+                "low": 20.0,
+                "close": 20.0,
+                "pre_close": 20.0,
+                "volume": 1_000_000.0,
+                "amount": 20_000_000.0,
+                "adj_convention": (
+                    convention_of_third if index == 2 else "raw"
+                ),
+            }
+            for index in range(5)
+        ]
+
+    assert len(
+        _adjusted_forward_bars(
+            _bars(rows("raw")),
+            signal_date=signal_date,
+            anchor_close=20.0,
+            config=Config(),
+        )
+    ) == 5
+    assert len(_adjusted_prior_bars(_bars(rows("raw")), config=Config())) == 5
+
+    for convention in ("qfq", "unknown", None):
+        assert _adjusted_forward_bars(
+            _bars(rows(convention)),
+            signal_date=signal_date,
+            anchor_close=20.0,
+            config=Config(),
+        ) == [], f"前瞻窗口对 {convention!r} 没有 fail-closed"
+        assert _adjusted_prior_bars(
+            _bars(rows(convention)), config=Config()
+        ) == [], f"前置窗口对 {convention!r} 没有 fail-closed"
+
+
+def test_dataset_content_hash_covers_the_convention_column():
+    """两份只有 `adj_convention` 不同的隔离数据集不得共享 `data_version`。
+
+    这是护栏 §4 那条失效模式的又一实例：改动之前 `adj_convention` 不影响任何
+    输出，漏哈希没有后果；改动之后它决定这段窗口到底会不会被复权，也就是决定
+    回测看到的是复权价还是原始价。与 `_HASH_BAR_FIELDS` 漏 `pre_close` 同类。
+    """
+    from hashlib import sha256
+
+    from src.backtest.services.bottom_divergence_v2_dataset import (
+        _validate_and_hash_bar,
+    )
+
+    def digest(convention: str) -> str:
+        hasher = sha256()
+        _validate_and_hash_bar(hasher, {
+            "code": _CODE,
+            "date": _TRADE_DATE,
+            "open": 20.0,
+            "high": 20.2,
+            "low": 19.8,
+            "close": 20.0,
+            "pre_close": 20.0,
+            "adj_convention": convention,
+            "volume": 1_000_000.0,
+            "amount": 20_000_000.0,
+            "pct_chg": 0.0,
+            "data_source": "fixture",
+            "adj_factor": 1.0,
+            "adj_factor_source": "legacy_assume_one",
+        })
+        return hasher.hexdigest()
+
+    assert digest("raw") != digest("qfq")
 
 
 def test_window_without_pre_close_is_marked_unadjustable():

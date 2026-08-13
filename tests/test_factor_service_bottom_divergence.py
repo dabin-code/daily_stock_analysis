@@ -156,6 +156,9 @@ class TestFactorServiceBottomDivergence(unittest.TestCase):
                 data_source="source_b" if index % 2 else "source_a",
                 adj_factor=1.25,
                 adj_factor_source="known_b" if index % 2 else "known_a",
+                # 口径守卫的输入。非 raw（含缺列）时整窗 fail-closed，
+                # 这批夹具测的是复权链本身，必须声明是原始价。
+                adj_convention="raw",
             ))
         return rows
 

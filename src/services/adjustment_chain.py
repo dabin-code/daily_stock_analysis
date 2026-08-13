@@ -22,14 +22,22 @@
 本模块只负责算和施加，不改数据库，也不决定谁可信——下游门禁读
 ``adj_factor_source``，在读取侧接上之前不要把 ``pre_close_chain`` 加进信任白名单，
 否则检测器会在带除权跳空的原始价上算阻力位，从「诚实地拒绝出信号」退化成「静默算错」。
+
+模块分两层，边界不要混：上半部分（``analyze_window`` / ``apply_adjustment``）是
+**纯算术**，契约是「调用方给的是同一口径、按日期升序的单只窗口」；下半部分
+（``apply_read_adjustment`` 系列）是**读取路径入口**，额外负责准入判定，其中就包括
+``adj_convention`` 口径守卫（见 ``convention_reject_reason``）。
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from typing import Any, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # ── 来源标记 ──────────────────────────────────────────────────────────
 # 可信段与被作废段必须用不同的字符串：下游白名单只认前者，后者进白名单等于
@@ -43,6 +51,18 @@ CLOSE_COLUMN = "close"
 PRE_CLOSE_COLUMN = "pre_close"
 ADJ_FACTOR_COLUMN = "adj_factor"
 ADJ_FACTOR_SOURCE_COLUMN = "adj_factor_source"
+
+# ── 口径 ──────────────────────────────────────────────────────────────
+# ``stock_daily.adj_convention`` 标的是**每一行价格自己**的复权口径
+# （``raw`` / ``qfq`` / ``unknown``，见 ``src/storage.py`` 的
+# ``VALID_ADJ_CONVENTIONS``）。这里不 import 那个常量：本模块被 spawn 出来的
+# 回测子进程直接加载，刻意不依赖 ORM 与数据库。
+# ``tests/test_adjustment_chain.py`` 钉住两处取值一致，防止各写各的。
+ADJ_CONVENTION_COLUMN = "adj_convention"
+RAW_CONVENTION = "raw"
+
+CONVENTION_REJECT_MISSING_COLUMN = "adj_convention_column_missing"
+CONVENTION_REJECT_NON_RAW = "adj_convention_not_raw"
 
 # 价格列乘 g(t)。
 #
@@ -349,9 +369,13 @@ def apply_adjustment(
 
 
 # ── 读取路径接入（Task 2）────────────────────────────────────────────────
-# 下面四个函数是三条读取路径共用的入口。它们不改上面的任何判定规则，只负责把
-# 「已经施加过怎么办」「解算不出来怎么办」「锚在窗口另一端怎么办」这三件事收敛成
-# 一份实现——三条路径各写一遍才是两套口径并存的真正来源。
+# 下面几个函数是三条读取路径共用的入口。它们不改上面的任何判定规则，只负责把
+# 「已经施加过怎么办」「解算不出来怎么办」「这段价格是不是同一个口径」「锚在窗口
+# 另一端怎么办」这四件事收敛成一份实现——三条路径各写一遍才是两套口径并存的
+# 真正来源。
+#
+# 口径守卫（``convention_reject_reason``）只在这一层生效，不下沉到
+# ``analyze_window``：上面那一层是纯算术，契约是「调用方给的是同一口径的窗口」。
 
 
 def is_adjusted(df: Optional[pd.DataFrame]) -> bool:
@@ -370,6 +394,88 @@ def is_adjusted(df: Optional[pd.DataFrame]) -> bool:
         .isin((TRUSTED_SOURCE, ANOMALOUS_SOURCE))
         .any()
     )
+
+
+def convention_reject_reason(df: Optional[pd.DataFrame]) -> Optional[str]:
+    """窗口能不能当作单一 ``raw`` 口径来成链；``None`` 表示可以。
+
+    **为什么读取侧必须看这一列。** 本模块按 ``close(t-1)/pre_close(t)`` 成链，
+    这个式子只在两行同口径时才有意义。``data_provider/efinance_fetcher.py``
+    的降级路径写死 ``fqt=1``（前复权），它覆写某一行之后，那一行会变成
+    「qfq 的 close + 上一次同步留下的 raw ``pre_close``」，而口径标签落
+    ``unknown``。混着成链算出来的因子不会报错、不会越界、也不会断链——它只是
+    **错**。更糟的是窗口归一到 D：D 恰好是这样一行时，整个窗口的价格水平一起偏。
+    今天不出错只因为 staging 晋升后全库恰好都是 ``raw``；三条写入路径小心维护
+    的这一列，在读取侧一个消费方都没有，正是「改动前是死条款、改动后变成活漏洞」
+    的下一个实例。
+
+    **缺列与 NULL / ``unknown`` / ``qfq`` 同等对待，一律拒绝。** 这个取舍是本
+    守卫的核心：
+
+    - 「缺列即放行」会让整道守卫被「忘了 SELECT 这一列」这**一个动作**关掉，
+      而且不报错、不留痕，只是悄悄退回混口径成链。守卫要防的失效模式恰好就长
+      这个样子，用同样形状的漏洞去实现它没有意义。
+    - 「缺列即拒绝」的代价有界且响：命中时走 ``mark_unadjustable``——价格原样
+      保留、因子写 NaN、来源写 anomalous，下游按 unknown 处理，也就是退化回
+      gate-3 之前那个安全状态；不抛异常、不中断流程，并且首次命中打一条
+      WARNING 指名是缺列还是口径不符，不至于只表现为「这只标的永远
+      ``adjustment_unknown``」。
+
+    严格只落在**读取路径入口**（``apply_read_adjustment`` /
+    ``apply_read_adjustment_from_anchor``）。``analyze_window`` 与
+    ``apply_adjustment`` 是纯算术，契约是「调用方给的是同一口径的窗口」，
+    不看这一列：离线抽查脚本已经在 SQL 侧 ``WHERE adj_convention='raw'``
+    过滤过，内存里人工构造的窗口也不该被迫编造一个口径标签。
+
+    取值按**精确相等**判定，不做 strip / lower 归一化：需要归一化才认得的值
+    不可能出自本仓库的三条写入路径，替它猜等于回到「按数据源名字猜口径」。
+    """
+    if df is None or len(df) == 0:
+        return None
+    if ADJ_CONVENTION_COLUMN not in df.columns:
+        return CONVENTION_REJECT_MISSING_COLUMN
+    if bool(df[ADJ_CONVENTION_COLUMN].eq(RAW_CONVENTION).all()):
+        return None
+    return CONVENTION_REJECT_NON_RAW
+
+
+# 首次命中才告警：混口径一旦发生就会命中成千上万个 (code, 回放日) 组合，
+# 逐次打日志会把有用信息淹掉。这里只求「操作员知道发生了什么、从哪查起」。
+_WARNED_CONVENTION_REASONS: set = set()
+
+
+def _warn_convention_once(reason: str, detail: str) -> None:
+    if reason in _WARNED_CONVENTION_REASONS:
+        return
+    _WARNED_CONVENTION_REASONS.add(reason)
+    logger.warning(
+        "复权链拒绝该窗口（%s）：%s。这些行按未复权处理，"
+        "下游会判 adjustment_unknown，不会静默按原样成链。",
+        reason,
+        detail,
+    )
+
+
+def _convention_blocks_adjustment(df: pd.DataFrame) -> bool:
+    reason = convention_reject_reason(df)
+    if reason is None:
+        return False
+    if reason == CONVENTION_REJECT_MISSING_COLUMN:
+        _warn_convention_once(
+            reason,
+            f"取数结果里没有 {ADJ_CONVENTION_COLUMN} 列，"
+            "读取路径需要把它加进取数列清单",
+        )
+    else:
+        values = df[ADJ_CONVENTION_COLUMN]
+        offenders = sorted(
+            {str(value) for value in values[~values.eq(RAW_CONVENTION)]}
+        )
+        _warn_convention_once(
+            reason,
+            f"窗口内出现非 {RAW_CONVENTION} 口径 {offenders}",
+        )
+    return True
 
 
 def mark_unadjustable(df: pd.DataFrame) -> pd.DataFrame:
@@ -395,6 +501,12 @@ def apply_read_adjustment(df: pd.DataFrame) -> pd.DataFrame:
     缺 ``pre_close`` 列（只可能是内存里人工构造的窗口——三条取数路径都带这列）
     按 fail-closed 标记，不施加也不打可信标记。
 
+    ``adj_convention`` 不是整窗 ``raw``（含缺列）时同样 fail-closed，理由与
+    取舍见 ``convention_reject_reason``：混口径成链算出来的因子只是错，不会
+    自己暴露。这里是**整窗**拒绝而不是切段——``adj_convention`` 描述的是这一行
+    价格本身的口径，一行口径不对意味着它的 ``close`` 与 ``pre_close`` 之间、
+    以及它与相邻行之间的关系全部失效，没有一个「之后照常施加」的安全边界。
+
     窗口内部的断链不在这里拦：``analyze_window`` 已经按位置切段，被作废段的
     因子是 NaN、来源是 anomalous，下游据此判 unknown。整窗拒绝反而会把一次
     转板重组的代价扩大到整段历史。
@@ -402,6 +514,8 @@ def apply_read_adjustment(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or len(df) == 0 or is_adjusted(df):
         return df
     if PRE_CLOSE_COLUMN not in df.columns:
+        return mark_unadjustable(df)
+    if _convention_blocks_adjustment(df):
         return mark_unadjustable(df)
     return apply_adjustment(df)
 
@@ -422,10 +536,15 @@ def apply_read_adjustment_from_anchor(df: pd.DataFrame) -> pd.DataFrame:
     与末行归一不同，这里**整窗 fail-closed**：断链会让 ``analyze_window``
     作废包含首行在内的整个前缀，锚点本身的因子成了 NaN，剩下的段再没有任何
     可信的换算关系能接回 D。
+
+    口径守卫同 ``apply_read_adjustment``：``adj_convention`` 不是整窗 ``raw``
+    （含缺列）即 fail-closed。
     """
     if df is None or len(df) == 0 or is_adjusted(df):
         return df
     if PRE_CLOSE_COLUMN not in df.columns:
+        return mark_unadjustable(df)
+    if _convention_blocks_adjustment(df):
         return mark_unadjustable(df)
     chain = analyze_window(df)
     if not chain.trusted:

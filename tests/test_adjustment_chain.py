@@ -25,15 +25,22 @@ import pytest
 
 from src.services import adjustment_chain as chain_module
 from src.services.adjustment_chain import (
+    ADJ_CONVENTION_COLUMN,
     ANOMALOUS_SOURCE,
     BREAK_MISSING_PRE_CLOSE,
     BREAK_RATIO_ABOVE_CEILING,
     BREAK_RATIO_BELOW_FLOOR,
+    CONVENTION_REJECT_MISSING_COLUMN,
+    CONVENTION_REJECT_NON_RAW,
     RATIO_CORRUPTION_CEILING,
+    RAW_CONVENTION,
     TRUSTED_SOURCE,
     analyze_window,
     apply_adjustment,
+    apply_read_adjustment,
+    apply_read_adjustment_from_anchor,
     compute_window_factors,
+    convention_reject_reason,
 )
 
 
@@ -654,3 +661,184 @@ def test_source_constants_stay_distinguishable():
     """
     assert chain_module.TRUSTED_SOURCE != chain_module.ANOMALOUS_SOURCE
     assert chain_module.ANOMALOUS_SOURCE.startswith(chain_module.TRUSTED_SOURCE)
+
+
+# ── 9. 口径守卫：只有整窗 raw 才允许成链 ───────────────────────────────
+#
+# `adj_convention` 标的是**每一行价格自己**的复权口径。
+# `data_provider/efinance_fetcher.py` 的降级路径写死 `fqt=1`（前复权），它覆写
+# 某一行之后，那一行是「qfq 的 close + 上一次同步留下的 raw pre_close」，标签
+# 落 unknown。混着成链算出来的因子不越界、不断链、不报错——它只是**错**，而且
+# 窗口归一到 D 时若 D 恰好是这样一行，整个窗口的价格水平会一起偏。
+#
+# 下面的用例都用同一组数字，只改口径标签，因为这正是要区分的两种情形：
+# 数值完全一样，能不能成链只取决于这一列。
+
+
+def _convention_window(conventions):
+    """10 送 10 的窗口 + 指定的逐行口径标签。"""
+    frame = _frame([20.0, 20.0, 10.5, 11.0], [19.5, 20.0, 10.0, 10.5])
+    if conventions is not None:
+        frame[ADJ_CONVENTION_COLUMN] = conventions
+    return frame
+
+
+def test_read_path_still_applies_the_chain_when_every_row_is_raw():
+    """回归保护：整窗 raw 时守卫必须完全透明。
+
+    守卫写错方向（例如把 raw 也拒掉）不会报错，只会让全库一夜之间失去所有
+    可信复权——现象上和「回测又出不了样本了」无法区分。
+    """
+    frame = _convention_window([RAW_CONVENTION] * 4)
+
+    adjusted = apply_read_adjustment(frame)
+
+    assert list(adjusted["adj_factor"]) == pytest.approx([0.5, 0.5, 1.0, 1.0])
+    assert list(adjusted["close"]) == pytest.approx([10.0, 10.0, 10.5, 11.0])
+    assert list(adjusted["adj_factor_source"]) == [TRUSTED_SOURCE] * 4
+    # 与不带口径列时逐列相同：守卫只做准入，不改任何算术。
+    pd.testing.assert_frame_equal(
+        adjusted.drop(columns=[ADJ_CONVENTION_COLUMN]),
+        apply_adjustment(_convention_window(None)),
+    )
+
+
+def test_one_foreign_convention_row_fails_closed_the_whole_window():
+    """承重：窗口里出现一行非 raw，整窗不得成链。
+
+    对照组把同一批数字全标成 raw，证明守卫拦下的确实是一次**会改价**的施加——
+    只留 fail-closed 那一条断言时，一个恒不施加的实现也能骗过去。
+
+    整窗而不是切段：`adj_convention` 描述的是这一行价格本身的口径，它一旦不对，
+    这行的 close 与 pre_close 之间、以及它与相邻两行之间的关系全部失效，没有
+    「异常点之后照常施加」那种安全边界。
+    """
+    raw_prices = [20.0, 20.0, 10.5, 11.0]
+
+    trusted = apply_read_adjustment(_convention_window([RAW_CONVENTION] * 4))
+    blocked = apply_read_adjustment(
+        _convention_window([RAW_CONVENTION, RAW_CONVENTION, "qfq", RAW_CONVENTION])
+    )
+
+    assert list(trusted["close"]) != pytest.approx(raw_prices), (
+        "对照组本身就没有缩放价格，这条用例证明不了守卫拦住了什么"
+    )
+    assert list(blocked["close"]) == pytest.approx(raw_prices)
+    assert list(blocked["volume"]) == pytest.approx(
+        list(_convention_window(None)["volume"])
+    )
+    assert blocked["adj_factor"].isna().all()
+    assert list(blocked["adj_factor_source"]) == [ANOMALOUS_SOURCE] * 4
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,          # 未声明口径的存量行
+        np.nan,        # SQL NULL 经 pandas 之后的样子
+        "unknown",     # storage.py 对未声明来源统一落的值
+        "qfq",         # efinance 降级路径的真实口径
+        "",            # 空串不是「没写」，同样无从判断
+        "RAW",         # 大小写不做归一化
+        " raw ",       # 空白不做归一化
+    ],
+)
+def test_every_non_raw_label_fails_closed(value):
+    """只有逐字 ``raw`` 放行。
+
+    大小写与空白刻意不做归一化：需要归一化才认得的值不可能出自本仓库的三条
+    写入路径，替它猜等于回到「按数据源名字猜口径」——storage.py 的注释把那种
+    做法叫「谎报」。
+    """
+    frame = _convention_window([RAW_CONVENTION, RAW_CONVENTION, value, RAW_CONVENTION])
+
+    adjusted = apply_read_adjustment(frame)
+
+    assert convention_reject_reason(frame) == CONVENTION_REJECT_NON_RAW
+    assert adjusted["adj_factor"].isna().all()
+    assert list(adjusted["adj_factor_source"]) == [ANOMALOUS_SOURCE] * 4
+
+
+def test_a_missing_convention_column_is_rejected_like_a_foreign_one():
+    """**缺列即拒绝**——本次改动的核心取舍。
+
+    另一条路（缺列即放行）会让整道守卫被「忘了 SELECT 这一列」这一个动作整体
+    关掉，不报错、不留痕，只是悄悄退回混口径成链。守卫要防的失效模式恰好就长
+    这个样子，用同样形状的漏洞去实现它没有意义。
+
+    代价是有界的：拒绝走的是 `mark_unadjustable`，价格原样保留、因子 NaN、
+    来源 anomalous，下游按 unknown 处理，也就是退回 gate-3 之前那个安全状态。
+    """
+    frame = _convention_window(None)
+
+    adjusted = apply_read_adjustment(frame)
+
+    assert convention_reject_reason(frame) == CONVENTION_REJECT_MISSING_COLUMN
+    assert list(adjusted["close"]) == pytest.approx([20.0, 20.0, 10.5, 11.0])
+    assert adjusted["adj_factor"].isna().all()
+    assert list(adjusted["adj_factor_source"]) == [ANOMALOUS_SOURCE] * 4
+
+
+def test_the_pure_math_layer_deliberately_ignores_the_convention_column():
+    """守卫只落在读取路径入口，不下沉到 `analyze_window` / `apply_adjustment`。
+
+    下沉的代价是实的：`scripts/audit_adjustment_chain.py` 已经在 SQL 侧
+    `WHERE adj_convention='raw'` 过滤过，它取的三列里根本没有这一列；测试与
+    离线分析里人工构造的窗口也会被迫编造一个口径标签，那种标签不承载任何信息。
+    这一层的契约是「调用方给的是同一口径的窗口」，判定口径不是它的职责。
+    """
+    mixed = _convention_window([RAW_CONVENTION, "qfq", "unknown", None])
+
+    chain = analyze_window(mixed)
+    adjusted = apply_adjustment(mixed)
+
+    assert chain.trusted
+    assert list(adjusted["adj_factor"]) == pytest.approx([0.5, 0.5, 1.0, 1.0])
+
+
+def test_the_anchor_entry_point_shares_the_convention_guard():
+    """前瞻窗口入口漏接守卫的话，两个入口就是两套口径准入规则。"""
+    frame = _convention_window(
+        [RAW_CONVENTION, "unknown", RAW_CONVENTION, RAW_CONVENTION]
+    )
+
+    adjusted = apply_read_adjustment_from_anchor(frame)
+
+    assert adjusted["adj_factor"].isna().all()
+    assert list(adjusted["adj_factor_source"]) == [ANOMALOUS_SOURCE] * 4
+    assert list(adjusted["close"]) == pytest.approx([20.0, 20.0, 10.5, 11.0])
+    # 对照：整窗 raw 时首行归一照常生效（锚点因子恒为 1）。
+    trusted = apply_read_adjustment_from_anchor(
+        _convention_window([RAW_CONVENTION] * 4)
+    )
+    assert float(trusted["adj_factor"].iloc[0]) == pytest.approx(1.0)
+    assert list(trusted["adj_factor_source"]) == [TRUSTED_SOURCE] * 4
+
+
+def test_a_fail_closed_window_is_not_reconsidered_on_a_second_read():
+    """已被判不可复权的窗口再读一次仍然不可复权，不会「第二次就放行」。"""
+    once = apply_read_adjustment(_convention_window(None))
+    twice = apply_read_adjustment(once)
+
+    pd.testing.assert_frame_equal(once, twice)
+
+
+def test_convention_reject_reason_names_the_two_causes_apart():
+    """两种拒绝原因要能分开：一个是代码缺陷，一个是数据状况。
+
+    处理方式相同（都 fail-closed），但排查入口完全不同——缺列要去改取数列
+    清单，非 raw 要去查是哪个数据源覆写了这一行。
+    """
+    assert CONVENTION_REJECT_MISSING_COLUMN != CONVENTION_REJECT_NON_RAW
+    assert convention_reject_reason(_convention_window([RAW_CONVENTION] * 4)) is None
+    assert convention_reject_reason(pd.DataFrame()) is None
+
+
+def test_raw_convention_matches_the_storage_enum():
+    """本模块刻意不 import storage（回测子进程按 spawn 加载，不带 ORM），
+    所以取值一致要靠这条用例钉住，而不是靠两处都写对。
+    """
+    from src.storage import VALID_ADJ_CONVENTIONS
+
+    assert RAW_CONVENTION in VALID_ADJ_CONVENTIONS
+    assert ADJ_CONVENTION_COLUMN == "adj_convention"

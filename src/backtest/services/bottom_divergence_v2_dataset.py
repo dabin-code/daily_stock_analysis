@@ -27,6 +27,11 @@ _HASH_BAR_FIELDS = (
     # `pre_close` 不同的隔离数据集会得到同一个 data_version，于是冻结证据与
     # base 快照缓存会跨数据集复用——和白名单漏登记同类的过度复用。
     "pre_close",
+    # 同理。`adj_convention` 决定这段窗口到底会不会被复权
+    # （`adjustment_chain.convention_reject_reason`：非 raw 即整窗 fail-closed），
+    # 也就是决定回测看到的是复权价还是原始价。不哈希它，两份只有 `adj_convention`
+    # 不同的隔离数据集会共享同一个 data_version。
+    "adj_convention",
     "volume",
     "amount",
     "pct_chg",

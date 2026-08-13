@@ -37,6 +37,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The read-time adjustment chain now **fails closed on any row whose
+  `adj_convention` is not `raw`**. Three write paths were carefully maintaining
+  that column and no read path consumed it, which made it a dead clause that the
+  read-side adjustment work turned into a live hole: `efinance_fetcher.py`
+  hard-codes `fqt=1` (front-adjusted) on the degraded fetch path, so a row it
+  overwrites becomes a qfq `close` next to the raw `pre_close` left behind by the
+  previous sync, labelled `unknown`. Chaining `close(t-1)/pre_close(t)` across
+  that boundary mixes two conventions and produces a factor that is simply wrong
+  — it does not break the chain, exceed a bound, or raise. Worse, if the mislabelled
+  row happens to be the anchor day D, the whole window's price level shifts.
+  Nothing is wrong today only because the promotion left the entire table on
+  `raw`. **A missing `adj_convention` column is rejected exactly like `NULL` /
+  `unknown` / `qfq`**: allowing it would let one forgotten column in a `SELECT`
+  list switch the whole guard off silently, which is the shape of the failure
+  mode the guard exists to prevent. Rejection costs are bounded and loud — it
+  routes through `mark_unadjustable` (prices untouched, `adj_factor` NaN, source
+  `pre_close_chain_anomalous`, downstream reads `adjustment_unknown`), i.e. the
+  safe pre-gate-3 state, plus a one-shot warning naming the cause. The guard sits
+  only on the read-path entrypoints (`apply_read_adjustment` /
+  `apply_read_adjustment_from_anchor`); `analyze_window` and `apply_adjustment`
+  stay pure arithmetic whose contract is that the caller supplied a
+  single-convention window, so `scripts/audit_adjustment_chain.py` (which already
+  filters `WHERE adj_convention='raw'` in SQL) and hand-built in-memory windows
+  are unaffected. Rejection is whole-window rather than segment-wise, because a
+  row's convention invalidates its own `close`/`pre_close` relationship, leaving
+  no safe boundary of the kind a chain break has. `build_factor_snapshot` now
+  selects `adj_convention`, `_ADJUSTABLE_BAR_FIELDS` in the replay path carries
+  it through to the forward/prior windows, and `ValidationFactorCache.from_database`
+  already selected it (now pinned by a test). Also added it to `_HASH_BAR_FIELDS`
+  for the same reason `pre_close` was added: it now decides whether a window gets
+  adjusted at all, so two datasets differing only in `adj_convention` must not
+  share a `data_version`. **`data_provider/efinance_fetcher.py` is deliberately
+  unchanged** — switching it away from `fqt=1` would change the prices shown in
+  reports and needs its own evaluation; this change only makes the read side
+  degrade safely.
 - Reconstructed adjustment factors **at read time** from `pre_close`, unblocking
   the bottom-divergence v2 backtest. The detector never used `adj_factor`
   arithmetically — it only asserts the source is whitelisted and the value is

@@ -138,6 +138,10 @@ class FactorService:
                     # （`market_data_sync_service.py:360-369`），
                     # `scripts/validate_staging_before_promotion.py` 守着它。
                     "pre_close": row.pre_close,
+                    # 口径守卫的输入。缺了这一列，`apply_read_adjustment` 会把
+                    # 整个窗口判成不可复权（fail-closed，见
+                    # `adjustment_chain.convention_reject_reason`）——不是可选项。
+                    "adj_convention": row.adj_convention,
                     "data_source": row.data_source,
                     "adj_factor": row.adj_factor,
                     "adj_factor_source": row.adj_factor_source,
