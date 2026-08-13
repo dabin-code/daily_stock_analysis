@@ -41,6 +41,7 @@ from src.backtest.services.bottom_divergence_v2_replay import (
 from src.backtest.services.bottom_divergence_v2_report import (
     canonical_json_dumps,
 )
+from src.backtest.services.replay_strategies import BOTTOM_DIVERGENCE_V2
 from src.config import Config
 from src.services.adjustment_chain import (
     ANOMALOUS_SOURCE,
@@ -147,12 +148,17 @@ def test_v1_and_v2_legs_share_one_base_factor_pass():
         config=v1_config, universe=universe, trade_date=trade_date
     )
     builds_after_v1 = cache.stats["base_snapshot_builds"]
+    evidence_after_v1 = cache.stats["frozen_evidence_builds"]
 
     cache.build_factor_snapshot(
         config=v2_config, universe=universe, trade_date=trade_date
     )
 
     assert builds_after_v1 == 1, "第一条 leg 应当算一次基础因子"
+    assert evidence_after_v1 == 0, (
+        "v1 这条 leg 跑了 v2 的证据层；证据层归属由策略描述符决定，"
+        "不该按配置以外的东西认领"
+    )
     assert cache.stats["base_snapshot_builds"] == 1, (
         "第二条 leg 重算了基础因子，跨策略的因子复用已失效"
     )
@@ -1084,6 +1090,7 @@ def test_event_dates_use_frozen_candidate_record_not_dataframe_index_dtype():
         signal_date=date(2026, 8, 5),
         config=Config(bottom_divergence_v2_enabled=True),
         stock_repository=ForbiddenRepository(),
+        strategy=BOTTOM_DIVERGENCE_V2,
     )
     assert result == {
         "early": date(2026, 7, 22),
@@ -1119,6 +1126,7 @@ def test_unconfirmed_major_bar_is_not_an_r2_event():
         signal_date=date(2026, 8, 5),
         config=Config(bottom_divergence_v2_enabled=True),
         stock_repository=ForbiddenRepository(),
+        strategy=BOTTOM_DIVERGENCE_V2,
     )
     assert result == {
         "early": date(2026, 7, 22),

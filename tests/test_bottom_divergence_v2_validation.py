@@ -2395,6 +2395,9 @@ def test_v1_replay_uses_first_legacy_confirmation_event_only() -> None:
     assert batch.samples[0].signal_date == trade_dates[0]
     assert batch.samples[0].candidate_version.startswith("v1:001337:")
     assert len(stock_repo.forward_calls) == 1
+    # v1 的三个事件日期同为确认日，信号日之后不会再成熟；照样收集证据会给
+    # 测试段塞进一批永远不变的记录，把转化率算错。
+    assert batch.event_evidence == ()
 
 
 @pytest.mark.unit

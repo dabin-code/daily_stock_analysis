@@ -433,3 +433,72 @@ class FiveLayerBacktestRecommendation(Base):
             "validation_status": self.validation_status,
             "evidence_json": self.evidence_json,
         }
+
+
+# ── Table 6: Run Data Manifest ──────────────────────────────────────────────
+
+class RunDataManifest(Base):
+    """spec 10.5：一次运行读过的那份只读快照的完整指纹，与运行一对一。
+
+    存在的理由是数据本身是活的：日常同步持续写 `stock_daily`，staging 会整表
+    提升，生产库这周被重建过两次。只靠 `five_layer_backtest_runs` 上的几个版本
+    字段，运行结束后无从证明它读的数据还在，也无从判定两次运行是否可比。
+
+    版本位（`adj_table_version` / `corporate_actions_version` /
+    `st_industry_version`）是三态，取值约定见
+    `src/backtest/services/run_data_manifest_service.py`：显式缺失标记、内容
+    摘要、以及本次改动之前写入的 NULL。
+    """
+    __tablename__ = "run_data_manifest"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    backtest_run_id = Column(String(64), unique=True, nullable=False, index=True)
+
+    snapshot_path = Column(Text)
+
+    # 逐表内容摘要，可比性由它决定。不含审计时间戳列。
+    table_hashes_json = Column(Text)
+    row_counts_json = Column(Text)
+
+    # 逐表重写摘要：只覆盖 created_at / updated_at 这类审计时间戳。生产库
+    # 962 万行 stock_daily 的审计时间戳几乎全部来自同一次 staging 提升，下次
+    # 提升会整表改写而价格不变，因此这条信号单独存放、不参与可比性判定，
+    # 只在差异清单里以非阻断项出现。取值约定见 run_data_manifest_service。
+    row_rewrite_hashes_json = Column(Text)
+
+    # spec 的 `date_range` 拆成两列而不是塞一个 JSON：时间窗要参与范围查询与
+    # 逐字段比对，塞进 JSON 后两者都得先解析。
+    date_range_from = Column(Date)
+    date_range_to = Column(Date)
+
+    # 摘要版本是 `sha256:` + 64 位十六进制，共 71 字符。
+    adj_table_version = Column(String(80))
+    corporate_actions_version = Column(String(80))
+    st_industry_version = Column(String(80))
+
+    code_revision = Column(String(64))
+    config_hash = Column(String(64))
+
+    created_at = Column(DateTime, default=datetime.now)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "backtest_run_id": self.backtest_run_id,
+            "snapshot_path": self.snapshot_path,
+            "table_hashes_json": self.table_hashes_json,
+            "row_counts_json": self.row_counts_json,
+            "row_rewrite_hashes_json": self.row_rewrite_hashes_json,
+            "date_range_from": (
+                self.date_range_from.isoformat() if self.date_range_from else None
+            ),
+            "date_range_to": (
+                self.date_range_to.isoformat() if self.date_range_to else None
+            ),
+            "adj_table_version": self.adj_table_version,
+            "corporate_actions_version": self.corporate_actions_version,
+            "st_industry_version": self.st_industry_version,
+            "code_revision": self.code_revision,
+            "config_hash": self.config_hash,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }

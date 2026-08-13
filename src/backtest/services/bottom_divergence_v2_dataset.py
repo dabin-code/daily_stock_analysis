@@ -2,7 +2,7 @@
 """Streaming isolated-dataset copy for deterministic validation."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from datetime import date
 from hashlib import sha256
 from pathlib import Path
@@ -15,6 +15,7 @@ from .bottom_divergence_v2_validation import ValidationInputError
 
 
 COPY_BATCH_SIZE = 2000
+SNAPSHOT_DB_FILENAME = "validation.db"
 _HASH_BAR_FIELDS = (
     "code",
     "date",
@@ -230,8 +231,19 @@ def isolated_replay_database(
     market_guard_index: str,
     config: Any = None,
     market_environment_version: str = "market_environment_engine:v1",
+    snapshot_dir: Optional[Path] = None,
 ) -> Iterator[Any]:
-    """Stream a warmup+evaluation+future slice into an isolated SQLite DB."""
+    """Stream a warmup+evaluation+future slice into an isolated SQLite DB.
+
+    `snapshot_dir` 不给时沿用原行为：快照建在进程临时目录里，退出即删。
+    给了就把快照落在该目录下并留存（spec 10.5 的 export 段）——运行结束后
+    数据还在，摘要才可复算、两次运行才谈得上可比。留存的快照按
+    `run_data_manifest_service.prune_retained_snapshots` 的策略回收。
+
+    快照的「只读」由 manifest 里的摘要保证，不靠文件系统权限位：库是 WAL
+    模式，把主库文件置为只读会让它连读都打不开，反而毁掉留存的意义。任何
+    事后改动都会让复算出的摘要对不上，可比性判定随之判红。
+    """
     from sqlalchemy import select
 
     from src.storage import (
@@ -248,13 +260,22 @@ def isolated_replay_database(
     if not codes:
         raise ValidationInputError("EMPTY_UNIVERSE", "universe is empty")
     stock_codes = list(dict.fromkeys([*codes, market_guard_index]))
-    with TemporaryDirectory(prefix="bottom-divergence-v2-validation-") as root:
-        database_path = Path(root) / "validation.db"
+    with ExitStack() as stack:
+        if snapshot_dir is None:
+            root = Path(stack.enter_context(
+                TemporaryDirectory(prefix="bottom-divergence-v2-validation-")
+            ))
+        else:
+            root = Path(snapshot_dir)
+            root.mkdir(parents=True, exist_ok=True)
+        database_path = root / SNAPSHOT_DB_FILENAME
         temporary = object.__new__(DatabaseManager)
         DatabaseManager.__init__(
             temporary,
             f"sqlite:///{database_path.as_posix()}",
         )
+        temporary.snapshot_path = str(database_path)
+        temporary.snapshot_retained = snapshot_dir is not None
         try:
             with (
                 source_db.get_session() as source_session,

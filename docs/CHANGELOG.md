@@ -11,6 +11,128 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`run_data_manifest` records what data a run actually read, and
+  `compare_manifests` turns "are these two runs comparable" into a verdict the code
+  produces.** The database is alive — daily sync writes `stock_daily`, staging gets
+  promoted wholesale, and this file has been rebuilt twice in the last two days —
+  so a run that finished yesterday may have read data that no longer exists. The
+  manifest holds the snapshot path, a per-table digest and row count, the data
+  window, upstream product versions, the git revision, and the config hash, one row
+  per run. `isolated_replay_database` gains an opt-in retained mode; the default
+  still uses a temporary directory, so no existing caller changes. Retained
+  snapshots are pruned to the newest three, overridable, with a `.pinned` marker
+  that exempts one. Three is the smallest number that answers "the digest moved —
+  was it this run, or had the baseline already drifted", which needs the run, its
+  baseline, and one older reference; at roughly 4–5 GB per full-window snapshot,
+  five would cross 25 GB.
+  **The blocking digest excludes `created_at` and `updated_at`, and a separate
+  non-blocking digest reports that rows were rewritten.** Including the audit
+  timestamps was tried first and measurement rejected it: 9,621,460 of the
+  9,622,383 rows in `stock_daily` carry a single timestamp, the one stamped by the
+  staging promotion, back to 2018. Every promotion or rebuild therefore rewrites the
+  timestamp on every row while the prices stay byte-identical, which would turn the
+  verdict red on routine maintenance — and a verdict that is red every time is one
+  people stop reading, which is worse than none because the door still looks
+  guarded. Detection does not weaken: if a value changed, the value itself moves the
+  digest. The exclusion is an exact-name set, never a pattern, because these tables
+  carry `list_date`, `delist_date`, `trade_date`, `date`, and `adj_anchor_date` — a
+  `*_date` rule swallows all five, and a `*_at` rule is harmless only until someone
+  adds `announced_at`. A test pins the set literally and feeds the partitioner
+  synthetic columns to prove only the exact names are dropped. The scan orders
+  content columns before audit columns so the content stream cannot depend on
+  timestamp values.
+  `id` stays in the content digest and is not affected by the same problem:
+  `_copy_batches` pops it for `stock_daily`, so the snapshot's ids are reassigned by
+  the copy's `ORDER BY (code, date)` and are a function of the row set alone. Only
+  `board_master` is copied with `keep_id=True`, deliberately, because
+  `instrument_board_membership.board_id` references it and a change there is a real
+  change in structure.
+  Two spec readings are narrowed. `code_revision` and `snapshot_path` are
+  non-blocking — section 5.3 already ruled that a commit hash must not decide
+  comparability, and two runs necessarily have different paths. And the snapshot is
+  not made read-only at the filesystem level despite 10.5 asking for a read-only
+  replay: `isolated_replay_database` writes a `ScreeningRun` row into it, and a WAL
+  database with a read-only main file can fail to open at all. Immutability is
+  tamper-evident instead — any later change makes the recomputed digest disagree.
+  Nothing calls the chain yet; the CLI still has to pass `snapshot_dir` and write
+  the manifest row.
+- **The replay engine no longer hardcodes v1 and v2: all four seams now resolve
+  from a strategy descriptor registry in
+  `src/backtest/services/replay_strategies.py`.** The strategy YAML path, the
+  config fields the parameter grid overrides and the flag it forces on, the factor
+  columns event and stage extraction read, and the freeze/compute pair of the
+  evidence layer were each a two-way branch on the string `"v1"`. Reading the
+  `ReplayStrategy` dataclass now tells you what a strategy has to supply; v1 leaves
+  the grid, the flag, the evidence layer and maturation empty rather than being
+  given invented counterparts.
+  This is a structural change with no behavioural one, and that is pinned by
+  byte-identity rather than asserted: a 45-stock, 64-trading-day replay driven
+  through the production machinery produces the canonical payload
+  `8333b832…` across five runs — cold and warm on the unmodified tree, cold and
+  warm on the changed one, and once more after re-baselining on the concurrently
+  drifted tree — with identical per-layer cache counters (84 base snapshots, 3780
+  frozen-evidence builds, 9540 parameter evaluations, same per-hash split). The
+  payload hashes every per-sample field the seams produce, which the aggregate gate
+  report does not. Forty-five stocks rather than fifteen because at fifteen the v1
+  leg yields no samples at all, which would leave v1's event extraction outside the
+  hash.
+  Where a strategy's evidence layer is selected, an ambiguous configuration raises
+  instead of picking one. The factor cache is shared across legs and is handed only
+  a `Config`, so the strategy has to be recovered from it; if two strategies with an
+  evidence layer were ever enabled at once the answer would be genuinely undefined,
+  and guessing would file one strategy's evidence under another's cache key.
+  Three seams remain, all outside the four this change covers and all of which a
+  third strategy hits immediately: `bottom_divergence_v2_checkpoint.py` keeps its
+  own strategy-path constants and an identity hash with exactly two slots;
+  `ValidationFactorCache._parameter_hash` writes the same three v2 grid fields down
+  a second time, and changing it moves cache keys; and `build_isolated_config`
+  together with `replay_maturation_events` still default to v2 because their callers
+  cannot supply a strategy.
+- **`src/backtest/services/daily_return_engine.py` implements the per-day return
+  formulas the backtest design has specified since v7 but nothing computed.** The
+  only return arithmetic in `src/backtest/` was
+  `(close[t] - entry_price) / entry_price` against a fixed entry price
+  (`entry_evaluator.py`), which cannot be chained into a holding series and has no
+  benchmark to be measured against. The new module supplies three pieces: a
+  per-holding daily series (first day `close(T+1)/open(T+1) - 1`, continuation
+  `close(d)/close(d-1) - 1`, exit day `open(d)/close(d-1) - 1`, suspended day `0`),
+  an equal-weight portfolio series over a deduplicated holding set with empty days
+  kept at `0`, and a market-median benchmark. Nothing calls it yet; wiring belongs
+  to the later stages.
+  The self-check is that the three segments chain to exactly
+  `open(T+1+k) / open(T+1) - 1`. The first-day formula is the one that invites a
+  lookahead: `close(T+1)/close(T) - 1` looks like an ordinary daily return but
+  folds in the signal-day-close to next-day-open gap, which is not obtainable when
+  the order is placed. The negative test does not merely assert that the identity
+  breaks under that substitution — it pins the deviation to exactly
+  `open(T+1)/close(T)`, so the failure can only be the lookahead gap. The random
+  price paths force an overnight gap of at least 0.5% for the same reason: at a
+  zero gap both formulas agree and the test would assert nothing.
+  Returns are computed on adjusted prices, because `close(d)/close(d-1)` crosses
+  dividend and split dates and raw prices manufacture a drop on every one of them
+  that never raises and never goes out of range. The holding window is normalised
+  onto the entry day via `apply_read_adjustment_from_anchor`. **The benchmark is
+  adjusted too, which section 8.2c does not ask for**: it writes `B(d)` in terms of
+  raw closes, but the strategy leg is adjusted, and differencing an adjusted leg
+  against an unadjusted one reintroduces the ex-dividend noise the adjustment
+  removed. The benchmark normalises to the last row rather than to an anchor —
+  the normalisation constant cancels in an adjacent-day ratio, so the returns agree
+  to floating-point rounding, but the anchor entry point fails the whole window
+  closed, and one chain break in 2019 would drop a stock out of `U(d)` for every
+  year after it.
+  When the adjustment guard rejects a holding window the module raises
+  `UnadjustableWindowError` rather than returning a flagged value. The guard's own
+  fallback (`mark_unadjustable`) leaves the raw prices in place and only marks the
+  factor source, so a flagged return series is finite, plausibly sized, and passes
+  every downstream gate — the failure mode the adjustment chain exists to prevent.
+  The benchmark is the deliberate exception: it drops untrusted rows from `U(d)`
+  and reports the count, because excluding members is what a cross-sectional
+  statistic already does and one dirty stock must not void the reference series.
+  Two deployment substitutions are marked as such at the point they are made:
+  suspension is inferred from zero or missing volume, since `suspension_history` is
+  a paid Tushare tier this deployment does not have, and the 303 codes that appear
+  in `stock_daily` without an `instrument_master` row are excluded from `U(d)`
+  rather than having a listing date guessed from their first price bar.
 - **`scripts/validate_bottom_divergence_v2.py` now rejects a window that the
   forward-label purge would empty, before it computes anything.** Each selection
   split has its last 20 trading days removed, because a sample needs 20 future

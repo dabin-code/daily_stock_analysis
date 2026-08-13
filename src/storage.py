@@ -1428,6 +1428,7 @@ class DatabaseManager:
                 self._migrate_sqlite_five_layer_backtest_group_summary_fields()
                 self._migrate_sqlite_five_layer_backtest_evaluation_fields()
                 self._migrate_sqlite_five_layer_backtest_run_version_fields()
+                self._migrate_sqlite_run_data_manifest_fields()
                 self._migrate_sqlite_stock_daily_adj_factor_fields()
                 self._migrate_sqlite_stock_daily_pre_close_fields()
                 self._migrate_sqlite_instrument_delist_date_field()
@@ -1873,6 +1874,89 @@ class DatabaseManager:
                         col_name,
                     )
                     conn.exec_driver_sql(ddl)
+
+    def _migrate_sqlite_run_data_manifest_fields(self) -> None:
+        """确保 run_data_manifest 的列与唯一索引齐全（spec 10.5）。
+
+        不做任何回填：本次改动之前的运行没有留下快照，也就没有摘要可算，
+        写任何值都是编造。这些行的版本位保持 NULL，与新运行写入的显式缺失
+        标记 `absent` 区分得开。
+        """
+        with self._engine.begin() as conn:
+            existing = {
+                row[1]
+                for row in conn.exec_driver_sql(
+                    "PRAGMA table_info(run_data_manifest)"
+                ).fetchall()
+            }
+            if not existing:
+                # 表还不存在时由 create_all 建，这里不重复维护一份 DDL。
+                return
+
+            new_columns = {
+                "snapshot_path": (
+                    "ALTER TABLE run_data_manifest ADD COLUMN snapshot_path TEXT"
+                ),
+                "table_hashes_json": (
+                    "ALTER TABLE run_data_manifest "
+                    "ADD COLUMN table_hashes_json TEXT"
+                ),
+                "row_counts_json": (
+                    "ALTER TABLE run_data_manifest ADD COLUMN row_counts_json TEXT"
+                ),
+                "row_rewrite_hashes_json": (
+                    "ALTER TABLE run_data_manifest "
+                    "ADD COLUMN row_rewrite_hashes_json TEXT"
+                ),
+                "date_range_from": (
+                    "ALTER TABLE run_data_manifest ADD COLUMN date_range_from DATE"
+                ),
+                "date_range_to": (
+                    "ALTER TABLE run_data_manifest ADD COLUMN date_range_to DATE"
+                ),
+                "adj_table_version": (
+                    "ALTER TABLE run_data_manifest "
+                    "ADD COLUMN adj_table_version VARCHAR(80)"
+                ),
+                "corporate_actions_version": (
+                    "ALTER TABLE run_data_manifest "
+                    "ADD COLUMN corporate_actions_version VARCHAR(80)"
+                ),
+                "st_industry_version": (
+                    "ALTER TABLE run_data_manifest "
+                    "ADD COLUMN st_industry_version VARCHAR(80)"
+                ),
+                "code_revision": (
+                    "ALTER TABLE run_data_manifest "
+                    "ADD COLUMN code_revision VARCHAR(64)"
+                ),
+                "config_hash": (
+                    "ALTER TABLE run_data_manifest "
+                    "ADD COLUMN config_hash VARCHAR(64)"
+                ),
+                "created_at": (
+                    "ALTER TABLE run_data_manifest ADD COLUMN created_at DATETIME"
+                ),
+            }
+            for col_name, ddl in new_columns.items():
+                if col_name not in existing:
+                    logger.info(
+                        "Applying inline SQLite migration: adding %s to run_data_manifest",
+                        col_name,
+                    )
+                    conn.exec_driver_sql(ddl)
+
+            # 索引独立于「本次是否新增列」判断，理由见 _ensure_sqlite_index。
+            # 唯一索引是「一次运行一份 manifest」的唯一强制点，缺了它同一个
+            # backtest_run_id 能写进两行，「这次运行读了什么」就有两个答案。
+            if "backtest_run_id" in existing:
+                self._ensure_sqlite_index(
+                    conn,
+                    "ix_run_data_manifest_backtest_run_id",
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "ix_run_data_manifest_backtest_run_id "
+                    "ON run_data_manifest(backtest_run_id)",
+                )
 
     def _migrate_sqlite_five_layer_backtest_evaluation_fields(self) -> None:
         """Ensure five-layer evaluations expose the latest entry timing metrics on SQLite."""

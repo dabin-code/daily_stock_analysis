@@ -37,6 +37,7 @@ from .bottom_divergence_v2_checkpoint import (  # noqa: F401
 from .bottom_divergence_v2_dataset import iter_query_batches
 from .bottom_divergence_v2_report import canonical_json_dumps
 from .bottom_divergence_v2_validation import canonical_parameter_hash
+from .replay_strategies import EvidenceHooks, evidence_strategy_for
 
 
 FROZEN_EVIDENCE_ALGORITHM_VERSION = (
@@ -181,18 +182,15 @@ def _universe_cell_fingerprint(value: Any) -> str:
 
 
 def _evaluate_factor_task(
-    task: tuple[str, Any, pd.DataFrame, Any],
+    task: tuple[str, Any, pd.DataFrame, Any, EvidenceHooks],
 ) -> tuple[str, Any, dict[str, Any]]:
-    code, config, group, frozen = task
+    code, config, group, frozen, evidence = task
     from src.services.factor_service import FactorService
 
     service = FactorService(db_manager=object(), config=config)
     if frozen is None:
-        frozen = service.freeze_bottom_divergence_v2_evidence(group)
-    factors = service.compute_bottom_divergence_v2_factors(
-        group,
-        frozen_evidence=frozen,
-    )
+        frozen = evidence.freeze(service, group)
+    factors = evidence.compute(service, group, frozen)
     return code, frozen, factors
 
 
@@ -980,7 +978,10 @@ class ValidationFactorCache:
             )
             self.stats["base_snapshot_builds"] += 1
         snapshot = base_snapshot.copy(deep=True)
-        if not config.bottom_divergence_v2_enabled:
+        # 缓存实例被全部 leg 共用，拿不到本条 leg 的策略标识，只能从配置反查
+        # 该跑哪一层证据；没有任何策略认领这份配置时，base 快照就是全部输出。
+        evidence_strategy = evidence_strategy_for(config)
+        if evidence_strategy is None:
             return snapshot
 
         parameter_hash = self._parameter_hash(config)
@@ -1062,6 +1063,7 @@ class ValidationFactorCache:
                 config,
                 window_for(code),
                 frozen,
+                evidence_strategy.evidence,
             ))
         if self.workers > 1 and len(tasks) > 1:
             results = self._worker_pool().map(

@@ -9,7 +9,6 @@ import statistics
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from hashlib import sha256
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Optional, Protocol, Sequence
 
@@ -21,10 +20,18 @@ from src.backtest.services.bottom_divergence_v2_validation import (
 )
 from src.config import Config
 from .bottom_divergence_v2_report import canonical_json_dumps
+from .replay_strategies import (
+    ReplayStrategy,
+    _optional_float,
+    event_dates as _event_dates,
+    resolve_strategy,
+)
+# 只为兼容既有导入方（脚本再导出与用例），本模块自身不再使用它。
+from .replay_strategies import _v1_breakout_floor  # noqa: F401
 
-ROOT = Path(__file__).resolve().parents[3]
-V1_STRATEGY_PATH = ROOT / "strategies" / "bottom_divergence_double_breakout.yaml"
-V2_STRATEGY_PATH = ROOT / "strategies" / "bottom_divergence_layered_entry_v2.yaml"
+# CLI 的发布闸门按构造就是「v2 对照 v1」：参数网格与成熟事件都只属于 v2。
+# 这个默认值让既有调用方不必关心策略标识；跑别的策略时显式传策略。
+DEFAULT_REPLAY_STRATEGY = "v2"
 
 
 def compute_pre_signal_features(
@@ -299,158 +306,6 @@ def _parse_position_weight(trade_plan_json: Optional[str]) -> Optional[float]:
     return None
 
 
-def _event_dates(
-    *,
-    factor: dict,
-    code: str,
-    signal_date: date,
-    config: Config,
-    stock_repository: Any,
-) -> dict[str, Optional[date]]:
-    if not config.bottom_divergence_v2_enabled:
-        return {"early": signal_date, "r1": signal_date, "r2": signal_date}
-
-    def as_date(value: Any) -> Optional[date]:
-        if isinstance(value, date):
-            return value
-        if isinstance(value, str):
-            try:
-                return date.fromisoformat(value)
-            except ValueError:
-                return None
-        return None
-
-    candidate_version = factor.get(
-        "bottom_divergence_v2_candidate_version"
-    )
-    records = factor.get("bottom_divergence_v2_candidate_records") or ()
-    record = next(
-        (
-            item
-            for item in records
-            if item.get("candidate_version") == candidate_version
-        ),
-        None,
-    )
-    if record is not None:
-        early = record.get("early_reversal") or {}
-        near = record.get("near_zone_events") or {}
-        major = record.get("major_zone_breakout") or {}
-        cleared = near.get("cleared_confirmed") or {}
-        return {
-            "early": as_date(early.get("date")),
-            "r1": as_date(cleared.get("date")),
-            "r2": (
-                as_date(major.get("date"))
-                if major.get("confirmed") is True
-                else None
-            ),
-        }
-
-    rows = stock_repository.get_range(
-        code,
-        signal_date - timedelta(days=config.screening_factor_lookback_days),
-        signal_date,
-    )
-    dates = [row.date for row in sorted(rows, key=lambda item: item.date)]
-
-    def resolve(field: str) -> Optional[date]:
-        index = factor.get(field)
-        try:
-            normalized = int(index)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        if (
-            float(index) == normalized
-            and 0 <= normalized < len(dates)
-        ):
-            return dates[normalized]
-        return None
-
-    return {
-        "early": resolve("bottom_divergence_v2_early_event_index"),
-        "r1": resolve("bottom_divergence_v2_near_event_index"),
-        "r2": resolve("bottom_divergence_v2_major_event_index"),
-    }
-
-
-def _v1_breakout_floor(factor: dict) -> Optional[float]:
-    buy_points = factor.get("bottom_divergence_buy_points") or []
-    horizontal = [
-        item
-        for item in buy_points
-        if item.get("triggered")
-        and (
-            "阻力" in str(item.get("label") or "")
-            or str(item.get("type") or "").lower() == "horizontal_resistance"
-        )
-    ]
-    if horizontal:
-        selected = max(horizontal, key=lambda item: int(item.get("level", 0)))
-        return _optional_float(selected.get("trigger_price"))
-    return _optional_float(
-        factor.get("bottom_divergence_horizontal_resistance")
-    )
-
-
-def _legacy_confirmation_date(factor: dict, signal_date: date) -> date:
-    for field_name in (
-        "bottom_divergence_confirmation_date",
-        "confirmation_date",
-    ):
-        value = factor.get(field_name)
-        if isinstance(value, date):
-            return value
-        if isinstance(value, str):
-            try:
-                return date.fromisoformat(value)
-            except ValueError:
-                pass
-    for field_name in (
-        "bottom_divergence_confirmation_days",
-        "confirmation_days",
-    ):
-        value = factor.get(field_name)
-        if type(value) is int and value >= 0:
-            return signal_date - timedelta(days=value)
-    return signal_date
-
-
-def _legacy_candidate_version(
-    factor: dict,
-    *,
-    code: str,
-) -> str:
-    explicit = factor.get("bottom_divergence_candidate_version")
-    if explicit:
-        return str(explicit)
-    for field_name in (
-        "bottom_divergence_confirmation_date",
-        "confirmation_date",
-    ):
-        frozen_date = factor.get(field_name)
-        if frozen_date:
-            return f"v1:{code}:{frozen_date}"
-    structural_payload = {
-        "buy_points": factor.get("bottom_divergence_buy_points"),
-        "horizontal_resistance": factor.get(
-            "bottom_divergence_horizontal_resistance"
-        ),
-        "support": factor.get("bottom_divergence_support"),
-        "signal_date": factor.get("bottom_divergence_signal_date"),
-    }
-    digest = sha256(
-        json.dumps(
-            structural_payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        ).encode("utf-8")
-    ).hexdigest()
-    return f"v1:{code}:{digest}"
-
-
 def _candidate_event_context(
     *,
     candidate: Any,
@@ -465,47 +320,14 @@ def _candidate_event_context(
     dict[str, Optional[date]],
     Optional[date],
 ]:
-    factor = dict(candidate.factor_snapshot or {})
-    if strategy_version == "v1":
-        confirmation_date = _legacy_confirmation_date(factor, signal_date)
-        events = {
-            "early": confirmation_date,
-            "r1": confirmation_date,
-            "r2": confirmation_date,
-        }
-        stage = "r2"
-        candidate_version = _legacy_candidate_version(
-            factor,
-            code=str(candidate.code),
-        )
-        return factor, stage, str(candidate_version), events, confirmation_date
-
-    stage = str(factor.get("bottom_divergence_v2_stage") or "")
-    events = _event_dates(
-        factor=factor,
-        code=candidate.code,
+    strategy = resolve_strategy(strategy_version)
+    return strategy.event_context(
+        strategy,
+        candidate=candidate,
         signal_date=signal_date,
         config=config,
         stock_repository=stock_repository,
     )
-    candidate_version = (
-        factor.get("bottom_divergence_v2_candidate_version")
-        or (
-            f"v2:{candidate.code}:"
-            f"{(events['early'] or signal_date).isoformat()}"
-        )
-    )
-    event_key = {
-        "early": "early",
-        "near": "r1",
-        "near_cleared": "r1",
-        "r1": "r1",
-        "major": "r2",
-        "major_actionable": "r2",
-        "r2": "r2",
-    }.get(stage.strip().lower())
-    event_date = events[event_key] if event_key is not None else None
-    return factor, stage, str(candidate_version), events, event_date
 
 
 def _build_validation_sample(
@@ -525,6 +347,7 @@ def _build_validation_sample(
         ]
     ] = None,
 ) -> ValidationSample:
+    strategy = resolve_strategy(strategy_version)
     context = event_context or _candidate_event_context(
         candidate=candidate,
         signal_date=signal_date,
@@ -579,16 +402,7 @@ def _build_validation_sample(
         if len(forward_bars) >= 5
         else None
     )
-    if strategy_version == "v1":
-        breakout_floor = _v1_breakout_floor(factor)
-    elif stage in {"major", "major_actionable", "r2"}:
-        breakout_floor = _optional_float(
-            factor.get("bottom_divergence_v2_major_zone_lower")
-        )
-    else:
-        breakout_floor = _optional_float(
-            factor.get("bottom_divergence_v2_near_zone_lower")
-        )
+    breakout_floor = strategy.breakout_floor(strategy, factor, stage)
     return ValidationSample(
         code=str(candidate.code),
         signal_date=signal_date,
@@ -597,10 +411,10 @@ def _build_validation_sample(
         stage=stage,
         entry_close=entry_close,
         near_zone_lower=_optional_float(
-            factor.get("bottom_divergence_v2_near_zone_lower")
+            strategy.factor_value(factor, "near_zone_lower")
         ),
         major_zone_lower=_optional_float(
-            factor.get("bottom_divergence_v2_major_zone_lower")
+            strategy.factor_value(factor, "major_zone_lower")
         ),
         early_event_date=events["early"],
         near_cleared_event_date=events["r1"],
@@ -649,6 +463,7 @@ def replay_historical_dates(
     dependencies: ReplayDependencies,
 ) -> ReplayBatch:
     """Replay production factors, YAML screening and the five-layer pipeline."""
+    strategy = resolve_strategy(strategy_version)
     factor_service = dependencies.factor_service_factory(config)
     screener, skill_manager = dependencies.screener_factory(strategy_version)
     samples: list[ValidationSample] = []
@@ -702,7 +517,7 @@ def replay_historical_dates(
             ),
         ):
             _, stage, candidate_version, events, event_date = context
-            if strategy_version == "v2":
+            if strategy.matures_events:
                 evidence_key = (str(candidate.code), candidate_version)
                 current = evidence_by_key.get(evidence_key)
                 evidence_by_key[evidence_key] = CandidateEventEvidence(
@@ -762,8 +577,10 @@ def replay_maturation_events(
     universe: Any,
     target_candidates: set[tuple[str, str]],
     dependencies: ReplayDependencies,
+    strategy_version: str = DEFAULT_REPLAY_STRATEGY,
 ) -> tuple[CandidateEventEvidence, ...]:
-    """Replay only locked-v2 event evidence without signals or opportunities."""
+    """Replay only locked event evidence without signals or opportunities."""
+    strategy = resolve_strategy(strategy_version)
     factor_service = dependencies.factor_service_factory(config)
     evidence_by_key: dict[
         tuple[str, str],
@@ -776,8 +593,9 @@ def replay_maturation_events(
             persist=False,
         )
         for factor in snapshot_df.to_dict(orient="records"):
-            candidate_version = factor.get(
-                "bottom_divergence_v2_candidate_version"
+            candidate_version = strategy.factor_value(
+                factor,
+                "candidate_version",
             )
             key = (str(factor.get("code") or ""), str(candidate_version or ""))
             if key not in target_candidates:
@@ -788,6 +606,7 @@ def replay_maturation_events(
                 signal_date=trade_date,
                 config=config,
                 stock_repository=dependencies.stock_repository,
+                strategy=strategy,
             )
             current = evidence_by_key.get(key)
             near_date = events["r1"]
@@ -879,19 +698,17 @@ class HistoricalReplayService(Protocol):
 def build_isolated_config(
     base_config: Config,
     parameter_snapshot: dict[str, float],
+    strategy: Optional[ReplayStrategy] = None,
 ) -> Config:
-    """Copy all runtime settings and override only the three v2 grid knobs."""
-    return replace(
-        base_config,
-        bottom_divergence_v2_enabled=True,
-        bottom_divergence_v2_cluster_pct=parameter_snapshot["cluster_pct"],
-        bottom_divergence_v2_atr_gap_multiplier=parameter_snapshot[
-            "atr_gap_multiplier"
-        ],
-        bottom_divergence_v2_zone_score_min=parameter_snapshot[
-            "zone_score_min"
-        ],
-    )
+    """Copy all runtime settings and override only the strategy's grid knobs."""
+    strategy = strategy or resolve_strategy(DEFAULT_REPLAY_STRATEGY)
+    overrides = {
+        config_field: parameter_snapshot[snapshot_key]
+        for snapshot_key, config_field in strategy.grid_fields.items()
+    }
+    if strategy.enabled_field is not None:
+        overrides[strategy.enabled_field] = True
+    return replace(base_config, **overrides)
 
 
 def _resolve_local_universe(
@@ -1041,12 +858,9 @@ def _build_default_replay_dependencies(
     repository = StockRepository(db_manager)
 
     def screener_factory(strategy_version: str) -> tuple[Any, Any]:
-        path = (
-            V1_STRATEGY_PATH
-            if strategy_version == "v1"
-            else V2_STRATEGY_PATH
+        skill = load_skill_from_yaml(
+            resolve_strategy(strategy_version).strategy_path
         )
-        skill = load_skill_from_yaml(path)
         manager = SkillManager()
         manager.register(skill)
         return (
@@ -1156,10 +970,3 @@ def _build_default_replay_dependencies(
         market_context_provider=market_context,
         stock_repository=stock_history,
     )
-
-
-def _optional_float(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    converted = float(value)
-    return converted if math.isfinite(converted) else None
