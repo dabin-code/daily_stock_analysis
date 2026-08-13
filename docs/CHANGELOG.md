@@ -59,6 +59,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **`@pytest.mark.real_database` no longer opens the production database; it now
+  receives a private writable replica, and the production-access guard has zero
+  exemptions.** The marker used to point `DATABASE_PATH` straight at
+  `data/stock_analysis.db`, and the guard let those tests through — the only hole
+  in it. The database has since been corrupted twice by test processes: on
+  2026-08-12 the file header was overwritten and the 1.3 GB file would not open at
+  all; on 2026-08-13 `stock_daily`'s b-tree came to reference page numbers past the
+  end of the file, leaving the table unreadable and impossible even to `DROP`. The
+  marked module is not read-only — it calls `execute_run` twice and persists sector
+  heat — so a read-only connection would not do; `tests/_production_replica.py`
+  copies the file instead, naming the copy after the production database's size and
+  mtime so one copy is shared across xdist workers and across runs, and stale copies
+  are removed. It is a plain file copy rather than the SQLite backup API: the latter
+  would have to open the production database, contradicting the guard it is meant to
+  serve, and fails outright on corrupt pages. The replica lives beside the database
+  and is already covered by the `*.db` ignore rule. `tests/test_production_db_guard.py`
+  pins both directions — a marked test that opens production now fails, and a marked
+  test still receives a replica that actually carries data (a replica of an empty
+  database would turn the module into a silent skip).
 - **Evaluated factors are now sharded per `parameter_hash` instead of sharing one
   file per trade date, and an unmodified partition is no longer written back.**
   Replay iterates leg-outer (each of the 3×2×3 grid legs walks every date), so a

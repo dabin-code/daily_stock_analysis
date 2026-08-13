@@ -28,21 +28,33 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
+from tests._production_replica import PRODUCTION_DB, production_replica_path
+
 # ──────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "stock_analysis.db"
-
-# 本模块的夹具直接用 sqlite3 读 DB_PATH，而被测引擎走 DatabaseManager，
-# 即 DATABASE_PATH。两者必须指向同一个库，否则夹具读到真实数据、
-# 引擎读到空库，用例会以「没有候选」的形式假失败。
+# 本模块的夹具直接用 sqlite3 读库，而被测引擎走 DatabaseManager，即
+# DATABASE_PATH。两者必须指向同一个库，否则夹具读到真实数据、引擎读到
+# 空库，用例会以「没有候选」的形式假失败。因此这里不能写死生产库路径：
+# real_database 标记会把 DATABASE_PATH 指向生产库的私有副本，夹具必须
+# 跟着走，否则本模块的写入（execute_run、板块热度落库）会打到生产库上。
 pytestmark = pytest.mark.real_database
+
+
+def db_path() -> Path:
+    """本模块当前该读写的库：生产库的私有副本。
+
+    不读 DATABASE_PATH——`setUpClass` 早于函数级夹具执行，那时它还指向
+    会话临时空库，夹具会以「无因子快照数据」的形式把整个模块静默跳过。
+    """
+    replica = production_replica_path()
+    return replica if replica is not None else PRODUCTION_DB
 
 
 def get_latest_factor_date() -> str:
     """从 daily_factor_snapshots 获取最新交易日。"""
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(db_path()))
     cursor = conn.cursor()
     cursor.execute(
         "SELECT DISTINCT trade_date FROM daily_factor_snapshots ORDER BY trade_date DESC LIMIT 1"
@@ -54,7 +66,7 @@ def get_latest_factor_date() -> str:
 
 def load_factor_snapshots(trade_date: str) -> pd.DataFrame:
     """加载指定日期的因子快照为 DataFrame。"""
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(db_path()))
     df = pd.read_sql_query(
         "SELECT * FROM daily_factor_snapshots WHERE trade_date = ?",
         conn,
@@ -76,7 +88,7 @@ def load_factor_snapshots(trade_date: str) -> pd.DataFrame:
 
 def load_board_memberships() -> dict:
     """加载板块成员映射: stock_code -> [board_names]。"""
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(db_path()))
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -101,8 +113,8 @@ class FiveLayerLocalTestBase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not DB_PATH.exists():
-            raise unittest.SkipTest(f"数据库不存在: {DB_PATH}")
+        if not db_path().exists():
+            raise unittest.SkipTest(f"数据库不存在: {db_path()}")
 
         cls.latest_date = get_latest_factor_date()
         if not cls.latest_date:
@@ -748,7 +760,7 @@ class TestAPIFiveLayerFields(unittest.TestCase):
 
     def test_candidate_api_includes_five_layer_fields(self):
         """验证 GET /candidates 返回的字段包含五层系统相关键。"""
-        conn = sqlite3.connect(str(DB_PATH))
+        conn = sqlite3.connect(str(db_path()))
         cursor = conn.cursor()
         cursor.execute(
             "SELECT run_id FROM screening_runs WHERE status='completed' "
@@ -763,7 +775,7 @@ class TestAPIFiveLayerFields(unittest.TestCase):
         run_id = row[0]
 
         # 直接检查 DB 中的候选数据（避免启动 API 服务器）
-        conn = sqlite3.connect(str(DB_PATH))
+        conn = sqlite3.connect(str(db_path()))
         cursor = conn.cursor()
         cursor.execute(
             "SELECT code, trade_stage, market_regime, theme_position, "
@@ -811,7 +823,7 @@ class TestSectorHeatPersistence(FiveLayerLocalTestBase):
         self.assertGreater(len(results), 0)
 
         # 检查 DB 中是否有对应日期的记录
-        conn = sqlite3.connect(str(DB_PATH))
+        conn = sqlite3.connect(str(db_path()))
         cursor = conn.cursor()
         cursor.execute(
             "SELECT COUNT(*) FROM daily_sector_heat WHERE trade_date = ?",

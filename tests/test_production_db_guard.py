@@ -63,3 +63,29 @@ def test_guard_leaves_ordinary_tests_alone():
     result = _run_probe("test_probe_leaves_production_alone")
 
     assert result.returncode == 0, result.stdout
+
+
+def test_real_database_marker_is_no_longer_an_escape_hatch():
+    """标了 real_database 也不许直连生产库。
+
+    2026-08-13 生产库第二次被写坏（stock_daily 的 b-tree 指向文件尾之后
+    的页号，整表不可读，连 DROP TABLE 都做不了）。此前这个标记是护栏的
+    唯一豁免口，标了就直连生产库；现在它拿到的是私有副本，豁免随之取消。
+    """
+    result = _run_probe("test_probe_marked_real_database_still_cannot_touch_production")
+
+    assert result.returncode != 0, (
+        "real_database 仍然可以直连生产库，豁免口没堵上:\n" + result.stdout
+    )
+    assert "打开了生产库" in result.stdout, result.stdout
+
+
+def test_real_database_marker_hands_out_a_populated_replica():
+    """反例：堵住豁免口不能把这些用例变成空转。
+
+    副本必须真的带着生产数据，否则 real_database 用例会以「无因子快照
+    数据」的形式静默跳过，护栏看着是绿的，覆盖率却没了。
+    """
+    result = _run_probe("test_probe_marked_real_database_is_pointed_at_a_replica")
+
+    assert result.returncode == 0, result.stdout

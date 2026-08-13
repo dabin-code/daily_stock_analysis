@@ -389,9 +389,54 @@ load+dump 要 0.62s，而 14 条 leg × 32 天让每个日期分区被反复换�
 
 ### 门禁
 
-- **门禁仍可能写生产库**（待决策）。`tests/test_e2e_five_layer_local.py` 标了
-  `real_database`，护栏对它放行，`DatabaseManager` 以读写方式打开并写 WAL 文件头。
-  其中 Case 8 会调 `execute_run`，条件具备时**会在生产库里建出选股 run**。
-  可选处置：把 Case 8 移出默认门禁，或让该模块只读打开。
+- ~~**门禁仍可能写生产库**（待决策）~~ **已闭合（2026-08-13，见第 9 节事故）。**
+  `real_database` 现在拿到的是 `tests/_production_replica.py` 建的私有可写副本，
+  护栏改为零例外；`tests/test_production_db_guard.py` 双向钉住（标记不再是通行证、
+  副本必须带数据）。
 - Windows 下单文件跑测试会因 `conftest.py` 的 `TemporaryDirectory.cleanup`
   报 WinError 32，导致全绿却退出码 1（`-n 8` 下不复现）。
+
+---
+
+## 9. 事故：生产库第二次损坏（2026-08-13）
+
+### 现象与范围
+
+`PRAGMA quick_check` 报 `invalid page number 1558957`，而实际 `page_count`
+只有 1318677——b-tree 指向了文件尾之后的页。**只有 `stock_daily` 一张表损坏，
+其余 36 张全部可读**，损坏表连按 code 前缀的窄查询都失败，`DROP TABLE` 也做不了
+（释放页需要遍历同一棵坏掉的 b-tree）。
+
+### 根因：未定位
+
+已排除：磁盘空间（剩 555 GB）、本仓库的并发写入进程（事发后无调度器在跑）。
+最可能的嫌疑是当天用 `-n 8` 跑全量门禁时 `real_database` 用例以读写方式打开生产库，
+但**没有直接证据把它和这次损坏钉死**，这里不写成结论。两次事故都发生在测试跑完之后
+才被发现，这一点是确定的。
+
+### 处置
+
+`stock_daily_staging` 完好（9,621,460 行，raw 口径，带 `pre_close`），是 C2 晋升
+时的同一份来源，所以 A 股数据零损失。重建路径：新建空库 → ATTACH 损坏库只读 →
+复制除 `stock_daily` 外的全部表 → 用原 DDL 重建 `stock_daily` 并从 staging 灌入 →
+从 08-11 备份补回 `sh000001` / `sh000905` → 建索引 → 切换。
+
+补指数这一步是必须的：staging 只覆盖 A 股个股，而 `sh000001` 正是
+`screening_market_guard_index` 的默认值，漏掉它会打掉大盘风控的数据源。这两个指数
+在备份里也只到 2026-03-19（A 股到 08-10），**指数同步早在本次事故之前就停了**，
+属于既有缺口，另计。补回的 923 行 `adj_convention` 置为 `unknown`，让读取时的复权
+护栏 fail-closed 拒绝它们——指数本就不存在复权概念。
+
+### 验证
+
+36 张表行数与损坏前体检结果逐一吻合；`quick_check` 为 `ok`；`stock_daily`
+9,622,383 行 / 5792 个代码 / 2018-01-02 ~ 2026-08-12；`pre_close` 空值 1001
+（= staging 已知的 78 个首日 + 923 行指数）；`adj_convention` 为 raw 9,621,460 /
+unknown 923。损坏库按原样保留在 `data/stock_analysis.db.corrupt_20260813_174025`。
+
+### 门禁改动
+
+见第 8 节「门禁」与 CHANGELOG。要点：`real_database` 不再是护栏的豁免口，
+它拿到的是按「生产库 size + mtime」命名的私有副本，跨 worker 与跨次运行复用；
+副本用普通文件拷贝而非 SQLite backup API——后者要打开生产库，与它服务的那道
+护栏自相矛盾，且在损坏页上必然失败。

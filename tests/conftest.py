@@ -7,10 +7,10 @@ from pathlib import Path
 import pytest
 
 from src.storage import DatabaseManager
+from tests._production_replica import PRODUCTION_DB as _PRODUCTION_DB
+from tests._production_replica import production_replica_path
 
 _LEAKS: list[str] = []
-
-_PRODUCTION_DB = Path(__file__).resolve().parent.parent / "data" / "stock_analysis.db"
 
 _PRODUCTION_OPENS: list[str] = []
 
@@ -73,8 +73,8 @@ def pytest_configure(config):
     """
     config.addinivalue_line(
         "markers",
-        "real_database: 该用例有意读取真实生产库 data/stock_analysis.db，"
-        "不受会话级临时库重定向影响",
+        "real_database: 该用例需要真实生产数据，会被导向生产库的私有可写副本"
+        "（见 production_replica_path），而不是生产库本身",
     )
 
     global _SESSION_DB_DIR, _SESSION_DB_PATH
@@ -126,8 +126,12 @@ def _database_path_isolation(request):
 
     from src.config import Config
 
+    replica = production_replica_path()
+    if replica is None:
+        pytest.skip("生产库不存在，real_database 用例无数据可用")
+
     previous = os.environ.get("DATABASE_PATH")
-    os.environ["DATABASE_PATH"] = str(_PRODUCTION_DB)
+    os.environ["DATABASE_PATH"] = str(replica)
     Config.reset_instance()
     DatabaseManager.reset_instance()
     try:
@@ -143,27 +147,28 @@ def _database_path_isolation(request):
 
 @pytest.fixture(autouse=True)
 def _fail_on_production_access(request):
-    """未标记 real_database 的用例连了生产库，就地失败。
+    """任何用例打开生产库都就地失败，没有例外。
 
-    2026-08-12 这个库被并发测试进程写坏过一次：文件头被别的数据页覆盖，
-    1.3 GB 的库直接打不开，只能从前一天的备份回滚。事后才发现远比当场
-    拦下昂贵，所以这里不只是记录，而是直接判失败。
+    这个库被测试进程写坏过两次：2026-08-12 是文件头被覆盖，1.3 GB 直接
+    打不开；2026-08-13 是 stock_daily 的 b-tree 指向了文件尾之后的页号，
+    整表不可读，连 DROP TABLE 都做不了，只能从 staging 重建。两次都是
+    在跑完门禁之后才发现的，所以这里宁可当场判红。
+
+    曾经给 real_database 留过口子，让它直连生产库。第二次事故后取消：
+    那些用例现在拿到的是 production_replica_path() 建的私有副本，
+    于是这道门可以做成零例外——不必再判断「这次打开是好人还是坏人」。
 
     判据是「本进程有没有打开过这个文件」，不是文件 mtime。mtime 是进程
-    无关的：并行跑时一个 worker 里标了 real_database 的用例连上生产库
-    （`PRAGMA journal_mode=WAL` 会写文件头），另外七个 worker 会把这次
-    改动记到自己正在跑的用例头上，一次全量能凭空多出五十个红。
+    无关的：并行跑时一个 worker 连上生产库（`PRAGMA journal_mode=WAL`
+    会写文件头），另外七个 worker 会把这次改动记到自己正在跑的用例头上，
+    一次全量能凭空多出五十个红。
 
     只读打开同样算违规——它意味着这个用例绕过了会话临时库的重定向，
     离写坏只差一次代码改动。
 
     残留盲区：不经 sqlite3 直接改文件的用例（比如 shutil 覆盖）拦不住。
-    真实事故走的是 sqlite 连接，这里按事故的路径设防。
+    两次事故走的都是 sqlite 连接，这里按事故的路径设防。
     """
-    if request.node.get_closest_marker("real_database") is not None:
-        yield
-        return
-
     _PRODUCTION_OPENS.clear()
     yield
     if _PRODUCTION_OPENS:
@@ -171,8 +176,8 @@ def _fail_on_production_access(request):
         _PRODUCTION_OPENS.clear()
         pytest.fail(
             f"{request.node.nodeid} 打开了生产库 {_PRODUCTION_DB}（{opened}）。"
-            "测试必须走会话临时库；确有必要访问真实库的模块请显式加 "
-            "@pytest.mark.real_database。"
+            "测试必须走会话临时库；确需真实数据的模块请加 "
+            "@pytest.mark.real_database，它会拿到生产库的私有副本。"
         )
 
 
