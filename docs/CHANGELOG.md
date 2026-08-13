@@ -303,6 +303,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Fixed base factor computation reading its thresholds from the global config
+  singleton while the factor cache keyed on the config object passed in.
+  `FactorService._compute_pattern_123_factors` and
+  `_compute_bottom_divergence_factors` called `get_config()` for the five
+  `low123_*` / `bottom_divergence_*` thresholds, but
+  `ValidationFactorCache` hashes the config it is given. The two could diverge
+  in either direction: changing the passed config would rebuild the cache entry
+  yet still compute it with the singleton's values, and changing the singleton
+  alone would leave the key unchanged so the cache would serve factors computed
+  under different thresholds. Either way the failure is silent — wrong numbers,
+  no error. Both functions now take an explicit `config` parameter.
+
+  **No previously produced result is affected.** The replay path derives its
+  config from the singleton (`bottom_divergence_v2_cli_service.py`:
+  `config = base_config or get_config()`) and `build_isolated_config` overrides
+  only the three `bottom_divergence_v2_*` grid knobs, so the passed config's
+  `low123_*` / `bottom_divergence_*` values have always equalled the
+  singleton's. The defect was latent; it would have activated as soon as a run
+  varied those thresholds, which is precisely what the planned multi-strategy
+  replay does.
+
 - Fixed the test suite writing to the production database. Any test that went
   through `DatabaseManager` without setting `DATABASE_PATH` itself opened
   `data/stock_analysis.db` directly, and roughly seventy `tearDown` bodies
@@ -377,6 +398,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   maintenance window still leaves other writers active.
 
 ### Changed
+
+- The base factor snapshot cache now keys on an explicit whitelist of the eight
+  config fields the base pass actually reads, plus a fingerprint of the
+  universe metadata and the `data_version`. It previously hashed all 232
+  `Config` fields minus four, so editing an unrelated setting — an LLM model
+  name, a webhook URL — invalidated every cached factor snapshot, and two
+  strategy legs could only share factors if their entire config matched. That
+  sharing is what makes multi-strategy historical replay affordable at all:
+  base factors measure 14.8 seconds per 500 stocks per day, so recomputing them
+  per leg turns an ~82-hour run into a thousand-hour one.
+
+  Two inputs that genuinely change the snapshot but were absent from the key are
+  now included: the universe's `name` / `list_date` / `is_st` / `circ_mv`
+  columns (they feed `days_since_listed`, the risk flags and the snapshot rows
+  directly), and `data_version`. A column that is absent, `None`, or `NaN`
+  hashes distinctly, because `bool(nan)` is truthy and a null `is_st` really
+  does mark a stock as ST.
+
+  **The frozen-evidence and evaluated-factor cache keys are deliberately
+  unchanged.** They share the same local variable but not the same requirements:
+  their output depends on `bottom_divergence_v2_sync_window`,
+  `_retention_bars`, `_breakout_buffer_pct` and the R1/R2 weights, none of which
+  `_parameter_hash` covers. Narrowing those keys too would make the cache serve
+  one parameter set's evidence as another's.
+
+  `tests/test_base_factor_cache_key_whitelist.py` guards the whitelist by
+  mutating each of the 232 fields and asserting that anything which changes the
+  snapshot is registered. Seven of the eight fields are verified to be
+  load-bearing there; `screening_factor_lookback_days` is covered by a separate
+  test because it is read by the caller when slicing the bar window rather than
+  by the snapshot builder.
 
 - Top-level backtest group metrics are now computed from the `entry` signal
   family only. `aggregate_group` used to mix entry's `forward_return_5d` with
