@@ -80,6 +80,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--universe-codes", type=Path)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        help=(
+            "persist the factor cache here so a later run can reuse the base "
+            "snapshots and frozen evidence instead of recomputing them; "
+            "omit it to keep the previous behaviour of a per-process "
+            "temporary directory. Reuse only happens when the data version, "
+            "universe, base config and algorithm versions all match, so a "
+            "stale directory costs a recompute, never a wrong answer"
+        ),
+    )
     parser.add_argument("--progress-every", type=int, default=100)
     parser.add_argument("--workers", type=int, default=4)
     return parser

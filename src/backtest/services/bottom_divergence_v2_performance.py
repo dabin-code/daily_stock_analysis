@@ -8,6 +8,7 @@ from concurrent.futures import ProcessPoolExecutor
 import gzip
 import hashlib
 import multiprocessing
+import os
 from pathlib import Path
 import pickle
 from tempfile import TemporaryDirectory
@@ -41,6 +42,50 @@ from .bottom_divergence_v2_validation import canonical_parameter_hash
 FROZEN_EVIDENCE_ALGORITHM_VERSION = (
     f"{CAUSAL_ALGORITHM_VERSION}+{ZONE_ALGORITHM_VERSION}"
 )
+
+# base 快照的算法版本，**手工维护**，必须保持文件名安全（只用字母、数字、`-`）。
+#
+# base 快照的取值由四样东西决定：配置、universe、bar 数据、以及计算它的代码。
+# 前三样分别由 `_base_config_hash`、universe 指纹、`data_version` 覆盖；
+# 第四样没有任何自动来源，只能靠这个常量。证据层用
+# `FROZEN_EVIDENCE_ALGORITHM_VERSION` 解决同一个问题，但那是两个 v2 检测器的
+# 版本号，而 base pass 强制关闭 v2、跑的是另一组检测器，对它没有代表性。
+#
+# 在缓存目录还是进程内临时目录的年代，这个缺口是死条款：目录随进程消失，
+# 改了代码也不可能读到旧快照。`cache_directory` 一旦可以指向持久化目录，
+# 它立刻变成活漏洞——**改了下列任何一处却没 bump，第二次运行会静默拿旧算法
+# 算出的因子当新算法的结果用**。不会报错，只会算错。
+#
+# 必须手工 bump 的改动（判据：会改变 base 快照内容、却不体现在
+# `BASE_FACTOR_CONFIG_FIELDS` / universe / `data_version` 里）：
+#
+# 1. `FactorService.build_factor_snapshot_from_groups` 在 base pass 上走到的
+#    任何计算，包括 `_compute_extended_factors` 及它调用的
+#    `_compute_ma100_factors` / `_compute_gap_limit_factors` /
+#    `_compute_macd_divergence_factors` / `_compute_trendline_factors` /
+#    `_compute_pattern_123_factors` / `_compute_bottom_divergence_factors` /
+#    `_compute_shrink_pullback_factors` /
+#    `_compute_ma100_low123_combined_factors` /
+#    `_compute_ma100_60min_combined_factors`，以及各类打分、风险标记，
+#    和输出列的增加、删除、改名、改 dtype。
+# 2. base pass 用到的检测器实现：`MABreakoutDetector`、`GapDetector`、
+#    `LimitUpDetector`、`DivergenceDetector`、`TrendlineDetector`、
+#    `PatternDetector`、`Low123TrendlineDetector`、
+#    `BottomDivergenceBreakoutDetector`、`ShrinkPullbackDetector`。
+#    （`CausalBottomDivergenceDetector` 与阻力区检测器不在此列——base pass
+#    关闭 v2，它们归 `FROZEN_EVIDENCE_ALGORITHM_VERSION` 管。）
+# 3. 写死在代码里的阈值与模块级常量，例如 `factor_service.py` 的
+#    `_MA100_60MIN_*`。它们不在 `Config` 里，白名单键对它们完全失明。
+# 4. `src/services/adjustment_chain.py` 的复权算法。`adj_apply_on_read`
+#    只覆盖开关，不覆盖算法本身；复权改了，喂进 base pass 的每个价格都变。
+# 5. 本文件里决定喂什么给 base pass 的代码：`_window` 的取窗规则、
+#    `_compact_bar_frame` 的列处理、以及 `build_factor_snapshot` 里构造
+#    base config 的方式（今天是 `bottom_divergence_v2_enabled=False`）。
+# 6. pandas / numpy 等依赖升级到会改变数值输出的版本。
+#
+# bump 的代价只是让旧缓存目录整体失效、重算一次；不 bump 的代价是错结论。
+# 拿不准就 bump。
+BASE_SNAPSHOT_ALGORITHM_VERSION = "base-factor-snapshot-v1"
 
 # base 快照路径真正读取的全部配置字段。这是**白名单**而不是黑名单：
 # `Config` 有 232 个字段，其中绝大多数（LLM、通知、调度等）与因子计算无关，
@@ -232,8 +277,16 @@ class ValidationFactorCache:
             str(code): self._compact_bar_frame(frame)
             for code, frame in sorted(bar_groups.items())
         }
+        # `cache_directory` 为空时退回进程内临时目录，这是既有默认行为：
+        # 不传就没有任何跨进程复用，也没有任何跨代码版本的陈旧产物。
+        # `ignore_cleanup_errors` 是给 Windows 的：子进程还没完全释放句柄时
+        # `cleanup()` 会抛 WinError 32，为了删一个纯派生的缓存目录而让整条
+        # 回放链路在 `finally` 里崩掉，不值得。
         self._temporary_directory = (
-            TemporaryDirectory(prefix="validation-factor-cache-")
+            TemporaryDirectory(
+                prefix="validation-factor-cache-",
+                ignore_cleanup_errors=True,
+            )
             if cache_directory is None
             else None
         )
@@ -280,6 +333,7 @@ class ValidationFactorCache:
         progress_callback: Optional[
             Callable[[dict[str, Any]], None]
         ] = None,
+        cache_directory: Optional[Path] = None,
         workers: int = 1,
     ) -> "ValidationFactorCache":
         return cls(
@@ -289,6 +343,7 @@ class ValidationFactorCache:
             sql_bar_queries=0,
             progress_every=progress_every,
             progress_callback=progress_callback,
+            cache_directory=cache_directory,
             workers=workers,
         )
 
@@ -305,6 +360,7 @@ class ValidationFactorCache:
         progress_callback: Optional[
             Callable[[dict[str, Any]], None]
         ] = None,
+        cache_directory: Optional[Path] = None,
         workers: int = 1,
     ) -> "ValidationFactorCache":
         from sqlalchemy import select
@@ -352,13 +408,32 @@ class ValidationFactorCache:
             sql_bar_queries=1,
             progress_every=progress_every,
             progress_callback=progress_callback,
+            cache_directory=cache_directory,
             workers=workers,
         )
 
     def close(self) -> None:
+        """收工。临时目录连同缓存一起删，持久化目录只落盘不删。
+
+        两种目录的语义相反，必须分开处理：临时目录的全部意义就是「本进程用完
+        即弃」，留下就是垃圾；持久化目录的全部意义则是「给下一个进程复用」，
+        删掉等于这次改动白做。
+        """
         if self._executor is not None:
+            # 先等 worker 退干净再动目录：Windows 上还有进程持有文件时
+            # 删目录会失败。
             self._executor.shutdown(wait=True)
             self._executor = None
+        if self._temporary_directory is not None:
+            self._temporary_directory.cleanup()
+            self._temporary_directory = None
+            # 目录已经没了，活动分区也就无处可落。不清掉它，第二次 close()
+            # 会走到下面的落盘分支，对着已删除的目录抛 FileNotFoundError。
+            self._active_frozen_date = None
+            return
+        # `_switch_frozen_partition` 只在切日期时写回上一个分区，最后一个
+        # 分区不在这里落盘就等于白算，下次运行会从头冻结这一天的证据。
+        self._flush_active_frozen_partition()
 
     def _worker_pool(self) -> ProcessPoolExecutor:
         if self._executor is None:
@@ -412,43 +487,90 @@ class ValidationFactorCache:
         *,
         universe: pd.DataFrame,
     ) -> Path:
-        # universe 与 bar 数据都是 base 快照的输入，必须进文件名。
+        # universe、bar 数据、计算代码都是 base 快照的输入，必须全部进文件名。
         # `data_version` 此前只被证据两层的键覆盖（`FrozenEvidenceCacheKey`），
-        # base 快照没带上它：今天缓存目录恒为进程内临时目录所以撞不上，但键的
-        # 正确性不该依赖这个偶然条件——阶段 2 要开跨进程复用。
+        # 算法版本则谁都没覆盖；缓存目录恒为进程内临时目录时两者都撞不上，
+        # 但键的正确性不该依赖这个偶然条件——`cache_directory` 现在可以指向
+        # 持久化目录，缓存文件会跨进程、跨代码版本活下来。
         data_version_hash = hashlib.sha256(
             str(self.data_version).encode("utf-8")
         ).hexdigest()[:16]
         return self._cache_directory / (
-            f"base-{trade_date.isoformat()}-{config_hash[:16]}"
+            f"base-{trade_date.isoformat()}"
+            f"-{BASE_SNAPSHOT_ALGORITHM_VERSION}"
+            f"-{config_hash[:16]}"
             f"-{self._universe_fingerprint(universe)[:16]}"
             f"-{data_version_hash}.pkl.gz"
         )
 
+    def _frozen_partition_identity(self) -> str:
+        """分区文件名里代表「这份证据属于哪次运行」的那一段。
+
+        分区文件的**内容**一直是按完整键存的（`FrozenEvidenceCacheKey` 与
+        `_temporary_frozen_key` 都含 `data_version` 与算法版本），所以查表
+        不会跨数据集读到错的证据。但文件名此前只有日期，持久化之后两个
+        `data_version` 会共用同一个文件，带来两个真实后果：
+        `_switch_frozen_partition` 是整份载入、整份写回，后写的一方会抹掉
+        另一方的条目（丢工作量）；`frozen_cache_keys` / `evaluation_cache_keys`
+        会把别的运行的键当成本次运行的键返回（错答案）。
+        文件名与键取同一口径即可一并消掉这两条。
+        """
+        return hashlib.sha256(
+            canonical_json_dumps({
+                "algorithm_version": FROZEN_EVIDENCE_ALGORITHM_VERSION,
+                "data_version": str(self.data_version),
+            }).encode("utf-8")
+        ).hexdigest()[:16]
+
     def _frozen_path(self, trade_date: date) -> Path:
         return self._cache_directory / (
-            f"frozen-{trade_date.isoformat()}.pkl.gz"
+            f"frozen-{trade_date.isoformat()}"
+            f"-{self._frozen_partition_identity()}.pkl.gz"
+        )
+
+    def _write_atomically(
+        self,
+        path: Path,
+        write: Callable[[Path], None],
+    ) -> None:
+        """先写同目录临时文件再 `os.replace`，避免读到写了一半的缓存。
+
+        临时目录里这是多余的（进程独占且用完即弃），持久化目录里则是必需：
+        分批跑会有多个进程指向同一个目录，进程被 Ctrl-C 或 OOM 杀掉时，
+        半个 gzip 文件会让下一次运行在 `pickle.load` 上直接崩，而不是重算。
+        临时文件名以 `.` 开头、以 `.tmp` 结尾，两个 glob 都匹配不到它。
+        """
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            write(temporary)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _flush_active_frozen_partition(self) -> None:
+        if self._active_frozen_date is None or not (
+            self._frozen_lookup or self._evaluated
+        ):
+            return
+        payload = {
+            "frozen": self._frozen,
+            "lookup": self._frozen_lookup,
+            "evaluated": self._evaluated,
+        }
+
+        def write(target: Path) -> None:
+            with gzip.open(target, "wb") as handle:
+                pickle.dump(payload, handle, protocol=5)
+
+        self._write_atomically(
+            self._frozen_path(self._active_frozen_date),
+            write,
         )
 
     def _switch_frozen_partition(self, trade_date: date) -> None:
         if self._active_frozen_date == trade_date:
             return
-        if self._active_frozen_date is not None and (
-            self._frozen_lookup or self._evaluated
-        ):
-            with gzip.open(
-                self._frozen_path(self._active_frozen_date),
-                "wb",
-            ) as handle:
-                pickle.dump(
-                    {
-                        "frozen": self._frozen,
-                        "lookup": self._frozen_lookup,
-                        "evaluated": self._evaluated,
-                    },
-                    handle,
-                    protocol=5,
-                )
+        self._flush_active_frozen_partition()
         self._frozen = {}
         self._frozen_lookup = {}
         self._evaluated = {}
@@ -493,8 +615,11 @@ class ValidationFactorCache:
         field_name: str,
     ) -> tuple[FrozenEvidenceCacheKey, ...]:
         keys = set(getattr(self, field_name))
-        for path in sorted(self._cache_directory.glob("frozen-*.pkl.gz")):
-            date_text = path.name[len("frozen-"):-len(".pkl.gz")]
+        # 只看属于本次运行的分区文件：持久化目录里同时躺着别的 `data_version`
+        # 与别的算法版本的分区，把它们的键混进来就是在返回错答案。
+        suffix = f"-{self._frozen_partition_identity()}.pkl.gz"
+        for path in sorted(self._cache_directory.glob(f"frozen-*{suffix}")):
+            date_text = path.name[len("frozen-"):-len(suffix)]
             if (
                 self._active_frozen_date is not None
                 and date_text == self._active_frozen_date.isoformat()
@@ -658,7 +783,13 @@ class ValidationFactorCache:
             base_snapshot = (
                 base_snapshot.sort_values("code").reset_index(drop=True)
             )
-            base_snapshot.to_pickle(base_path, compression="gzip")
+            self._write_atomically(
+                base_path,
+                lambda target: base_snapshot.to_pickle(
+                    target,
+                    compression="gzip",
+                ),
+            )
             self.stats["base_snapshot_builds"] += 1
         snapshot = base_snapshot.copy(deep=True)
         if not config.bottom_divergence_v2_enabled:

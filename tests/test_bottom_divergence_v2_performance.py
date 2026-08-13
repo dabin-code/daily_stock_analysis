@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from src.backtest.services import bottom_divergence_v2_performance
 from src.backtest.services.bottom_divergence_v2_performance import (
     BASE_FACTOR_CONFIG_FIELDS,
     CanonicalCheckpointStore,
@@ -1043,3 +1044,422 @@ def test_checkpoint_recovers_valid_atomic_temp_after_main_corruption(tmp_path):
             data_version="data-a",
             config_hash="config-a",
         )
+
+
+# ─── 持久化缓存目录：跨进程复用与失效条件 ──────────────────────────────
+#
+# `cache_directory` 透传之前，缓存目录恒为进程内临时目录，键不完备的后果只是
+# 每次重算；透传之后缓存文件会跨进程、跨代码版本活下来，同一个缺口就变成
+# 静默返回错数据。下面每一条失效条件都必须有独立的钉子。
+
+
+def _build_once(
+    *,
+    cache_directory,
+    data_version,
+    groups,
+    universe,
+    trade_date,
+    config,
+):
+    """模拟一次独立进程：构造 -> 算一天 -> close。返回三层计数与快照。"""
+    cache = ValidationFactorCache.from_groups(
+        data_version=data_version,
+        trade_dates=(trade_date,),
+        bar_groups=groups,
+        cache_directory=cache_directory,
+    )
+    try:
+        snapshot = cache.build_factor_snapshot(
+            config=config,
+            universe=universe,
+            trade_date=trade_date,
+        )
+    finally:
+        cache.close()
+    return dict(cache.stats), snapshot
+
+
+def test_a_second_run_reuses_a_persistent_factor_cache(tmp_path):
+    """本次改动的承重测试：指向同一持久化目录的第二次运行不得重算。
+
+    同一进程内多条 leg 早就共享一次因子计算，但两次独立构造此前不可能复用
+    ——`from_groups` / `from_database` 都不透传 `cache_directory`，目录恒为
+    临时目录。这条用例钉的就是「透传之后跨进程复用真的生效」，三层计数
+    （base 快照 / 冻结证据 / 参数评估）必须全部归零，且结果与第一次逐值相等。
+    """
+    groups = {"000001": _bars("000001")}
+    trade_date = groups["000001"].iloc[-2]["date"]
+    universe = _one_stock_universe(name="A")
+    config = Config(bottom_divergence_v2_enabled=True)
+    arguments = {
+        "cache_directory": tmp_path,
+        "data_version": "data-a",
+        "groups": groups,
+        "universe": universe,
+        "trade_date": trade_date,
+        "config": config,
+    }
+
+    first_stats, first = _build_once(**arguments)
+    assert first_stats["base_snapshot_builds"] == 1
+    assert first_stats["frozen_evidence_builds"] == 1
+    assert first_stats["parameter_evaluations"] == 1, (
+        "第一次运行没算出三层产物，第二次的归零断言就是空对空"
+    )
+
+    second_stats, second = _build_once(**arguments)
+
+    assert second_stats["base_snapshot_builds"] == 0, (
+        "第二次运行重算了 base 快照，跨进程因子复用没有生效"
+    )
+    assert second_stats["frozen_evidence_builds"] == 0, (
+        "第二次运行重算了冻结证据；分区文件要么没落盘，要么键对不上"
+    )
+    assert second_stats["parameter_evaluations"] == 0, (
+        "第二次运行重算了参数评估层"
+    )
+    pd.testing.assert_frame_equal(second, first)
+
+
+def test_the_default_temporary_directory_keeps_the_previous_behaviour(tmp_path):
+    """不给 `cache_directory` 时行为必须与改动前一致：没有任何跨进程复用。
+
+    默认路径不能被这次改动带着变——持久化是 opt-in 的能力，不是新默认值。
+    """
+    groups = {"000001": _bars("000001")}
+    trade_date = groups["000001"].iloc[-2]["date"]
+    universe = _one_stock_universe(name="A")
+    config = Config(bottom_divergence_v2_enabled=True)
+    arguments = {
+        "cache_directory": None,
+        "data_version": "data-a",
+        "groups": groups,
+        "universe": universe,
+        "trade_date": trade_date,
+        "config": config,
+    }
+
+    first_stats, first = _build_once(**arguments)
+    second_stats, second = _build_once(**arguments)
+
+    assert first_stats["base_snapshot_builds"] == 1
+    assert second_stats["base_snapshot_builds"] == 1, (
+        "默认（临时目录）行为下第二次运行复用了因子，默认行为被改变了"
+    )
+    assert second_stats["frozen_evidence_builds"] == 1
+    assert second_stats["parameter_evaluations"] == 1
+    # 复用与否不该改变结果，只该改变成本。
+    pd.testing.assert_frame_equal(second, first)
+    # 临时目录不落在用户指定的位置。
+    assert not list(tmp_path.iterdir())
+
+
+def test_close_deletes_a_temporary_cache_but_keeps_a_persistent_one(tmp_path):
+    """两种目录的 `close()` 语义相反，必须分开处理。
+
+    临时目录留下就是垃圾；持久化目录删掉等于这次改动白做——下一个进程
+    什么也复用不到，而它恰恰是被显式要求保留的那个。
+    """
+    trade_date = date(2024, 3, 1)
+    temporary_cache = ValidationFactorCache.from_groups(
+        data_version="data-a",
+        trade_dates=(trade_date,),
+        bar_groups={},
+    )
+    temporary_directory = temporary_cache._cache_directory
+    assert temporary_directory.exists()
+    temporary_cache.close()
+    assert not temporary_directory.exists(), (
+        "临时缓存目录没有随 close() 消失"
+    )
+
+    persistent_directory = tmp_path / "factor-cache"
+    persistent_cache = ValidationFactorCache.from_groups(
+        data_version="data-a",
+        trade_dates=(trade_date,),
+        bar_groups={},
+        cache_directory=persistent_directory,
+    )
+    assert persistent_cache._temporary_directory is None
+    marker = persistent_directory / "base-marker.pkl.gz"
+    marker.write_bytes(b"cached")
+    persistent_cache.close()
+
+    assert marker.exists(), "close() 删掉了持久化缓存目录里的内容"
+
+
+def test_closing_twice_is_safe(tmp_path):
+    """`close()` 在 `finally` 里被调用，重复调用不得炸掉调用方。
+
+    临时目录那一支删完目录后若不清掉活动分区，第二次 close() 会去往一个
+    已经不存在的目录落盘。
+    """
+    groups = {"000001": _bars("000001")}
+    trade_date = groups["000001"].iloc[-2]["date"]
+    for cache_directory in (None, tmp_path):
+        cache = ValidationFactorCache.from_groups(
+            data_version="data-a",
+            trade_dates=(trade_date,),
+            bar_groups=groups,
+            cache_directory=cache_directory,
+        )
+        cache.build_factor_snapshot(
+            config=Config(bottom_divergence_v2_enabled=True),
+            universe=_one_stock_universe(name="A"),
+            trade_date=trade_date,
+        )
+        cache.close()
+        cache.close()
+
+
+def test_persistent_cache_is_invalidated_by_the_base_algorithm_version(
+    tmp_path,
+    monkeypatch,
+):
+    """改了 base 因子的计算代码却不 bump 版本号，就会读回旧算法的快照。
+
+    这是登记在进度文档 §8 的隐患：base 快照键此前只覆盖配置、universe 与
+    `data_version`，计算代码本身没有任何来源。临时目录时代它是死条款，
+    持久化之后是活漏洞。
+    """
+    groups = {"000001": _bars("000001")}
+    trade_date = groups["000001"].iloc[-2]["date"]
+    arguments = {
+        "cache_directory": tmp_path,
+        "data_version": "data-a",
+        "groups": groups,
+        "universe": _one_stock_universe(name="A"),
+        "trade_date": trade_date,
+        "config": Config(bottom_divergence_v2_enabled=False),
+    }
+
+    first_stats, _ = _build_once(**arguments)
+    assert first_stats["base_snapshot_builds"] == 1
+    # 对照组：什么都不改必须命中。没有它，「重算了」这条断言在缓存根本
+    # 没生效时同样成立，测的就不是失效条件。
+    control_stats, _ = _build_once(**arguments)
+    assert control_stats["base_snapshot_builds"] == 0
+
+    monkeypatch.setattr(
+        bottom_divergence_v2_performance,
+        "BASE_SNAPSHOT_ALGORITHM_VERSION",
+        "base-factor-snapshot-probe",
+    )
+    second_stats, _ = _build_once(**arguments)
+
+    assert second_stats["base_snapshot_builds"] == 1, (
+        "算法版本变了，缓存却把旧算法算出的 base 快照当成新结果返回"
+    )
+
+
+def test_persistent_cache_is_invalidated_by_the_data_version(tmp_path):
+    """bar 数据换了一套，base 快照与冻结证据都必须重算。
+
+    `data_version` 是调用方对「喂进来的 bar 是哪一份」的承诺，两层都靠它。
+    """
+    groups = {"000001": _bars("000001")}
+    trade_date = groups["000001"].iloc[-2]["date"]
+    arguments = {
+        "cache_directory": tmp_path,
+        "groups": groups,
+        "universe": _one_stock_universe(name="A"),
+        "trade_date": trade_date,
+        "config": Config(bottom_divergence_v2_enabled=True),
+    }
+
+    first_stats, _ = _build_once(data_version="data-a", **arguments)
+    assert first_stats["base_snapshot_builds"] == 1
+    assert first_stats["frozen_evidence_builds"] == 1
+    control_stats, _ = _build_once(data_version="data-a", **arguments)
+    assert control_stats["base_snapshot_builds"] == 0
+    assert control_stats["frozen_evidence_builds"] == 0
+
+    second_stats, _ = _build_once(data_version="data-b", **arguments)
+
+    assert second_stats["base_snapshot_builds"] == 1, (
+        "换了 data_version 却读回上一份数据算出的 base 快照"
+    )
+    assert second_stats["frozen_evidence_builds"] == 1, (
+        "换了 data_version 却读回上一份数据冻结的证据"
+    )
+
+
+def test_persistent_cache_is_invalidated_by_the_universe(tmp_path):
+    """universe 是 base 快照逐行的输入，换了就必须重算。"""
+    groups = {"000001": _bars("000001")}
+    trade_date = groups["000001"].iloc[-2]["date"]
+    arguments = {
+        "cache_directory": tmp_path,
+        "data_version": "data-a",
+        "groups": groups,
+        "trade_date": trade_date,
+        "config": Config(bottom_divergence_v2_enabled=False),
+    }
+
+    first_stats, first = _build_once(
+        universe=_one_stock_universe(name="A"),
+        **arguments,
+    )
+    assert first_stats["base_snapshot_builds"] == 1
+    control_stats, _ = _build_once(
+        universe=_one_stock_universe(name="A"),
+        **arguments,
+    )
+    assert control_stats["base_snapshot_builds"] == 0
+
+    second_stats, second = _build_once(
+        universe=_one_stock_universe(name="B"),
+        **arguments,
+    )
+
+    assert second_stats["base_snapshot_builds"] == 1, (
+        "换了 universe 却命中上一个 universe 的 base 缓存文件"
+    )
+    assert not first.equals(second), (
+        "两个 universe 的 base 快照相同，这条用例的前提不成立"
+    )
+
+
+def test_frozen_partition_files_do_not_leak_across_data_versions(tmp_path):
+    """分区文件名必须与它内部的键同口径，否则会串运行。
+
+    分区文件的内容一直按完整键存（含 `data_version` 与算法版本），所以查表
+    不会返回错的证据；但文件名此前只有日期。持久化之后同一个文件会被两个
+    `data_version` 共写：整份载入、整份写回会让后写的一方抹掉先写的条目，
+    而 `frozen_cache_keys` / `evaluation_cache_keys` 会把别的运行的键当成
+    本次运行的键返回。
+    """
+    groups = {"000001": _bars("000001")}
+    trade_date = groups["000001"].iloc[-2]["date"]
+    universe = _one_stock_universe(name="A")
+    config = Config(bottom_divergence_v2_enabled=True)
+
+    producer = ValidationFactorCache.from_groups(
+        data_version="data-a",
+        trade_dates=(trade_date,),
+        bar_groups=groups,
+        cache_directory=tmp_path,
+    )
+    producer.build_factor_snapshot(
+        config=config,
+        universe=universe,
+        trade_date=trade_date,
+    )
+    producer.close()
+    assert producer.frozen_cache_keys, "生产方没写出任何冻结证据"
+
+    stranger = ValidationFactorCache.from_groups(
+        data_version="data-b",
+        trade_dates=(trade_date,),
+        bar_groups=groups,
+        cache_directory=tmp_path,
+    )
+
+    assert stranger.frozen_cache_keys == (), (
+        "另一个 data_version 的分区文件被当成了本次运行的冻结证据"
+    )
+    assert stranger.evaluation_cache_keys == (), (
+        "另一个 data_version 的分区文件被当成了本次运行的已评估因子"
+    )
+    assert stranger._frozen_path(trade_date) != producer._frozen_path(
+        trade_date
+    ), "两个 data_version 共用了同一个分区文件名"
+
+
+def test_a_failed_cache_write_leaves_the_previous_file_intact(tmp_path):
+    """写到一半失败不得毁掉已经落盘的那一份。
+
+    临时目录里这条无所谓——进程死了目录也没了。持久化目录里则是新增的
+    失败模式：分批跑时进程被 Ctrl-C 或 OOM 杀掉，直写会在目标路径上留下
+    半个 gzip 文件，下一次运行读它时崩在 `pickle.load` 上，而不是重算。
+    """
+    cache = ValidationFactorCache.from_groups(
+        data_version="data-a",
+        trade_dates=(date(2024, 3, 1),),
+        bar_groups={},
+        cache_directory=tmp_path,
+    )
+    target = tmp_path / "base-probe.pkl.gz"
+    cache._write_atomically(target, lambda path: path.write_bytes(b"good"))
+    assert target.read_bytes() == b"good"
+
+    def fail_midway(path):
+        path.write_bytes(b"half")
+        raise OSError("disk full")
+
+    with pytest.raises(OSError):
+        cache._write_atomically(target, fail_midway)
+
+    assert target.read_bytes() == b"good", (
+        "写失败的缓存文件覆盖了上一份完好的产物"
+    )
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "base-probe.pkl.gz"
+    ], "失败的写入留下了中间文件"
+
+
+def test_persistent_cache_directory_holds_no_half_written_leftovers(tmp_path):
+    """缓存文件一律先写临时文件再原子替换，目录里不该留下中间产物。
+
+    持久化目录会被多个进程共享，写到一半被 Ctrl-C 或 OOM 杀掉时，半个
+    gzip 文件会让下一次运行在 `pickle.load` 上崩掉而不是重算。中间文件还
+    必须避开 `base-*` / `frozen-*` 两个 glob，否则它自己就会被当成缓存读。
+    """
+    groups = {"000001": _bars("000001")}
+    trade_date = groups["000001"].iloc[-2]["date"]
+    cache = ValidationFactorCache.from_groups(
+        data_version="data-a",
+        trade_dates=(trade_date,),
+        bar_groups=groups,
+        cache_directory=tmp_path,
+    )
+    cache.build_factor_snapshot(
+        config=Config(bottom_divergence_v2_enabled=True),
+        universe=_one_stock_universe(name="A"),
+        trade_date=trade_date,
+    )
+    cache.close()
+
+    names = sorted(path.name for path in tmp_path.iterdir())
+    assert names, "什么都没写出来，这条用例没覆盖到目标"
+    assert all(
+        name.startswith(("base-", "frozen-")) for name in names
+    ), f"缓存目录里留下了中间产物：{names}"
+
+
+def test_from_groups_defaults_to_a_temporary_directory():
+    cache = ValidationFactorCache.from_groups(
+        data_version="data-a",
+        trade_dates=(date(2024, 3, 1),),
+        bar_groups={},
+    )
+    try:
+        assert cache._temporary_directory is not None
+    finally:
+        cache.close()
+
+
+def test_from_database_forwards_the_cache_directory(tmp_path, monkeypatch):
+    """`from_database` 是 CLI 真正走的工厂，不透传就等于这次改动没落地。"""
+    monkeypatch.setattr(
+        bottom_divergence_v2_performance,
+        "iter_query_batches",
+        lambda session, statement: iter(()),
+    )
+    db_manager = MagicMock()
+    persistent_directory = tmp_path / "factor-cache"
+
+    cache = ValidationFactorCache.from_database(
+        db_manager=db_manager,
+        data_version="data-a",
+        trade_dates=(date(2024, 3, 1),),
+        codes=("000001",),
+        lookback_days=120,
+        cache_directory=persistent_directory,
+    )
+    try:
+        assert cache._cache_directory == persistent_directory
+        assert cache._temporary_directory is None
+    finally:
+        cache.close()

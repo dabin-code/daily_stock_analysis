@@ -260,8 +260,15 @@ python scripts/validate_bottom_divergence_v2.py \
   --market cn \
   --workers 12 \
   --checkpoint .claude/reviews/bottom-divergence-v2-checkpoint.json \
+  --cache-dir .cache/bottom-divergence-v2-factors \
   --output .claude/reviews/bottom-divergence-v2-validation.json
 ```
+
+`--cache-dir` 可选，把因子缓存写到指定目录，使后续运行复用已算好的 base 快照与
+冻结证据；不传则维持既有行为（进程内临时目录，用完即删，不跨进程复用）。
+复用只在 `data_version`、universe、base 配置与算法版本全部一致时发生，因此指向
+一个过期目录的代价是重算，不会是错结果。目录内容随代码演进增长，需要时直接删除
+整个目录即可。
 
 长任务中断后可在输入数据和配置未变化时追加 `--resume`。断点文件会校验
 `data_version`、完整 v2 配置、参数网格、成本、日期/市场/universe、

@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `scripts/validate_bottom_divergence_v2.py` gained an optional `--cache-dir`,
+  and `ValidationFactorCache.from_database` / `from_groups` now forward
+  `cache_directory` to the constructor (they accepted none before, so the cache
+  directory was always a per-process temporary one and no two runs could share a
+  factor pass). Omitting the flag keeps the previous behaviour exactly. `close()`
+  now distinguishes the two cases: a temporary directory is deleted, a persistent
+  one is kept and the still-in-memory frozen partition is flushed to it first —
+  `_switch_frozen_partition` only wrote a partition when the trade date changed,
+  so the last date of a run was never persisted. The CLI prints
+  `validation-factor-cache base_snapshot_builds=... frozen_evidence_builds=...
+  parameter_evaluations=...` on stderr so an operator can tell reuse from a
+  silent recompute.
+- **`BASE_SNAPSHOT_ALGORITHM_VERSION` now takes part in the base snapshot cache
+  key, and must be bumped by hand when the base factor code changes.** The base
+  snapshot's value is decided by config, universe, bars and *the code that
+  computes it*; the first three were keyed (whitelist hash, universe fingerprint,
+  `data_version`) and the fourth had no source at all. While the cache directory
+  was always temporary this was a dead clause — the directory died with the
+  process, so changed code could never read an old snapshot. Making the directory
+  persistent turns it into a live hole: change a detector and forget to bump, and
+  the next run silently serves factors computed by the old algorithm. The constant
+  carries an enumerated list of what requires a bump (base-pass detectors, the
+  hard-coded thresholds that live outside `Config`, `adjustment_chain`, the
+  windowing code, and numeric-output-changing dependency upgrades). The frozen
+  evidence layer already had the equivalent guard in
+  `FROZEN_EVIDENCE_ALGORITHM_VERSION`.
+- Frozen evidence partition files are now named
+  `frozen-<date>-<identity>.pkl.gz`, where the identity covers `data_version` and
+  the evidence algorithm version, and the key-listing properties only glob this
+  run's identity. The file *contents* were always keyed in full, so no wrong
+  evidence was ever returned; but the filename was date-only, which under a shared
+  persistent directory means two data versions write the same file. Since
+  `_switch_frozen_partition` loads and stores a whole partition, the later writer
+  erases the earlier one's entries, and `frozen_cache_keys` /
+  `evaluation_cache_keys` would report another run's keys as this run's.
+- Base snapshots and frozen partitions are written to a sibling temporary file and
+  then `os.replace`d. A persistent directory can be shared by concurrent or
+  restarted processes, so a run killed mid-write would otherwise leave a truncated
+  gzip file that makes the *next* run die in `pickle.load` instead of recomputing.
+
 ### Changed
 
 - Promoted `stock_daily_staging` into production `stock_daily`, taking the table

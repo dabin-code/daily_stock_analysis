@@ -427,6 +427,9 @@ def run_validation_cli(
             lookback_days=config.screening_factor_lookback_days,
             progress_every=getattr(args, "progress_every", 100),
             progress_callback=report_progress,
+            # 不给 `--cache-dir` 时保持既有行为：进程内临时目录，
+            # 用完即删，不跨进程复用任何因子。
+            cache_directory=getattr(args, "cache_dir", None),
             workers=getattr(args, "workers", 4),
         )
         dependencies = _build_default_replay_dependencies(
@@ -469,4 +472,16 @@ def run_validation_cli(
                 isolation_observer(source_db, temporary_db)
             return result
         finally:
+            # 三层计数是判断因子复用是否真的生效的唯一可观测量。不打出来，
+            # 操作者给了 `--cache-dir` 也无从知道命中与否，只能靠总耗时猜。
+            stats = factor_cache.stats
+            print(
+                "validation-factor-cache "
+                f"base_snapshot_builds={stats['base_snapshot_builds']} "
+                f"frozen_evidence_builds={stats['frozen_evidence_builds']} "
+                f"parameter_evaluations={stats['parameter_evaluations']} "
+                f"sql_bar_queries={stats['sql_bar_queries']}",
+                file=sys.stderr,
+                flush=True,
+            )
             factor_cache.close()

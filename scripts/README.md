@@ -736,6 +736,26 @@ docker exec stock-analyzer python /app/run_historical_random_screening.py --samp
 
 ---
 
+### 5.2 `validate_bottom_divergence_v2.py` — 底背离 v2 样本外发布闸门
+
+**作用**：把指定区间的历史行情复制成隔离数据集，按参数网格重放底背离 v1/v2，产出 canonical JSON 报告。发布 v2 前必须跑。完整参数见 `--help`，用法与成本模型说明见根目录 `README.md`。
+
+**因子缓存目录**
+
+```powershell
+# 默认：进程内临时目录，用完即删，两次运行之间没有任何复用
+python scripts/validate_bottom_divergence_v2.py --date-from 2026-06-01 --date-to 2026-07-15 --market cn --universe-codes data/universe_smoke.txt --output .claude/reviews/v2-validation.json
+
+# 指定 --cache-dir：base 快照与冻结证据落盘，后续运行可复用
+python scripts/validate_bottom_divergence_v2.py --date-from 2026-06-01 --date-to 2026-07-15 --market cn --universe-codes data/universe_smoke.txt --cache-dir .cache/bottom-divergence-v2-factors --output .claude/reviews/v2-validation.json
+```
+
+命中情况会在 stderr 打印 `validation-factor-cache base_snapshot_builds=... frozen_evidence_builds=... parameter_evaluations=...`，三项全为 0 表示这一趟完全复用了缓存。
+
+⚠️ 缓存键覆盖 `data_version`、universe 指纹、base 配置白名单与算法版本，任一不同都会重算而不是返回旧结果。**但改了 base 因子的计算代码却没有 bump `BASE_SNAPSHOT_ALGORITHM_VERSION`（在 `src/backtest/services/bottom_divergence_v2_performance.py`），持久化目录就会返回旧算法算出的因子**。拿不准时直接删掉整个缓存目录。
+
+---
+
 ## 6. CI / 治理校验
 
 ### 6.1 `ci_gate.sh` — 后端 CI gate
