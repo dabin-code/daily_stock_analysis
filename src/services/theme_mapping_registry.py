@@ -8,10 +8,11 @@ ThemeMappingRegistry: 板块→题材主数据映射注册表。
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,45 @@ class ThemeResolution:
 # ── 默认配置路径 ─────────────────────────────────────────────────────────
 
 _DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "theme_board_mappings.yaml"
+
+
+# ── YAML 解析缓存 ────────────────────────────────────────────────────────
+#
+# 回测里每次 FiveLayerPipeline.run() 都会新建一个 ThemeMappingRegistry，
+# 同一份 YAML 会被重复解析上百次。缓存键取文件内容摘要而非路径或 mtime：
+# 文件一旦被改写，摘要必然变化，因此不存在读到陈旧配置的时间窗口。
+
+_MAX_CACHED_DOCUMENTS = 8
+_document_cache: Dict[str, Any] = {}
+
+
+def clear_theme_mapping_cache() -> None:
+    """清空 YAML 解析缓存。测试或需要强制重读配置时使用。"""
+    _document_cache.clear()
+
+
+def _load_yaml_document(path: str) -> Any:
+    """读取并解析 YAML；内容未变时复用已解析结果。
+
+    返回值在多个注册表实例间共享，调用方只读不改。
+    """
+    import yaml
+
+    with open(path, "rb") as f:
+        raw = f.read()
+
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest in _document_cache:
+        return _document_cache[digest]
+
+    data = yaml.safe_load(raw.decode("utf-8"))
+
+    if len(_document_cache) >= _MAX_CACHED_DOCUMENTS:
+        oldest = next(iter(_document_cache), None)
+        if oldest is not None:
+            _document_cache.pop(oldest, None)
+    _document_cache[digest] = data
+    return data
 
 
 # ── 注册表 ───────────────────────────────────────────────────────────────
@@ -124,14 +164,13 @@ class ThemeMappingRegistry:
     def _load(self, path: str) -> None:
         """从 YAML 文件加载映射。失败时退化为空注册表。"""
         try:
-            import yaml
+            import yaml  # noqa: F401
         except ImportError:
             logger.warning("PyYAML not installed; ThemeMappingRegistry empty.")
             return
 
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
+            data = _load_yaml_document(path)
         except FileNotFoundError:
             logger.warning("Theme mapping config not found: %s", path)
             return

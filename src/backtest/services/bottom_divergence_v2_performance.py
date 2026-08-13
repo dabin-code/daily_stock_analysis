@@ -812,6 +812,55 @@ class ValidationFactorCache:
             "zone_score_min": config.bottom_divergence_v2_zone_score_min,
         })
 
+    def _window_mask(
+        self,
+        code: str,
+        trade_date: date,
+        lookback_days: int,
+    ) -> Optional[tuple[pd.DataFrame, pd.Series]]:
+        """取窗的**唯一**判据：源 frame 与它的行掩码。
+
+        `_window` 与 `_window_row_count` 都从这里出发，两条路径因此不可能给出
+        不同的窗口范围。这一点是正确性而不是整洁：`as_of_index` 取自行数、
+        却要与真正被评估的那个窗口对齐，两处各写一遍谓词就等于埋一个「键对不上
+        内容」的静默错误。
+        """
+        frame = self._bar_groups.get(code)
+        if frame is None:
+            return None
+        start = pd.Timestamp(
+            trade_date - timedelta(days=lookback_days * 2)
+        )
+        end = pd.Timestamp(trade_date)
+        dates = frame["date"]
+        return frame, (dates >= start) & (dates <= end)
+
+    def _window_row_count(
+        self,
+        code: str,
+        trade_date: date,
+        lookback_days: int,
+    ) -> int:
+        """窗口的行数，**不物化窗口、也不施加复权**。
+
+        调用方只要 `as_of_index` 时走这条路：三层缓存全命中的热运行里，取窗
+        结果除了行数之外一个字节都没人读，而复权是整趟最贵的单项（实测 7230
+        次、8.77s，占 25%）。
+
+        用行数替代 `len(_window(...))` 成立，是因为复权**不改变行数**：
+        `apply_read_adjustment` 的四个分支（空窗原样返回、已复权原样返回、
+        缺 `pre_close` 或口径非 `raw` 走 `mark_unadjustable`、正常走
+        `apply_adjustment`）都只增列或改值，没有一条会增删行。
+        `tests/test_bottom_divergence_v2_performance.py::
+        test_window_row_count_matches_the_adjusted_window_in_every_branch`
+        逐分支钉住这条不变式——它一旦失效，`as_of_index` 就会与被评估窗口
+        错位，缓存键指向别的窗口。
+        """
+        resolved = self._window_mask(code, trade_date, lookback_days)
+        if resolved is None:
+            return 0
+        return int(resolved[1].sum())
+
     def _window(
         self,
         code: str,
@@ -827,14 +876,10 @@ class ValidationFactorCache:
         分红信息带进 D，直接违反时点安全。这里切出来的窗口末行恰好就是 D，
         而 base 快照与 v2 证据两层消费的都是它，一处施加两层同口径。
         """
-        frame = self._bar_groups.get(code)
-        if frame is None:
+        resolved = self._window_mask(code, trade_date, lookback_days)
+        if resolved is None:
             return pd.DataFrame()
-        start = pd.Timestamp(
-            trade_date - timedelta(days=lookback_days * 2)
-        )
-        end = pd.Timestamp(trade_date)
-        mask = (frame["date"] >= start) & (frame["date"] <= end)
+        frame, mask = resolved
         window = frame.loc[mask].reset_index(drop=True)
         if not adjust:
             return window
@@ -850,15 +895,28 @@ class ValidationFactorCache:
         from src.services.factor_service import FactorService
 
         codes = sorted(str(code) for code in universe["code"].tolist())
-        windows = {
-            code: self._window(
-                code,
-                trade_date,
-                config.screening_factor_lookback_days,
-                adjust=config.adj_apply_on_read,
-            )
-            for code in codes
-        }
+        lookback_days = config.screening_factor_lookback_days
+        # 取窗**按需**物化。此前这里是一个覆盖全 universe 的 dict comprehension，
+        # 位置在 `base_path.exists()` 与三层缓存查表之前，于是三层全命中的热运行
+        # 也要把 15 只 × 482 次调用 = 7230 个窗口整套取出来并复权，实测 12.90s
+        # （其中复权 8.77s，占整趟 25%），而这些窗口除了行数之外无人读取。
+        #
+        # memo 的生命周期只有这一次调用，且键集不超过 `codes`，所以常驻上界
+        # 严格不高于改动前那个 dict——冷路径仍然只算一遍，热路径一个都不算。
+        materialized: dict[str, pd.DataFrame] = {}
+
+        def window_for(code: str) -> pd.DataFrame:
+            window = materialized.get(code)
+            if window is None:
+                window = self._window(
+                    code,
+                    trade_date,
+                    lookback_days,
+                    adjust=config.adj_apply_on_read,
+                )
+                materialized[code] = window
+            return window
+
         # 两个口径刻意分开：base 快照只依赖白名单里的 8 个字段，而证据两层
         # 仍需 `base_hash` 的全量口径——`bottom_divergence_v2_sync_window` 等
         # 字段只由它覆盖，`_parameter_hash` 不含它们。
@@ -874,6 +932,10 @@ class ValidationFactorCache:
                 config,
                 bottom_divergence_v2_enabled=False,
             )
+            # base pass 要喂 universe 里的每一只，包括取不到 bar 的空窗——
+            # 这是改动前的行为，`_build_base_factor_task` 对空窗返回 None 再被
+            # 过滤掉。这里整套物化，后面的 v2 循环命中 memo，不会再算第二遍。
+            windows = {code: window_for(code) for code in codes}
             if self.workers > 1 and len(windows) > 1:
                 info_by_code = universe.set_index("code").to_dict("index")
                 tasks = [
@@ -932,15 +994,38 @@ class ValidationFactorCache:
             str(row["code"]): index
             for index, row in snapshot.iterrows()
         }
+        # 显式补回一道曾经由 `windows[code]` 隐式提供的断言。
+        #
+        # 取窗改成按需物化之前，这个循环里的 `windows[code]` 会对 universe 之外的
+        # code 抛 `KeyError`——一道没人写但一直生效的结构性断言。改成
+        # `_window_row_count` 之后它消失了：多出来的 code 必然在 `_bar_groups` 里
+        # （它们的 base 行就是从那儿算出来的），于是会被正常评估、写进 snapshot
+        # 返回给调用方，**调用方拿到一个超出自己 universe 的快照且不报错**。
+        #
+        # 今天不可达：`row_by_code` 只源于 base 快照，而 base 快照要么按含
+        # `_universe_fingerprint` 的文件名读回、要么由 `sorted(windows)` /
+        # `sorted(bar_groups)` 现算，两条都以 `codes` 为上界。
+        # 会打破它的是「多条 leg 共享同一次因子计算」从同策略多网格推广到多策略：
+        # 对 union universe 建一次 base 快照、各策略读自己的子集，包含关系当场失效。
+        unexpected = sorted(set(row_by_code) - set(codes))
+        if unexpected:
+            raise ValueError(
+                "base 快照含 universe 之外的 code："
+                f"{unexpected[:5]}（共 {len(unexpected)} 个）。"
+                "快照的 universe 与本次重放的 universe 已经脱钩，"
+                "继续下去会产出一份超出调用方 universe 的因子快照。"
+            )
         tasks = []
         temporary_keys = {}
         ready_results = []
         for code in sorted(row_by_code):
-            group = windows[code]
-            if len(group) < 60:
+            # 只问行数：命中缓存时窗口本身没有消费方，物化它纯属浪费。
+            # 行数不受复权影响，见 `_window_row_count` 的说明。
+            row_count = self._window_row_count(code, trade_date, lookback_days)
+            if row_count < 60:
                 progress.advance()
                 continue
-            as_of_index = len(group) - 1
+            as_of_index = row_count - 1
             temporary_key = self._temporary_frozen_key(
                 data_version=self.data_version,
                 code=code,
@@ -971,10 +1056,11 @@ class ValidationFactorCache:
                 ):
                     ready_results.append((code, frozen, cached, False))
                     continue
+            # 到这里才真的需要窗口：要么没冻结过证据，要么这一组参数没评估过。
             tasks.append((
                 code,
                 config,
-                group,
+                window_for(code),
                 frozen,
             ))
         if self.workers > 1 and len(tasks) > 1:

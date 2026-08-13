@@ -86,6 +86,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `FROZEN_PARTITION_LAYOUT_VERSION` joins the frozen partition identity, so a cache
   directory written by the previous layout is ignored rather than partially
   reinterpreted. The cost is one recompute per stale directory.
+- **Replay windows are now materialized only when something actually consumes them,
+  instead of up front for the whole universe.** `build_factor_snapshot` opened with a
+  dict comprehension that took and adjusted a window for every code in the universe,
+  positioned *before* the base-snapshot lookup and the three cache layers — so a run
+  that recomputed nothing still paid for every window. On the hot path those windows
+  were never read beyond `len(group)`, and `apply_read_adjustment` never adds or drops
+  rows, so the work was entirely wasted: 7,230 calls and 8.77s, 25% of the run. Window
+  taking is now deferred behind a per-call memo, and the row count needed for the
+  `< 60` filter and `as_of_index` comes from `_window_row_count`, which evaluates the
+  window predicate without materializing or adjusting. Measured as a same-session A/B on
+  the 15-stock / 32-trading-day smoke replay with `--workers 4` and a warm OS page cache:
+  the hot run falls from 41.2s to 25.4s (−38.3%) with `apply_read_adjustment` down to 0
+  calls, while the cold run rises from 140.8s to 146.2s (+3.8%). The cold cost is real
+  and expected: a cold code now has its window predicate evaluated twice, once to
+  materialize and once for the row count. It is paid once per cache directory, against a
+  saving paid on every subsequent run. Reports are byte-identical (same SHA-256) across
+  both variants, cold and hot, and the parent process peak working set drops from
+  155.6 MB to 153.3 MB. The window predicate now
+  lives in one place (`_window_mask`) because the row count feeding `as_of_index` must
+  agree with the window that is later evaluated — two copies of the predicate would be
+  a silent key/content mismatch, not a style issue.
+- Parsed theme-mapping YAML documents are cached at module scope, keyed by a SHA-256 of
+  the file content. A fresh `ThemeMappingRegistry` is built on every
+  `FiveLayerPipeline.run()`, so a replay across legs and trading dates reparsed the same
+  file 482 times (4.63s). Content hashing is deliberate: file mtime and size were
+  measured to be unreliable as a key here — rewriting the same path with same-length
+  content produced an identical `(st_mtime_ns, st_size)` in 16 of 20 trials, which would
+  serve a stale mapping. Reparsing 482 times now costs 0.035s instead of 1.196s.
+  `clear_theme_mapping_cache()` is exported for tests.
+- `build_factor_snapshot` now raises if the base snapshot contains codes outside the
+  requested universe. Before windows were deferred, `windows[code]` raised `KeyError`
+  in that situation — an unwritten but load-bearing structural assertion. Without it the
+  extra codes (which are necessarily present in `_bar_groups`, since that is where their
+  base rows came from) would be evaluated normally and returned, handing the caller a
+  snapshot wider than its own universe with no signal. The condition is unreachable
+  today, because a base snapshot is either read back under a filename carrying the
+  universe fingerprint or computed from `sorted(bar_groups)`, both bounded by the
+  universe. It becomes reachable as soon as one base pass is shared across strategies
+  over a union universe, which is the natural implementation of the planned cross-leg
+  factor sharing.
 
 - Promoted `stock_daily_staging` into production `stock_daily`, taking the table
   from 2,974,189 rows starting 2024-04-18 to **9,622,396 rows spanning

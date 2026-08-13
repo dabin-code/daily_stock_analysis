@@ -6,7 +6,7 @@ from datetime import date, timedelta
 import hashlib
 import json
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
@@ -42,6 +42,10 @@ from src.backtest.services.bottom_divergence_v2_report import (
     canonical_json_dumps,
 )
 from src.config import Config
+from src.services.adjustment_chain import (
+    ANOMALOUS_SOURCE,
+    TRUSTED_SOURCE,
+)
 from src.services.factor_service import FactorService
 
 
@@ -564,6 +568,281 @@ def test_factor_cache_does_not_read_bars_after_trade_date():
         trade_date=trade_date,
     )
     pd.testing.assert_frame_equal(actual, expected)
+
+
+def _adjustable_bars(
+    code: str,
+    size: int = 170,
+    *,
+    convention: str | None = "raw",
+    with_pre_close: bool = True,
+) -> pd.DataFrame:
+    """`_bars` 加上复权链真正要读的两列，可按分支关掉其中任意一列。
+
+    `_bars` 两列都不带，落在 `apply_read_adjustment` 的 fail-closed 分支上，
+    覆盖不到「真的施加了复权」那一支。
+    """
+    frame = _bars(code, size)
+    if with_pre_close:
+        closes = frame["close"].to_numpy(dtype=float)
+        frame["pre_close"] = np.concatenate(([closes[0]], closes[:-1]))
+    if convention is not None:
+        frame["adj_convention"] = convention
+    return frame
+
+
+@pytest.mark.parametrize(
+    ("convention", "with_pre_close", "trusted"),
+    [
+        ("raw", True, True),
+        # 口径守卫整窗拒绝：`mark_unadjustable` 只改列不改行。
+        ("qfq", True, False),
+        # 缺 `adj_convention` 列与非 raw 同等对待，同样整窗拒绝。
+        (None, True, False),
+        # 缺 `pre_close` 列走另一条 fail-closed 分支。
+        ("raw", False, False),
+    ],
+)
+def test_window_row_count_matches_the_adjusted_window_in_every_branch(
+    convention,
+    with_pre_close,
+    trusted,
+):
+    """行数不变式：`_window_row_count` 必须等于真窗口的行数。
+
+    这条不变式是 `as_of_index` 的地基。热路径只拿行数去拼
+    `FrozenEvidenceCacheKey`，真正被评估的却是随后物化出来的窗口；两者一旦
+    差一行，缓存键就指向了另一个窗口的证据——不报错，只算错。
+
+    逐分支跑是必需的：`apply_read_adjustment` 有四条出口（正常施加、口径
+    fail-closed、缺 `pre_close` fail-closed、空窗原样返回），只测其中一条
+    等于赌另外三条也不改行数。
+    """
+    group = _adjustable_bars(
+        "000001",
+        90,
+        convention=convention,
+        with_pre_close=with_pre_close,
+    )
+    trade_date = group.iloc[-3]["date"]
+    cache = ValidationFactorCache.from_groups(
+        data_version="data-a",
+        trade_dates=(trade_date,),
+        bar_groups={"000001": group},
+    )
+    try:
+        # 依次是「整段都在窗口内」「窗口被 lookback 截断」「只剩回放日当天」。
+        for lookback_days in (200, 20, 0):
+            adjusted = cache._window(
+                "000001", trade_date, lookback_days, adjust=True
+            )
+            unadjusted = cache._window(
+                "000001", trade_date, lookback_days, adjust=False
+            )
+            counted = cache._window_row_count(
+                "000001", trade_date, lookback_days
+            )
+            assert counted == len(adjusted) == len(unadjusted) > 0, (
+                f"lookback={lookback_days} 上行数不一致，"
+                "as_of_index 会与被评估的窗口错位"
+            )
+            expected_source = (
+                TRUSTED_SOURCE if trusted else ANOMALOUS_SOURCE
+            )
+            assert (
+                adjusted["adj_factor_source"] == expected_source
+            ).all(), "夹具没有落在预期的复权分支上，这条参数化是空转的"
+
+        # 取不到 bar 的 code：改动前是 `windows[code]` 拿到空 DataFrame，
+        # 现在是行数 0，两者都必须让调用方走「不足 60 根」那条路。
+        assert cache._window_row_count("999999", trade_date, 200) == 0
+        assert cache._window("999999", trade_date, 200).empty
+    finally:
+        cache.close()
+
+
+def test_a_base_snapshot_wider_than_the_universe_fails_loudly(tmp_path):
+    """base 快照含 universe 之外的 code 时必须报错，不得静默返回超集。
+
+    取窗改成按需物化之前，v2 循环里的 `windows[code]` 会对这种 code 抛
+    `KeyError`——一道没人写但一直生效的结构性断言。换成 `_window_row_count`
+    之后它消失了：多出来的 code 必然在 `_bar_groups` 里（它们的 base 行就是
+    从那儿算出来的），于是会被正常评估并写进返回值，**调用方拿到一份超出自己
+    universe 的快照且没有任何提示**。
+
+    这条路今天不可达（base 快照的两个来源都以 `codes` 为上界）。它会变成活的，
+    是在「多条 leg 共享同一次因子计算」从同策略多网格推广到多策略时：对 union
+    universe 建一次 base 快照、各策略读自己的子集。这里直接把那一刻的形状写死。
+    """
+    groups = {"000001": _bars("000001"), "000002": _bars("000002")}
+    trade_date = groups["000001"].iloc[-2]["date"]
+    narrow_universe = pd.DataFrame([{"code": "000001", "name": "A"}])
+    wide_universe = pd.DataFrame([
+        {"code": "000001", "name": "A"},
+        {"code": "000002", "name": "B"},
+    ])
+    # base 快照键只覆盖 8 字段白名单，v2 开关不在其中（base pass 强制关闭 v2），
+    # 所以开与关落在同一个 base 文件上——正是下面覆写生效的前提。
+    base_off = Config(bottom_divergence_v2_enabled=False)
+    base_on = Config(bottom_divergence_v2_enabled=True)
+
+    narrow_cache = ValidationFactorCache.from_groups(
+        data_version="data-a",
+        trade_dates=(trade_date,),
+        bar_groups=groups,
+        cache_directory=tmp_path / "narrow",
+    )
+    wide_cache = ValidationFactorCache.from_groups(
+        data_version="data-a",
+        trade_dates=(trade_date,),
+        bar_groups=groups,
+        cache_directory=tmp_path / "wide",
+    )
+    try:
+        narrow_cache.build_factor_snapshot(
+            config=base_off,
+            universe=narrow_universe,
+            trade_date=trade_date,
+        )
+        wide_snapshot = wide_cache.build_factor_snapshot(
+            config=base_off,
+            universe=wide_universe,
+            trade_date=trade_date,
+        )
+        assert len(wide_snapshot) == 2, "夹具没造出两行，这条测试是空转的"
+
+        base_files = list((tmp_path / "narrow").glob("base-*"))
+        assert len(base_files) == 1, f"预期一个 base 快照文件，实际 {base_files}"
+        wide_snapshot.to_pickle(base_files[0], compression="gzip")
+
+        with pytest.raises(ValueError, match="universe 之外的 code"):
+            narrow_cache.build_factor_snapshot(
+                config=base_on,
+                universe=narrow_universe,
+                trade_date=trade_date,
+            )
+    finally:
+        narrow_cache.close()
+        wide_cache.close()
+
+
+def test_a_fully_cached_snapshot_neither_takes_nor_adjusts_a_window():
+    """三层全命中时，取窗与复权必须一次都不发生。
+
+    取窗此前是 `build_factor_snapshot` 开头一个覆盖全 universe 的 dict
+    comprehension，位置在 base 快照落盘判定与三层查表**之前**，于是什么都
+    不重算的热运行也要把每一只都取窗并复权一遍。实测 15 只股池 32 天里这是
+    7230 次调用、12.90s，其中复权 8.77s 占整趟 25%，而这些窗口除了行数之外
+    没有任何消费方。
+
+    这里钉的是「热路径不碰窗口」，不是「快了多少」：把物化改回提前执行，
+    下面两个计数立刻非零。
+    """
+    groups = {"000001": _adjustable_bars("000001")}
+    trade_date = groups["000001"].iloc[-1]["date"]
+    universe = pd.DataFrame([{"code": "000001", "name": "A"}])
+    config = Config(bottom_divergence_v2_enabled=True)
+    cache = ValidationFactorCache.from_groups(
+        data_version="data-a",
+        trade_dates=(trade_date,),
+        bar_groups=groups,
+    )
+    try:
+        first = cache.build_factor_snapshot(
+            config=config,
+            universe=universe,
+            trade_date=trade_date,
+        )
+        assert cache.stats["base_snapshot_builds"] == 1
+        assert cache.stats["parameter_evaluations"] == 1
+
+        calls = {"window": 0, "adjust": 0}
+        original_window = ValidationFactorCache._window
+        original_adjust = (
+            bottom_divergence_v2_performance.apply_read_adjustment
+        )
+
+        def counting_window(self, *args, **kwargs):
+            calls["window"] += 1
+            return original_window(self, *args, **kwargs)
+
+        def counting_adjust(frame):
+            calls["adjust"] += 1
+            return original_adjust(frame)
+
+        with patch.object(
+            ValidationFactorCache, "_window", counting_window
+        ), patch.object(
+            bottom_divergence_v2_performance,
+            "apply_read_adjustment",
+            counting_adjust,
+        ):
+            second = cache.build_factor_snapshot(
+                config=config,
+                universe=universe,
+                trade_date=trade_date,
+            )
+
+        assert calls == {"window": 0, "adjust": 0}, (
+            f"热运行仍在取窗/复权（{calls}），取窗又跑到查表前面去了"
+        )
+        assert cache.stats["base_snapshot_builds"] == 1
+        assert cache.stats["frozen_evidence_builds"] == 1
+        assert cache.stats["parameter_evaluations"] == 1
+        pd.testing.assert_frame_equal(second, first)
+    finally:
+        cache.close()
+
+
+def test_a_cold_snapshot_still_feeds_adjusted_windows_to_both_layers():
+    """冷运行必须仍然把**已复权**的窗口喂给 base pass 与证据层。
+
+    推迟物化的反向风险是推过头：某条路径拿到未复权窗口也不会报错，只会在
+    带除权跳空的原始价上算因子。这里用同一份数据构造两个缓存——一个开
+    `adj_apply_on_read`、一个关——若两者产出相同，说明复权根本没被施加。
+    """
+    groups = {"000001": _adjustable_bars("000001")}
+    trade_date = groups["000001"].iloc[-1]["date"]
+    universe = pd.DataFrame([{"code": "000001", "name": "A"}])
+    adjusted_config = Config(
+        bottom_divergence_v2_enabled=True,
+        adj_apply_on_read=True,
+    )
+    caches = {}
+    try:
+        for name, config in (
+            ("on", adjusted_config),
+            ("off", replace(adjusted_config, adj_apply_on_read=False)),
+        ):
+            caches[name] = ValidationFactorCache.from_groups(
+                data_version="data-a",
+                trade_dates=(trade_date,),
+                bar_groups=groups,
+            )
+            window = caches[name]._window(
+                "000001",
+                trade_date,
+                config.screening_factor_lookback_days,
+                adjust=config.adj_apply_on_read,
+            )
+            caches[name].build_factor_snapshot(
+                config=config,
+                universe=universe,
+                trade_date=trade_date,
+            )
+            assert caches[name].stats["parameter_evaluations"] == 1
+            if config.adj_apply_on_read:
+                assert "adj_factor_source" in window.columns
+                assert (
+                    window["adj_factor_source"] == TRUSTED_SOURCE
+                ).all()
+            else:
+                assert (
+                    window["adj_factor_source"] != TRUSTED_SOURCE
+                ).all()
+    finally:
+        for cache in caches.values():
+            cache.close()
 
 
 @pytest.mark.skipif(

@@ -7,11 +7,15 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import yaml
 
 from src.services.theme_mapping_registry import (
     ThemeMapping,
     ThemeMappingRegistry,
     ThemeResolution,
+    clear_theme_mapping_cache,
 )
 
 # ── 测试用 YAML 内容 ────────────────────────────────────────────────────
@@ -246,6 +250,90 @@ themes:
         )
         with self.assertRaises(AttributeError):
             r.canonical_tag = "Z"  # type: ignore[misc]
+
+
+class TestThemeMappingRegistryParseCache(unittest.TestCase):
+    """YAML 解析缓存：重复构造不重复解析，且不返回陈旧配置。"""
+
+    # 两份内容不同但字节数完全相同的配置，用于验证缓存不是按
+    # (路径, mtime, size) 判定新鲜度——那样在同尺寸快速改写时会读到旧值。
+    _YAML_TAG_A = """\
+themes:
+  - canonical_tag: "TAG_A"
+    boards:
+      - board_name: "BOARD_X"
+        priority: 100
+"""
+    _YAML_TAG_B = """\
+themes:
+  - canonical_tag: "TAG_B"
+    boards:
+      - board_name: "BOARD_X"
+        priority: 100
+"""
+
+    def setUp(self) -> None:
+        clear_theme_mapping_cache()
+
+    def tearDown(self) -> None:
+        clear_theme_mapping_cache()
+
+    def test_repeated_construction_parses_yaml_once(self) -> None:
+        """同一份配置重复构造注册表，只解析一次 YAML。"""
+        path = _write_temp_yaml(_TEST_YAML)
+        try:
+            with patch("yaml.safe_load", wraps=yaml.safe_load) as safe_load:
+                registries = [
+                    ThemeMappingRegistry(config_path=path) for _ in range(5)
+                ]
+
+            self.assertEqual(safe_load.call_count, 1)
+            for reg in registries:
+                self.assertEqual(reg.resolve_tag("AIGC概念"), "AI大模型")
+                self.assertEqual(len(reg.get_all_boards_for_tag("AI大模型")), 2)
+        finally:
+            os.unlink(path)
+
+    def test_rewritten_config_is_reparsed(self) -> None:
+        """配置被改写后重新解析，不返回缓存中的旧映射。"""
+        path = _write_temp_yaml(self._YAML_TAG_A)
+        try:
+            before = ThemeMappingRegistry(config_path=path)
+            self.assertEqual(before.resolve_tag("BOARD_X"), "TAG_A")
+
+            # 同尺寸、同一路径、紧接着改写：mtime 可能落在同一时间戳刻度内
+            self.assertEqual(len(self._YAML_TAG_A), len(self._YAML_TAG_B))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self._YAML_TAG_B)
+
+            after = ThemeMappingRegistry(config_path=path)
+            self.assertEqual(after.resolve_tag("BOARD_X"), "TAG_B")
+            # 已构造的实例保持自身快照，不被缓存刷新影响
+            self.assertEqual(before.resolve_tag("BOARD_X"), "TAG_A")
+        finally:
+            os.unlink(path)
+
+    def test_distinct_configs_do_not_share_cache_entry(self) -> None:
+        """不同内容的配置各自解析，互不串味。"""
+        path_a = _write_temp_yaml(self._YAML_TAG_A)
+        path_b = _write_temp_yaml(self._YAML_TAG_B)
+        try:
+            self.assertEqual(
+                ThemeMappingRegistry(config_path=path_a).resolve_tag("BOARD_X"),
+                "TAG_A",
+            )
+            self.assertEqual(
+                ThemeMappingRegistry(config_path=path_b).resolve_tag("BOARD_X"),
+                "TAG_B",
+            )
+        finally:
+            os.unlink(path_a)
+            os.unlink(path_b)
+
+    def test_missing_file_still_degrades_to_empty_registry(self) -> None:
+        """缓存不改变文件缺失时的降级行为。"""
+        reg = ThemeMappingRegistry(config_path="/nonexistent/cached/path.yaml")
+        self.assertTrue(reg.is_empty)
 
 
 class TestThemeMappingRegistryDefaultPath(unittest.TestCase):
