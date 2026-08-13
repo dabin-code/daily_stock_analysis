@@ -480,7 +480,13 @@ def run_validation_cli(
                 f"base_snapshot_builds={stats['base_snapshot_builds']} "
                 f"frozen_evidence_builds={stats['frozen_evidence_builds']} "
                 f"parameter_evaluations={stats['parameter_evaluations']} "
-                f"sql_bar_queries={stats['sql_bar_queries']}",
+                f"sql_bar_queries={stats['sql_bar_queries']} "
+                f"partition_loads={stats['frozen_partition_loads']} "
+                "partition_load_seconds="
+                f"{stats['frozen_partition_load_seconds']:.3f} "
+                f"partition_dumps={stats['frozen_partition_dumps']} "
+                "partition_dump_seconds="
+                f"{stats['frozen_partition_dump_seconds']:.3f}",
                 file=sys.stderr,
                 flush=True,
             )

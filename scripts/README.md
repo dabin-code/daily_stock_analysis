@@ -750,7 +750,12 @@ python scripts/validate_bottom_divergence_v2.py --date-from 2026-06-01 --date-to
 python scripts/validate_bottom_divergence_v2.py --date-from 2026-06-01 --date-to 2026-07-15 --market cn --universe-codes data/universe_smoke.txt --cache-dir .cache/bottom-divergence-v2-factors --output .claude/reviews/v2-validation.json
 ```
 
-命中情况会在 stderr 打印 `validation-factor-cache base_snapshot_builds=... frozen_evidence_builds=... parameter_evaluations=...`，三项全为 0 表示这一趟完全复用了缓存。
+命中情况会在 stderr 打印一行 `validation-factor-cache`，含两组数：
+
+- `base_snapshot_builds` / `frozen_evidence_builds` / `parameter_evaluations`——**算了多少**，三项全为 0 表示这一趟完全复用了缓存。
+- `partition_loads` / `partition_load_seconds` / `partition_dumps` / `partition_dump_seconds`——**换页花了多少**。三层计数全为 0 却依然很慢时，看这四个数。纯复用的一趟 `partition_dumps` 应当是 0：没算出新东西就不该把分区原样写回。
+
+缓存目录里有两类文件：`base-<日期>-...` 是 base 因子快照；`frozen-<日期>-<身份>.pkl.gz` 是该日共享的冻结证据，`frozen-<日期>-<身份>-eval-<参数哈希>.pkl.gz` 是各条 leg 私有的已评估因子。后者按参数哈希分片，所以文件数约等于 `日期数 × (1 + 网格 leg 数)`，单个文件相应变小；15 只 × 32 天的冒烟跑约 500 个文件、43 MB。
 
 ⚠️ 缓存键覆盖 `data_version`、universe 指纹、base 配置白名单与算法版本，任一不同都会重算而不是返回旧结果。**但改了 base 因子的计算代码却没有 bump `BASE_SNAPSHOT_ALGORITHM_VERSION`（在 `src/backtest/services/bottom_divergence_v2_performance.py`），持久化目录就会返回旧算法算出的因子**。拿不准时直接删掉整个缓存目录。
 

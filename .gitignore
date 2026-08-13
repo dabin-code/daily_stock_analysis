@@ -63,6 +63,9 @@ Thumbs.db
 .coverage
 htmlcov/
 
+# 重放因子缓存（`--cache-dir` 的推荐落点，纯派生产物，可随时删）
+.cache/
+
 local/
 
 run.sh

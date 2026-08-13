@@ -1367,6 +1367,138 @@ def test_frozen_partition_files_do_not_leak_across_data_versions(tmp_path):
     ), "两个 data_version 共用了同一个分区文件名"
 
 
+def _switch_and_evaluate(cache, *, universe, trade_date, configs):
+    for config in configs:
+        cache.build_factor_snapshot(
+            config=config,
+            universe=universe,
+            trade_date=trade_date,
+        )
+
+
+def test_each_leg_only_pages_in_its_own_evaluated_shard(tmp_path):
+    """已评估因子按参数哈希分片，一条 leg 不得把别人的那份搬进内存。
+
+    这是本次提速的承重结构。实测一个日期分区解包后 9.84 MB，其中 `evaluated`
+    占 9.54 MB（96.9%），而网格是 3×2×3=18 条 leg，每条只读写其中 1/18。
+    合住一个文件时每次换页都在搬另外 17/18 的死重——15 只 × 32 天的重放里
+    这一项占了整趟 84%。
+
+    断言分两半，缺一不可：
+    - 落盘要分开（否则换页量没降）；
+    - 内存里只能有当前 leg 的键（否则分了文件却仍整份载入，等于没分）。
+    """
+    groups = {"000001": _bars("000001")}
+    trade_date = groups["000001"].iloc[-2]["date"]
+    universe = _one_stock_universe(name="A")
+    first = Config(
+        bottom_divergence_v2_enabled=True,
+        bottom_divergence_v2_zone_score_min=0.4,
+    )
+    second = replace(first, bottom_divergence_v2_zone_score_min=0.5)
+
+    cache = ValidationFactorCache.from_groups(
+        data_version="data-a",
+        trade_dates=(trade_date,),
+        bar_groups=groups,
+        cache_directory=tmp_path,
+    )
+    _switch_and_evaluate(
+        cache,
+        universe=universe,
+        trade_date=trade_date,
+        configs=(first, second),
+    )
+    resident_hash = cache._active_evaluated_hash
+    assert resident_hash == cache._parameter_hash(second)
+    assert cache._evaluated, "第二条 leg 什么都没评估，断言是空对空"
+    assert {key.parameter_hash for key in cache._evaluated} == {
+        resident_hash
+    }, "换 leg 之后内存里仍留着上一条 leg 的已评估因子，分片没有生效"
+    cache.close()
+
+    shards = sorted(
+        path.name for path in tmp_path.glob("frozen-*-eval-*.pkl.gz")
+    )
+    assert len(shards) == 2, (
+        f"两条 leg 没有各自落一个分片文件：{shards}"
+    )
+    for config in (first, second):
+        assert cache._evaluated_path(
+            trade_date, cache._parameter_hash(config)
+        ).exists()
+
+    # 共享分区只装冻结证据，不再夹带任何 leg 私有的已评估因子。
+    shared = cache._read_partition_file(cache._frozen_path(trade_date))
+    assert set(shared) == {"frozen", "lookup"}, (
+        f"共享分区里仍有 leg 私有数据：{sorted(shared)}"
+    )
+
+    # 分片之后 `evaluation_cache_keys` 仍要给出跨 leg 的完整并集。
+    reader = ValidationFactorCache.from_groups(
+        data_version="data-a",
+        trade_dates=(trade_date,),
+        bar_groups=groups,
+        cache_directory=tmp_path,
+    )
+    assert {
+        key.parameter_hash for key in reader.evaluation_cache_keys
+    } == {
+        cache._parameter_hash(first),
+        cache._parameter_hash(second),
+    }, "分片之后 evaluation_cache_keys 漏了某条 leg 的键"
+    assert reader.frozen_cache_keys, (
+        "分片文件把共享分区的冻结证据键挤掉了"
+    )
+
+
+def test_an_unchanged_partition_is_not_written_back(tmp_path):
+    """没算出新东西的一趟不得写回任何分区。
+
+    热运行的三层计数全为 0，也就是每一次写回都在把刚读进来的字节原样写出去。
+    实测这一项占整趟 62%（128.6s / 206.8s），而它买不到任何东西。
+    """
+    groups = {"000001": _bars("000001")}
+    trade_date = groups["000001"].iloc[-2]["date"]
+    universe = _one_stock_universe(name="A")
+    config = Config(bottom_divergence_v2_enabled=True)
+    arguments = {
+        "data_version": "data-a",
+        "trade_dates": (trade_date,),
+        "bar_groups": groups,
+        "cache_directory": tmp_path,
+    }
+
+    producer = ValidationFactorCache.from_groups(**arguments)
+    producer.build_factor_snapshot(
+        config=config,
+        universe=universe,
+        trade_date=trade_date,
+    )
+    producer.close()
+    assert producer.stats["frozen_partition_dumps"] > 0, (
+        "第一趟没写出任何分区，第二趟的归零断言就是空对空"
+    )
+
+    consumer = ValidationFactorCache.from_groups(**arguments)
+    consumer.build_factor_snapshot(
+        config=config,
+        universe=universe,
+        trade_date=trade_date,
+    )
+    consumer.close()
+
+    assert consumer.stats["parameter_evaluations"] == 0, (
+        "第二趟重算了因子，这条用例测的不是纯复用路径"
+    )
+    assert consumer.stats["frozen_partition_dumps"] == 0, (
+        "纯复用的一趟仍在把读进来的分区原样写回"
+    )
+    assert consumer.stats["frozen_partition_loads"] > 0, (
+        "第二趟连读都没读，说明它根本没走到分区换页"
+    )
+
+
 def test_a_failed_cache_write_leaves_the_previous_file_intact(tmp_path):
     """写到一半失败不得毁掉已经落盘的那一份。
 

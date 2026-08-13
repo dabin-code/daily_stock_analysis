@@ -50,8 +50,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   then `os.replace`d. A persistent directory can be shared by concurrent or
   restarted processes, so a run killed mid-write would otherwise leave a truncated
   gzip file that makes the *next* run die in `pickle.load` instead of recomputing.
+- The `validation-factor-cache` stderr line now also reports
+  `partition_loads` / `partition_load_seconds` / `partition_dumps` /
+  `partition_dump_seconds`. The three-layer counters only say whether factors were
+  recomputed; they cannot say where the time went, and a fully-reusing run measured
+  at 206.8s with all three counters at zero. The difference was entirely in these
+  four numbers.
 
 ### Changed
+
+- **Evaluated factors are now sharded per `parameter_hash` instead of sharing one
+  file per trade date, and an unmodified partition is no longer written back.**
+  Replay iterates leg-outer (each of the 3×2×3 grid legs walks every date), so a
+  date partition is paged in and out once per leg. Measured on one real partition:
+  9.84 MB unpickled, of which `evaluated` is 9.54 MB (96.9%) and `frozen` +
+  `lookup` only 0.30 MB — and each leg reads and writes exactly 1/18 of
+  `evaluated`, so 17/18 of every page-in was dead weight. Sharding by
+  `parameter_hash` cuts the transferred volume accordingly; skipping the write-back
+  of a clean partition removes it entirely on a reusing run. On the 15-stock /
+  32-trading-day smoke replay with `--workers 4`, partition I/O falls from 96.06s
+  to 5.49s cold and from 173.44s to 2.56s hot, taking the run from 216.6s to 121.2s
+  cold and 206.8s to 30.6s hot. The canonical report is byte-identical (same
+  SHA-256) before and after, cold and hot. The cache directory grows 1.4%
+  (42.5 MB to 43.1 MB) and holds more, smaller files.
+  A per-date in-memory LRU was measured and rejected: one resident partition costs
+  48.5 MB of RSS, 27x its 1.76 MB compressed size, so holding 32 dates would need
+  1.55 GB and the full 2089-day window 101 GB. Sharding keeps the footprint O(1) in
+  both the date count and the universe size.
+- Partition files are written at gzip level 6 instead of the `gzip.open` default of
+  9. Compression was 83% of dump cost (0.223s of 0.268s on a real partition);
+  level 6 halves it (0.120s) for 0.7% more bytes (1.757 MB to 1.769 MB).
+  Decompression is level-independent (0.018–0.020s across levels), so reads do not
+  pay for it. Level 1 is faster still (0.057s) but costs 17.6% more bytes, which is
+  not worth it now that dump is no longer the bottleneck.
+- `FROZEN_PARTITION_LAYOUT_VERSION` joins the frozen partition identity, so a cache
+  directory written by the previous layout is ignored rather than partially
+  reinterpreted. The cost is one recompute per stale directory.
 
 - Promoted `stock_daily_staging` into production `stock_daily`, taking the table
   from 2,974,189 rows starting 2024-04-18 to **9,622,396 rows spanning

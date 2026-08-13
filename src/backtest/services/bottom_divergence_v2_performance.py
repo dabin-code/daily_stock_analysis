@@ -43,6 +43,19 @@ FROZEN_EVIDENCE_ALGORITHM_VERSION = (
     f"{CAUSAL_ALGORITHM_VERSION}+{ZONE_ALGORITHM_VERSION}"
 )
 
+# 冻结分区的磁盘布局版本，进分区身份段。改布局必须 bump，否则新代码会拿旧
+# 布局的文件当新布局读——`evaluated` 从共享分区搬进按参数哈希分片的文件后，
+# 旧文件里那一份会被当成「没算过」而重算，或更糟：被当成分片读出错的键。
+# bump 的代价只是让旧缓存目录整体失效、重算一次。
+FROZEN_PARTITION_LAYOUT_VERSION = "sharded-evaluated-v1"
+
+# 分区文件的 gzip 级别。`gzip.open` 默认 9，实测在真实分区上压缩占 dump 总耗时
+# 的 83%（0.223s / 0.268s）；降到 6 只让文件大 0.7%（1.757 -> 1.769 MB）却把
+# 压缩耗时腰斩（0.223 -> 0.120s）。级别 1 更快（0.057s）但文件大 17.6%
+# （2.066 MB），在分片之后 dump 已经不是瓶颈，不值得为它多占磁盘。
+# 解压耗时与级别无关（三档实测均为 0.018-0.020s），所以降级别不拖慢读回。
+PARTITION_COMPRESS_LEVEL = 6
+
 # base 快照的算法版本，**手工维护**，必须保持文件名安全（只用字母、数字、`-`）。
 #
 # base 快照的取值由四样东西决定：配置、universe、bar 数据、以及计算它的代码。
@@ -300,12 +313,24 @@ class ValidationFactorCache:
         self._frozen_lookup: dict[tuple[Any, ...], Any] = {}
         self._evaluated: dict[FrozenEvidenceCacheKey, dict[str, Any]] = {}
         self._active_frozen_date: Optional[date] = None
+        self._active_evaluated_hash: Optional[str] = None
+        # 没改过的分区不必写回。热运行里三层计数全为 0，也就是每一次写回都在
+        # 把刚读进来的字节原样写出去；实测这一项占整趟 62%。
+        self._frozen_dirty = False
+        self._evaluated_dirty = False
         self.stats = {
             "sql_bar_queries": sql_bar_queries,
             "base_snapshot_builds": 0,
             "frozen_evidence_builds": 0,
             "parameter_evaluations": 0,
             "parameter_evaluations_by_hash": {},
+            # 分区换页的可观测量。三层计数只能说明「因子有没有重算」，
+            # 说明不了「时间花在哪」——实测热运行三层全零却仍耗时 250s，
+            # 差额全在这四个数上。
+            "frozen_partition_loads": 0,
+            "frozen_partition_load_seconds": 0.0,
+            "frozen_partition_dumps": 0,
+            "frozen_partition_dump_seconds": 0.0,
         }
         self.progress_every = progress_every
         self.progress_callback = progress_callback
@@ -430,6 +455,7 @@ class ValidationFactorCache:
             # 目录已经没了，活动分区也就无处可落。不清掉它，第二次 close()
             # 会走到下面的落盘分支，对着已删除的目录抛 FileNotFoundError。
             self._active_frozen_date = None
+            self._active_evaluated_hash = None
             return
         # `_switch_frozen_partition` 只在切日期时写回上一个分区，最后一个
         # 分区不在这里落盘就等于白算，下次运行会从头冻结这一天的证据。
@@ -519,6 +545,7 @@ class ValidationFactorCache:
             canonical_json_dumps({
                 "algorithm_version": FROZEN_EVIDENCE_ALGORITHM_VERSION,
                 "data_version": str(self.data_version),
+                "layout_version": FROZEN_PARTITION_LAYOUT_VERSION,
             }).encode("utf-8")
         ).hexdigest()[:16]
 
@@ -526,6 +553,29 @@ class ValidationFactorCache:
         return self._cache_directory / (
             f"frozen-{trade_date.isoformat()}"
             f"-{self._frozen_partition_identity()}.pkl.gz"
+        )
+
+    def _evaluated_path(
+        self,
+        trade_date: date,
+        parameter_hash: str,
+    ) -> Path:
+        """已评估因子按 (日期, 参数哈希) 分片，而不是与冻结证据同住一个文件。
+
+        分片的理由是实测的读写量：一个日期分区解包后 9.84 MB，其中 `evaluated`
+        占 9.54 MB（96.9%），而 `frozen` + `lookup` 只有 0.30 MB。网格是
+        3×2×3=18 条 leg，`evaluated` 里 18 个参数哈希各占 91 条，**任何一条
+        leg 只读写属于自己的那 1/18**——其余 17/18 是被白读白写的。
+
+        合住时每次换页要搬 9.84 MB，分片后只搬 0.30 + 0.53 MB。这条路比给分区
+        加内存 LRU 更可取：LRU 要把整个日期分区常驻，实测单个分区常驻 48.5 MB
+        RSS（是压缩后 1.76 MB 的 27 倍），32 天就是 1.55 GB，而分片把内存占用
+        保持在 O(1)，不随日期数或股池规模增长。
+        """
+        return self._cache_directory / (
+            f"frozen-{trade_date.isoformat()}"
+            f"-{self._frozen_partition_identity()}"
+            f"-eval-{parameter_hash}.pkl.gz"
         )
 
     def _write_atomically(
@@ -547,41 +597,100 @@ class ValidationFactorCache:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def _flush_active_frozen_partition(self) -> None:
-        if self._active_frozen_date is None or not (
-            self._frozen_lookup or self._evaluated
-        ):
-            return
-        payload = {
-            "frozen": self._frozen,
-            "lookup": self._frozen_lookup,
-            "evaluated": self._evaluated,
-        }
+    @staticmethod
+    def _read_partition_file(path: Path) -> Any:
+        with gzip.open(path, "rb") as handle:
+            return pickle.load(handle)
 
+    def _dump_partition(self, path: Path, payload: Any) -> None:
         def write(target: Path) -> None:
-            with gzip.open(target, "wb") as handle:
+            with gzip.open(
+                target,
+                "wb",
+                compresslevel=PARTITION_COMPRESS_LEVEL,
+            ) as handle:
                 pickle.dump(payload, handle, protocol=5)
 
-        self._write_atomically(
-            self._frozen_path(self._active_frozen_date),
-            write,
+        started = time.perf_counter()
+        self._write_atomically(path, write)
+        self.stats["frozen_partition_dumps"] += 1
+        self.stats["frozen_partition_dump_seconds"] += (
+            time.perf_counter() - started
         )
 
-    def _switch_frozen_partition(self, trade_date: date) -> None:
-        if self._active_frozen_date == trade_date:
+    def _load_partition(self, path: Path) -> Optional[Any]:
+        if not path.exists():
+            return None
+        started = time.perf_counter()
+        payload = self._read_partition_file(path)
+        self.stats["frozen_partition_loads"] += 1
+        self.stats["frozen_partition_load_seconds"] += (
+            time.perf_counter() - started
+        )
+        return payload
+
+    def _flush_active_evaluated_shard(self) -> None:
+        if (
+            self._active_frozen_date is None
+            or self._active_evaluated_hash is None
+            or not self._evaluated_dirty
+        ):
             return
-        self._flush_active_frozen_partition()
-        self._frozen = {}
-        self._frozen_lookup = {}
-        self._evaluated = {}
-        target = self._frozen_path(trade_date)
-        if target.exists():
-            with gzip.open(target, "rb") as handle:
-                payload = pickle.load(handle)
-            self._frozen = payload["frozen"]
-            self._frozen_lookup = payload["lookup"]
-            self._evaluated = payload["evaluated"]
-        self._active_frozen_date = trade_date
+        self._dump_partition(
+            self._evaluated_path(
+                self._active_frozen_date,
+                self._active_evaluated_hash,
+            ),
+            self._evaluated,
+        )
+        self._evaluated_dirty = False
+
+    def _flush_active_frozen_partition(self) -> None:
+        # 分片必须先落盘：它的路径要用 `_active_frozen_date`，而调用方随后
+        # 就会把这个字段改成新日期。
+        self._flush_active_evaluated_shard()
+        if self._active_frozen_date is None or not self._frozen_dirty:
+            return
+        self._dump_partition(
+            self._frozen_path(self._active_frozen_date),
+            {"frozen": self._frozen, "lookup": self._frozen_lookup},
+        )
+        self._frozen_dirty = False
+
+    def _switch_frozen_partition(
+        self,
+        trade_date: date,
+        parameter_hash: str,
+    ) -> None:
+        """把 (日期, 参数哈希) 这一格换进内存，两个轴各自独立换页。
+
+        日期换了，冻结证据与已评估分片都得换；只有参数哈希换了（同一天连着
+        跑两条 leg，实际不会发生，但语义上必须成立），只换分片。
+        """
+        if self._active_frozen_date != trade_date:
+            self._flush_active_frozen_partition()
+            self._frozen = {}
+            self._frozen_lookup = {}
+            self._frozen_dirty = False
+            payload = self._load_partition(self._frozen_path(trade_date))
+            if payload is not None:
+                self._frozen = payload["frozen"]
+                self._frozen_lookup = payload["lookup"]
+            self._active_frozen_date = trade_date
+            self._evaluated = {}
+            self._evaluated_dirty = False
+            self._active_evaluated_hash = None
+        if self._active_evaluated_hash == parameter_hash:
+            return
+        self._flush_active_evaluated_shard()
+        self._evaluated = (
+            self._load_partition(
+                self._evaluated_path(trade_date, parameter_hash)
+            )
+            or {}
+        )
+        self._evaluated_dirty = False
+        self._active_evaluated_hash = parameter_hash
 
     @staticmethod
     def _candidate_versions(frozen: Any) -> tuple[str, ...]:
@@ -610,33 +719,50 @@ class ValidationFactorCache:
             config_hash,
         )
 
-    def _partition_cache_keys(
-        self,
-        field_name: str,
-    ) -> tuple[FrozenEvidenceCacheKey, ...]:
-        keys = set(getattr(self, field_name))
+    @property
+    def frozen_cache_keys(self) -> tuple[FrozenEvidenceCacheKey, ...]:
         # 只看属于本次运行的分区文件：持久化目录里同时躺着别的 `data_version`
         # 与别的算法版本的分区，把它们的键混进来就是在返回错答案。
+        keys = set(self._frozen)
         suffix = f"-{self._frozen_partition_identity()}.pkl.gz"
+        active = (
+            self._active_frozen_date.isoformat()
+            if self._active_frozen_date is not None
+            else None
+        )
         for path in sorted(self._cache_directory.glob(f"frozen-*{suffix}")):
             date_text = path.name[len("frozen-"):-len(suffix)]
-            if (
-                self._active_frozen_date is not None
-                and date_text == self._active_frozen_date.isoformat()
-            ):
+            try:
+                date.fromisoformat(date_text)
+            except ValueError:
+                # 分片文件叫 `frozen-<日期>-<身份>-eval-<参数哈希>.pkl.gz`，
+                # 参数哈希恰好等于身份段时也会撞进上面的 glob。它没有
+                # `frozen` 这个键，读它会直接 KeyError。
                 continue
-            with gzip.open(path, "rb") as handle:
-                payload = pickle.load(handle)
-            keys.update(payload[field_name.lstrip("_")])
+            if date_text == active:
+                continue
+            keys.update(self._read_partition_file(path)["frozen"])
         return tuple(sorted(keys, key=repr))
 
     @property
-    def frozen_cache_keys(self) -> tuple[FrozenEvidenceCacheKey, ...]:
-        return self._partition_cache_keys("_frozen")
-
-    @property
     def evaluation_cache_keys(self) -> tuple[FrozenEvidenceCacheKey, ...]:
-        return self._partition_cache_keys("_evaluated")
+        keys = set(self._evaluated)
+        identity = self._frozen_partition_identity()
+        active = (
+            self._evaluated_path(
+                self._active_frozen_date,
+                self._active_evaluated_hash,
+            ).name
+            if self._active_frozen_date is not None
+            and self._active_evaluated_hash is not None
+            else None
+        )
+        pattern = f"frozen-*-{identity}-eval-*.pkl.gz"
+        for path in sorted(self._cache_directory.glob(pattern)):
+            if path.name == active:
+                continue
+            keys.update(self._read_partition_file(path))
+        return tuple(sorted(keys, key=repr))
 
     @staticmethod
     def _config_hash(config: Any) -> str:
@@ -796,7 +922,7 @@ class ValidationFactorCache:
             return snapshot
 
         parameter_hash = self._parameter_hash(config)
-        self._switch_frozen_partition(trade_date)
+        self._switch_frozen_partition(trade_date, parameter_hash)
         progress = ValidationProgress(
             len(snapshot),
             every=self.progress_every,
@@ -885,6 +1011,7 @@ class ValidationFactorCache:
                 self._frozen_lookup[temporary_key] = frozen
                 for frozen_key in frozen_keys:
                     self._frozen[frozen_key] = frozen
+                self._frozen_dirty = True
                 self.stats["frozen_evidence_builds"] += 1
             if was_computed:
                 for frozen_key in frozen_keys:
@@ -893,6 +1020,7 @@ class ValidationFactorCache:
                         parameter_hash=parameter_hash,
                     )
                     self._evaluated[evaluation_key] = factors
+                self._evaluated_dirty = True
                 self.stats["parameter_evaluations"] += 1
                 by_hash = self.stats["parameter_evaluations_by_hash"]
                 by_hash[parameter_hash] = by_hash.get(parameter_hash, 0) + 1
