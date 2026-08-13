@@ -12,6 +12,8 @@ import unittest
 import numpy as np
 import pandas as pd
 
+from src.config import Config
+
 
 def _make_group_df(n: int = 120) -> pd.DataFrame:
     np.random.seed(42)
@@ -59,6 +61,7 @@ class TestExtendedFactorsIncludeMACD(unittest.TestCase):
     def test_macd_keys_in_extended(self):
         from src.services.factor_service import FactorService
         svc = FactorService.__new__(FactorService)
+        svc.config = Config()
         group = _make_group_df()
         latest = group.iloc[-1]
         close_series = group["close"]

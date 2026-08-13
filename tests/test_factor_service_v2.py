@@ -10,6 +10,7 @@ from datetime import date, timedelta
 import pandas as pd
 import pytest
 
+from src.config import Config
 from src.services.factor_service import FactorService
 
 
@@ -42,6 +43,7 @@ class TestFactorServiceExtendedFactors:
         fs.lookback_days = 80
         fs.min_list_days = 120
         fs.breakout_lookback_days = 20
+        fs.config = Config()
 
         snapshot = self._build_snapshot_from_bars(fs, "600001", days=30)
         if snapshot.empty:
@@ -55,6 +57,7 @@ class TestFactorServiceExtendedFactors:
         fs.lookback_days = 80
         fs.min_list_days = 120
         fs.breakout_lookback_days = 20
+        fs.config = Config()
 
         snapshot = self._build_snapshot_from_bars(fs, "600001", days=30)
         if snapshot.empty:
@@ -68,6 +71,7 @@ class TestFactorServiceExtendedFactors:
         fs.lookback_days = 80
         fs.min_list_days = 120
         fs.breakout_lookback_days = 20
+        fs.config = Config()
 
         snapshot = self._build_snapshot_from_bars(fs, "600001", days=30)
         if snapshot.empty:
@@ -81,6 +85,7 @@ class TestFactorServiceExtendedFactors:
         fs.lookback_days = 80
         fs.min_list_days = 120
         fs.breakout_lookback_days = 20
+        fs.config = Config()
 
         snapshot = self._build_snapshot_from_bars(fs, "600001", days=30)
         if snapshot.empty:
@@ -94,6 +99,7 @@ class TestFactorServiceExtendedFactors:
         fs.lookback_days = 80
         fs.min_list_days = 120
         fs.breakout_lookback_days = 20
+        fs.config = Config()
 
         snapshot = self._build_snapshot_from_bars(fs, "600001", days=30)
         if snapshot.empty:

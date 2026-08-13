@@ -12,6 +12,8 @@ import unittest
 import numpy as np
 import pandas as pd
 
+from src.config import Config
+
 
 def _make_group_df(n: int = 120) -> pd.DataFrame:
     np.random.seed(42)
@@ -54,7 +56,7 @@ class TestComputePattern123Factors(unittest.TestCase):
     def test_returns_expected_keys(self):
         from src.services.factor_service import FactorService
         group = _make_group_df()
-        result, _raw = FactorService._compute_pattern_123_factors(group)
+        result, _raw = FactorService._compute_pattern_123_factors(group, Config())
         self.assertIn("pattern_123_bottom", result)
         self.assertIn("pattern_123_breakout", result)
         self.assertIn("pattern_123_higher_low_pct", result)
@@ -65,7 +67,7 @@ class TestComputePattern123Factors(unittest.TestCase):
     def test_values_are_correct_types(self):
         from src.services.factor_service import FactorService
         group = _make_group_df()
-        result, _raw = FactorService._compute_pattern_123_factors(group)
+        result, _raw = FactorService._compute_pattern_123_factors(group, Config())
         self.assertIsInstance(result["pattern_123_bottom"], bool)
         self.assertIsInstance(result["pattern_123_breakout"], bool)
         self.assertIsInstance(result["pattern_123_higher_low_pct"], float)
@@ -77,6 +79,7 @@ class TestExtendedFactorsIncludePhase3(unittest.TestCase):
     def test_keys_in_extended(self):
         from src.services.factor_service import FactorService
         svc = FactorService.__new__(FactorService)
+        svc.config = Config()
         group = _make_group_df()
         latest = group.iloc[-1]
         close_series = group["close"]

@@ -507,10 +507,14 @@ class FactorService:
         trendline_factors = self._compute_trendline_factors(group)
 
         # 123 pattern factors
-        pattern_123_factors, pattern_123_raw = self._compute_pattern_123_factors(group)
+        pattern_123_factors, pattern_123_raw = self._compute_pattern_123_factors(
+            group, self.config
+        )
 
         # Bottom divergence double breakout factors
-        bottom_div_factors = self._compute_bottom_divergence_factors(group)
+        bottom_div_factors = self._compute_bottom_divergence_factors(
+            group, self.config
+        )
         bottom_div_v2_factors = self._compute_bottom_divergence_v2_factors(group)
 
         # Trend pullback freshness / support confirmation
@@ -740,7 +744,9 @@ class FactorService:
         }
 
     @staticmethod
-    def _compute_pattern_123_factors(group: pd.DataFrame) -> tuple[dict, dict]:
+    def _compute_pattern_123_factors(
+        group: pd.DataFrame, config: Config
+    ) -> tuple[dict, dict]:
         """Compute 123 bottom pattern factors for screening strategy B.
 
         Returns:
@@ -780,14 +786,15 @@ class FactorService:
             if p1 > 0:
                 higher_low_pct = round((p3 - p1) / p1 * 100.0, 4)
 
-        # Joint detector — thresholds are configurable via env/config so they
-        # can be tuned without code changes / image rebuilds.
-        _cfg = get_config()
+        # Joint detector — thresholds are configurable so they can be tuned
+        # without code changes / image rebuilds. 阈值必须取自传入的 config：
+        # base 因子缓存键哈希的正是这个对象，回落到全局单例会让缓存键
+        # 不再代表因子实际的计算参数。
         joint = Low123TrendlineDetector.detect(
             group,
-            max_p1_p2_bars=_cfg.low123_max_p1_p2_bars,
-            max_breakout_gap=_cfg.low123_max_breakout_gap,
-            break_tolerance=_cfg.low123_break_tolerance,
+            max_p1_p2_bars=config.low123_max_p1_p2_bars,
+            max_breakout_gap=config.low123_max_breakout_gap,
+            break_tolerance=config.low123_break_tolerance,
         )
         state = joint.get("state", "rejected")
         is_breakout_ready = state == "breakout_ready"
@@ -830,7 +837,9 @@ class FactorService:
         return factors, joint
 
     @staticmethod
-    def _compute_bottom_divergence_factors(group: pd.DataFrame) -> dict:
+    def _compute_bottom_divergence_factors(
+        group: pd.DataFrame, config: Config
+    ) -> dict:
         """Compute bottom divergence double breakout factors."""
         if len(group) < 60:
             return {
@@ -858,11 +867,12 @@ class FactorService:
                 "bottom_divergence_validation_status": "insufficient_data",
             }
 
-        _cfg = get_config()
+        # 阈值必须取自传入的 config：base 因子缓存键哈希的正是这个对象，
+        # 回落到全局单例会让缓存键不再代表因子实际的计算参数。
         result = BottomDivergenceBreakoutDetector.detect(
             group,
-            max_breakout_gap=_cfg.bottom_divergence_max_breakout_gap,
-            break_tolerance=_cfg.bottom_divergence_break_tolerance,
+            max_breakout_gap=config.bottom_divergence_max_breakout_gap,
+            break_tolerance=config.bottom_divergence_break_tolerance,
         )
         state = result.get("state", "rejected")
         confirmation_days = FactorService._compute_bottom_divergence_confirmation_days(group, result)

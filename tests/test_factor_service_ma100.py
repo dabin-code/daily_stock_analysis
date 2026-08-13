@@ -10,6 +10,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
+from src.config import Config
 from src.services.factor_service import FactorService
 
 
@@ -82,6 +83,7 @@ class TestExtendedFactorsIntegration(unittest.TestCase):
 
     def test_extended_factors_include_ma100(self):
         fs = FactorService.__new__(FactorService)
+        fs.config = Config()
         group = _make_group(n=120)
         latest = group.iloc[-1]
         close_series = group["close"].astype(float)
@@ -96,6 +98,7 @@ class TestExtendedFactorsIntegration(unittest.TestCase):
 
     def test_extended_factors_include_ma100_60min(self):
         fs = FactorService.__new__(FactorService)
+        fs.config = Config()
         group = _make_group(n=120)
         latest = group.iloc[-1]
         close_series = group["close"].astype(float)

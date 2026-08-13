@@ -850,7 +850,7 @@ class TestFactorServiceBottomDivergence(unittest.TestCase):
             "hit_reasons": ["底背离成立", "双突破同步确认"],
         }
 
-        result = FactorService._compute_bottom_divergence_factors(df)
+        result = FactorService._compute_bottom_divergence_factors(df, Config())
 
         self.assertTrue(result["bottom_divergence_double_breakout"])
         self.assertEqual(result["bottom_divergence_state"], "confirmed")
@@ -922,7 +922,7 @@ class TestFactorServiceBottomDivergence(unittest.TestCase):
             "hit_reasons": ["底背离成立", "双突破同步确认"],
         }
 
-        result = FactorService._compute_bottom_divergence_factors(df)
+        result = FactorService._compute_bottom_divergence_factors(df, Config())
 
         self.assertTrue(result["bottom_divergence_double_breakout"])
         self.assertFalse(result["bottom_divergence_actionable_entry"])
@@ -951,7 +951,7 @@ class TestFactorServiceBottomDivergence(unittest.TestCase):
             "hit_reasons": ["底背离成立", "双突破同步确认"],
         }
 
-        result = FactorService._compute_bottom_divergence_factors(df)
+        result = FactorService._compute_bottom_divergence_factors(df, Config())
 
         self.assertTrue(result["bottom_divergence_double_breakout"])
         self.assertFalse(result["bottom_divergence_actionable_entry"])
@@ -976,7 +976,7 @@ class TestFactorServiceBottomDivergence(unittest.TestCase):
             "hit_reasons": ["强势回撤", "双突破同步确认"],
         }
 
-        result = FactorService._compute_bottom_divergence_factors(df)
+        result = FactorService._compute_bottom_divergence_factors(df, Config())
 
         self.assertTrue(result["bottom_divergence_double_breakout"])
         self.assertFalse(result["bottom_divergence_actionable_entry"])
