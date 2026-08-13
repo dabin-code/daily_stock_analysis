@@ -35,6 +35,7 @@ from src.backtest.evaluators.base_evaluator import EvaluationResult
 from src.config import Config
 from src.backtest.services.bottom_divergence_v2_validation import (
     BottomDivergenceV2Validator,
+    ValidationInputError,
     ValidationSample,
     assign_tertile,
     build_parameter_snapshots,
@@ -1532,6 +1533,85 @@ def test_cli_returns_one_for_ineligible_zero_cost_report(tmp_path) -> None:
 
     assert exit_code == 1
     assert report["reasons"] == ["zero_cost_model"]
+
+
+@pytest.mark.unit
+def test_cli_rejects_window_too_short_for_the_forward_label_purge(
+    tmp_path,
+) -> None:
+    """窗口不够长时要在重放之前判死，而不是算完再报。
+
+    2026-08-13 一次 400 只 × 82 交易日的实跑花了 104 分钟，最后停在
+    `invalid_opportunity_count:validation`：验证段按 floor(82×0.2)=16 天切出来，
+    而前瞻标签要清掉每段末尾 20 天，于是整段被清空。这个结论只依赖交易日历的
+    长度，在任何因子计算之前就已经确定，没有理由让它跑满两个小时才浮出来。
+
+    这里刻意取 100 天而不是事故现场的 82 天：100 天切出的验证段恰好是 20 天，
+    正好被清光。82 天在 `<= 20` 和 `< 20` 两种写法下都会被拦，钉不住临界点；
+    100 天只有 `<=` 拦得住，配合下面 105 天的反例才把边界夹死在 20/21 之间。
+    """
+    class ShortCalendar(_FakeReplayBoundary):
+        def __init__(self) -> None:
+            super().__init__()
+            self._dates = self._dates[:100]
+
+    service = ShortCalendar()
+    with pytest.raises(ValidationInputError) as caught:
+        run_validation_cli(
+            Namespace(
+                date_from=date(2022, 1, 1),
+                date_to=date(2022, 4, 11),
+                market="cn",
+                output=tmp_path / "short.json",
+                universe_codes=None,
+            ),
+            replay_service=service,
+            base_config=Config(
+                backtest_buy_cost_bps=1.0,
+                backtest_sell_cost_bps=1.0,
+                backtest_slippage_bps=1.0,
+            ),
+        )
+
+    assert caught.value.error_code == "WINDOW_TOO_SHORT"
+    assert "validation" in caught.value.message
+    assert "105" in caught.value.message, "要告诉调用方至少需要多少个交易日"
+    assert service.calls == [], "判死必须发生在任何重放之前"
+
+
+@pytest.mark.unit
+def test_cli_accepts_the_shortest_window_that_survives_the_purge(
+    tmp_path,
+) -> None:
+    """反例：门槛不能顺手把刚好够用的窗口也拦掉。
+
+    105 个交易日切出 floor(105×0.2)=21 天验证段，清掉 20 天后还剩 1 天，
+    是能跑的最短窗口。这条钉住边界取在 `>` 而不是 `>=`。
+    """
+    class BoundaryCalendar(_FakeReplayBoundary):
+        def __init__(self) -> None:
+            super().__init__()
+            self._dates = self._dates[:105]
+
+    service = BoundaryCalendar()
+    _, report = run_validation_cli(
+        Namespace(
+            date_from=date(2022, 1, 1),
+            date_to=date(2022, 4, 16),
+            market="cn",
+            output=tmp_path / "boundary.json",
+            universe_codes=None,
+        ),
+        replay_service=service,
+        base_config=Config(
+            backtest_buy_cost_bps=1.0,
+            backtest_sell_cost_bps=1.0,
+            backtest_slippage_bps=1.0,
+        ),
+    )
+
+    assert report.get("error_code") != "WINDOW_TOO_SHORT"
+    assert service.calls, "刚好够用的窗口应该真的跑起来"
 
 
 @pytest.mark.unit

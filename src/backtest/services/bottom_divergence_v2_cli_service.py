@@ -43,6 +43,8 @@ from src.backtest.services.bottom_divergence_v2_validation import (
     ValidationSample,
     build_parameter_snapshots,
     chronological_split,
+    minimum_trading_days,
+    purge_would_empty,
 )
 from src.config import Config, get_config
 
@@ -164,6 +166,18 @@ def _run_validation_cli_core(
             "NO_TRADING_DATES",
             str(exc),
         ) from exc
+    emptied = purge_would_empty(split)
+    if emptied is not None:
+        # 只依赖日历长度，所以能在任何因子计算之前判死。一次 400 只 ×
+        # 82 交易日的实跑跑满 104 分钟才停在 invalid_opportunity_count，
+        # 而这个结论在第一秒就已经确定。
+        raise ValidationInputError(
+            "WINDOW_TOO_SHORT",
+            f"{emptied} split has {len(getattr(split, f'{emptied}_dates'))} "
+            f"trading days, all of which the forward-label purge would remove; "
+            f"requested range yields {len(trade_dates)} trading days but at "
+            f"least {minimum_trading_days()} are required",
+        )
     v1_config = replace(config, bottom_divergence_v2_enabled=False)
     replay = (
         replay_service.replay

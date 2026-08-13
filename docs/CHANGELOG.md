@@ -11,6 +11,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`scripts/validate_bottom_divergence_v2.py` now rejects a window that the
+  forward-label purge would empty, before it computes anything.** Each selection
+  split has its last 20 trading days removed, because a sample needs 20 future
+  bars to be labelled. `chronological_split` gives the validation split
+  `floor(N * 0.2)` days, so any range under 105 trading days leaves that split
+  with nothing and the run ends in `invalid_opportunity_count:validation`. That
+  is knowable from the calendar alone, yet it used to surface only at the very
+  end: a 400-stock, 82-trading-day run spent 104 minutes before reporting it. The
+  new `WINDOW_TOO_SHORT` error names the offending split, its day count, and the
+  105-day minimum. The minimum is derived by walking the same
+  `math.floor(count * ratio)` the splitter uses rather than computing
+  `ceil(21 / 0.2)`, so it cannot disagree with the splitter over whether 105 is
+  enough — 0.2 is not representable in binary and the closed form lands on the
+  wrong side. `tests/test_bottom_divergence_v2_validation.py` brackets the
+  boundary from both sides: a 100-day range (validation exactly 20 days, purged
+  to zero) must be rejected, and a 105-day range (21 days, one survives) must
+  actually run.
 - `scripts/validate_bottom_divergence_v2.py` gained an optional `--cache-dir`,
   and `ValidationFactorCache.from_database` / `from_groups` now forward
   `cache_directory` to the constructor (they accepted none before, so the cache

@@ -2,6 +2,7 @@
 """Time-series parameter selection and non-inferiority orchestration."""
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 from datetime import date
 from typing import Any, Dict, Mapping, Optional, Sequence
@@ -25,6 +26,39 @@ from .bottom_divergence_v2_metrics import (
 
 
 _FORWARD_LABEL_DAYS = 20
+
+_SELECTION_SPLIT_RATIOS = (("train", 0.6), ("validation", 0.2))
+
+
+def minimum_trading_days() -> int:
+    """能让两个选参切分都熬过前瞻清洗的最短交易日数。
+
+    验证段是紧约束：它只占 20%，而清洗要从每段末尾砍掉
+    `_FORWARD_LABEL_DAYS` 天。用循环而不是 `ceil((F+1)/r)` 直接算，
+    是因为 0.2 在二进制里不精确，`21 / 0.2` 落在 105 的哪一侧不该由
+    浮点表示决定——这里的判据必须和 `chronological_split` 里那个
+    `math.floor(len(dates) * ratio)` 逐位一致。
+    """
+    needed = 1
+    for _, ratio in _SELECTION_SPLIT_RATIOS:
+        count = 1
+        while math.floor(count * ratio) <= _FORWARD_LABEL_DAYS:
+            count += 1
+        needed = max(needed, count)
+    return needed
+
+
+def purge_would_empty(split: Any) -> Optional[str]:
+    """返回第一个会被前瞻清洗清空的选参切分名，没有则返回 None。
+
+    只看日历长度，因子还没算就能定。放在这里而不是调用方，是为了让它
+    和 `_selection_dates_and_purge_report` 的清洗深度共用同一个常量，
+    改一处不会漏掉另一处。
+    """
+    for name, _ in _SELECTION_SPLIT_RATIOS:
+        if len(getattr(split, f"{name}_dates")) <= _FORWARD_LABEL_DAYS:
+            return name
+    return None
 
 
 def _selection_dates_and_purge_report(
