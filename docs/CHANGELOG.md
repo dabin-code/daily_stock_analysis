@@ -9,8 +9,186 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Promoted `stock_daily_staging` into production `stock_daily`, taking the table
+  from 2,974,189 rows starting 2024-04-18 to **9,622,396 rows spanning
+  2018-01-02 to 2026-08-12**, on a single `raw` price convention with
+  `pre_close` on every A-share row. This was not merely a backfill. The previous
+  production table stored **front-adjusted (qfq) prices while labelling them
+  unadjusted** — `adj_convention` was NULL on 99.8% of rows and
+  `adj_factor_source` read `legacy_assume_one` on 2.6M, i.e. it asserted a
+  factor of 1. The evidence is unambiguous: comparing the two tables over their
+  2.4-year overlap, disagreement decays monotonically from 14.0% of rows in
+  2024-04 to 0.00% from 2026-04 onward, and for a single stock (300956) the
+  staging/production ratio holds constant at 1.462 through 2024 and converges to
+  exactly 1.0 at the present. That is the signature of a qfq series anchored at
+  a bulk backfill around 2026-03/04. Concretely, the stored 2024-04-18 close for
+  300956 was 7.37 when the actual traded price was 10.78 — the historical price
+  had been restated by dividends that had not yet happened, which is a lookahead
+  leak in any backtest reading it. Promotion replaced those prices with the raw
+  ones and the two tables now agree on 0 mismatched rows.
+  `ma5` / `ma10` / `ma20` / `volume_ratio` / `adj_factor` / `adj_factor_source`
+  are now NULL, deliberately: the old moving averages were computed from the qfq
+  prices and would not match the raw prices replacing them, and
+  `src/services/factor_service.py` recomputes all four from the close series
+  rather than reading the stored columns.
+  Rollback: `data/backups/stock_analysis_20260813_095547.db` (5151 MB).
+
 ### Added
 
+- Reconstructed adjustment factors **at read time** from `pre_close`, unblocking
+  the bottom-divergence v2 backtest. The detector never used `adj_factor`
+  arithmetically — it only asserts the source is whitelisted and the value is
+  finite and positive — so the gate really means "the price series you were
+  handed is adjustment-consistent". After the promotion above, `adj_factor` and
+  `adj_factor_source` are NULL on all 9.6M rows, so every candidate came back
+  `adjustment_unknown` and the validation CLI stopped at `NO_ELIGIBLE_SAMPLES`.
+  Requiring the adjusted series to reproduce the real return
+  `adj_close(t)/adj_close(t-1) == close(t)/pre_close(t)` gives
+  `f(t) = f(t-1) * close(t-1) / pre_close(t)`, and the factor actually applied is
+  `g(t) = f(t)/f(D)`, normalised to the window's anchor day D. Normalising
+  matters twice over: `g(D) == 1` keeps the entry price equal to the price
+  actually tradable that day and on the same scale as the forward bars, and the
+  cumulative error before the window cancels in the ratio, which is also why
+  computing per window is equivalent to computing over full history. OHLC and
+  `pre_close` are multiplied by `g`, `volume` is **divided** by it (pre-split
+  bars are quoted in the old share count and must scale up to today's), and
+  `amount` is left alone because price × volume is conserved. Cross-checked
+  against Sina's front-adjusted series: 10 liquid large caps over ~2,089 sessions
+  each show a median deviation of 0.0095% and a worst case of 0.1145% across
+  20k+ comparisons, i.e. the reference source's own rounding noise. Six stocks
+  with storage gaps of 11–293 days around adjustment events show the same
+  deviations (four of them exactly 0.0000%), confirming that long gaps are
+  trading halts rather than fabricated events and that no calendar-continuity
+  gate is needed.
+- Applied the reconstruction on **all three read paths**, since covering fewer
+  means live and backtest silently disagree: `ValidationFactorCache._window`
+  (backtest factor windows — deliberately *not* `from_database`, which pulls a
+  whole range at once and would have to normalise by a date later than D,
+  leaking future dividends into D), `_build_validation_sample`'s forward/prior
+  bars in `bottom_divergence_v2_replay` (without this, one ex-dividend inside a
+  20-day forward window is booked as a loss, and the 1,145 bonus-issue events in
+  the table produce 33–66% phantom losses while the backtest keeps emitting
+  samples), and `FactorService.build_factor_snapshot` /
+  `build_factor_snapshot_from_groups` for production. The forward window anchors
+  on its **first** row rather than its last, because D sits outside it.
+- Added `pre_close_chain` to the three adjustment-trust whitelists —
+  `FactorService._bottom_divergence_v2_metadata`,
+  `causal_bottom_divergence_detector._candidate_metadata`, and
+  `bottom_divergence_layered_entry._has_trusted_adjustment`. The third governs
+  **live** execution, and omitting it would have meant "backtest permits, live
+  refuses" with nothing raising. `pre_close_chain_anomalous` is deliberately
+  excluded: it marks rows that were cut out of the chain and had **no**
+  adjustment applied, so whitelisting it would push raw, dividend-gapped prices
+  through the gate wearing a trusted label.
+  Measured on a 15-code smoke universe over 2025-01-02..2025-09-30 (183 trading
+  days, factor snapshots on 5 probe dates): before, the status distribution was
+  `adjustment_unknown` 53 / `no_primary_candidate` 22 and the replay produced
+  **0** samples; after, it is `major_not_confirmed` 34 / `no_primary_candidate`
+  24 / `confirmation_too_old` 14 / `structure_floor_broken` 3 — no
+  `adjustment_unknown` at all — and the replay produces **23 executable
+  samples**. Spot-checking one of them by hand (000333, signal 2025-05-21, ex-
+  dividend 2025-06-12 where `pre_close` 72.01 sits 3.48 below the prior close
+  75.49, i.e. the 10-for-34.8 cash dividend): the 20-day return is −5.11%
+  adjusted versus −9.48% raw, so 4.37pp of the raw figure was pure ex-dividend
+  gap. The distortion is not just a scale factor — the raw MAE would have been
+  −10.09% and would have landed on 2025-06-16, while the adjusted MAE is −6.00%
+  on 2025-06-09, a different bar entirely.
+- Added `ADJ_APPLY_ON_READ` (default `true`) as a real `Config` dataclass field
+  and registered it in `BASE_FACTOR_CONFIG_FIELDS`. Missing that registration
+  would cause **over-reuse** — flipping the switch would read back the previous
+  base snapshot, which is a wrong answer rather than a slow one. Also added
+  `pre_close` to the dataset content hash (`_HASH_BAR_FIELDS`): before this
+  change `pre_close` affected nothing, and after it, it determines every price
+  the backtest sees, so two datasets differing only in `pre_close` must not
+  share a `data_version`.
+- **Nothing is written to the database.** The daily sync's `INSERT OR REPLACE`
+  column list does not include `adj_factor` (see
+  `src/services/market_data_sync_service.py`), so backfilled factors would be
+  wiped out column by column and need a standing maintenance task; `pre_close`,
+  by contrast, *is* in that list and is guarded by
+  `scripts/validate_staging_before_promotion.py`. `src/storage.py` has also
+  already pinned `adj_factor` to a different meaning (the fetch-time qfq/raw
+  ratio paired with `adj_anchor_date`), so writing the cumulative factor there
+  would give one column two meanings. Rollback is therefore
+  `ADJ_APPLY_ON_READ=false` with **no data to clean up**.
+- Added `scripts/audit_adjustment_chain.py`, a read-only full-table audit of the
+  chain (the connection itself is opened `mode=ro`, so "does not write" is
+  enforced by SQLite rather than by a dry-run branch). Baseline over 9.62M rows
+  and 5,790 codes: 47 chain breaks, every one of them a `pre_close` above the
+  prior close — directionally impossible for a dividend or a split, and in
+  practice a NEEQ transfer-method change or a board-transfer restructuring —
+  all on Beijing exchange `920xxx` codes, exactly one per affected stock, zero
+  on the main boards. **No row hit the upper bound**, and 8,053 rows (0.084%)
+  were invalidated by segment cutting. Anomalies are judged by direction, not
+  magnitude: the lower bound is `1 - 1e-9`, a floating-point tolerance rather
+  than a business margin (the table contains no rows at all with
+  `0 < |close(t-1) - pre_close(t)| < 0.005`), and the upper bound of 20 is a
+  data-corruption tripwire, not a rule — the largest legitimate ratio observed
+  is 9.7173 (a ~10:1 split) and values of 3.0000 and 2.7586 were already being
+  accepted, so there is no principled way to reject 3.0358.
+  On a broken chain the code fails closed: it invalidates the prefix before the
+  break, applies nothing, and marks those rows `pre_close_chain_anomalous`.
+  It never forward-fills and never substitutes 1.0 — a partially adjusted series
+  is worse than a refusal, because it is finite, positive and non-null, and
+  would sail through every downstream check.
+- Added `scripts/validate_staging_before_promotion.py` and
+  `scripts/promote_staging_to_production.py`, the two-step gate the promotion
+  above went through. The validator is read-only and checks primary-key
+  uniqueness, positive prices, the OHLC envelope, convention labelling, date
+  format, `pct_chg` against the `pre_close`/`close` chain, and alignment with
+  `trading_calendar`; it also fails when `pre_close` is missing on anything
+  other than a stock's first bar, since that means a broken chain rather than a
+  new listing. All ten checks passed on 9,621,460 rows: 2,089 trading days all
+  aligned with the calendar, and the 78 null `pre_close` values were all first
+  bars. The `pct_chg` check carries an explicit budget (10 rows, 0.5pp) instead
+  of zero tolerance because the upstream field itself has isolated noise — one
+  row in 9.6M, off by 0.065pp, on a date whose `pre_close` matches the prior
+  close exactly. A permanently red check gets ignored.
+  The promoter deletes **only the codes staging covers** rather than truncating:
+  production also holds indices (`sh000001`, `sh000905`) and a HK stock that the
+  A-share backfill never covered, and `sh000001` is the default
+  `screening_market_guard_index`, so truncating would have silently removed the
+  market-timing guard's data source. It defaults to dry-run and prints the full
+  plan — rows deleted, rows preserved and their code count, rows written,
+  columns copied — before `--execute` does anything, and runs in one
+  transaction.
+- Added a Tushare-backed path for the listing/delisting lifecycle backfill that
+  fills `instrument_master.list_date` / `delist_date`, the data survivor-bias
+  correction depends on. The original source, baostock, is unreachable at the
+  service level rather than locally: its data port 10030 times out from this
+  machine *and* from five external probe nodes (Iran ×2, Japan, Netherlands,
+  Portugal), while port 80 on the same host answers in 0.19–0.55s from Germany,
+  Indonesia, Iran, the Netherlands and the US, and in 0.04s directly. The
+  library also has no account tier to escalate — it logs in with a hardcoded
+  anonymous identity, and its `10002007` is `BSERR_RECVSOCK_FAIL`, a transport
+  error, not one of the `100010xx` permission codes.
+  `ListingLifecycleService.sync_from_tushare()` fetches `stock_basic` once per
+  `list_status` (`L`, `D`, `P` by default) and writes **once, after every fetch
+  has succeeded**. Fetching only `L` would silently restore the survivor bias
+  this service exists to remove, so a partial result is treated as a failure and
+  nothing is written. An empty result is fatal for `L` and `D`, which can never
+  legitimately be empty market-wide, but tolerated for `P` (suspended listing),
+  which current delisting rules have largely phased out — failing there would
+  discard two successful fetches and, under the quota below, a day's worth of
+  attempts. A failed fetch remains fatal for every status, `P` included.
+  `sync_from_baostock()` is unchanged and still available via `--source
+  baostock` for when the service returns.
+- Added `scripts/sync_listing_lifecycle.py` to drive that sync. Tushare's
+  `stock_basic` is capped at **5 calls per day** on the free tier (with
+  secondary caps near 1/minute and 1/hour), and rejected attempts consume quota
+  too, so the script never retries and prints the API-call cost of a run before
+  making any call. `--dry-run` shows that plan and the resolved database path
+  without touching the network or the database. After a real run it reports not
+  only the service's own counts but a fresh query of how many
+  `instrument_master` rows now carry a non-null `list_date` and `delist_date` —
+  the second number is what actually demonstrates survivor bias can be
+  corrected. Rate-limit failures print an explicit hint that retrying
+  immediately wastes more of the day's budget. `--pause-seconds` (default 65)
+  spaces the per-status calls to respect the per-minute cap; it is not a retry
+  delay. **This has not yet been run against production**: the day's quota was
+  exhausted while establishing these limits.
 - Backfilled `stock_daily_staging` across the full 2018–2026 window: 9,621,460
   rows over 2,089 trading days from 2018-01-02 to 2026-08-12, every row carrying
   `pre_close` and `adj_convention='raw'`, in 83 minutes at the free tier's 45
@@ -303,6 +481,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Made the bottom-divergence v2 adjustment gate combine its two provenance
+  levels with AND rather than falling back. `_compute_bottom_divergence_v2_factors`
+  read `zone_metadata.get("adj_factor_source") or metadata.adj_factor_source`, so
+  a non-empty candidate-level value made the group-level verdict unreachable. The
+  candidate-level value is frozen by the detector to the A/B prefix
+  (`visible.iloc[a_idx:b_idx+1]`), while a broken chain only invalidates the rows
+  *before* the break — so a break sitting before A is invisible to it, even
+  though resistance zones are built from swing highs across the whole visible
+  window and would consume those unadjusted bars. Reproduced: the group's own
+  metadata already read `unknown` while the final `actionability_status` still
+  came back `actionable`. This was dormant until now — no source was trusted, so
+  every group was `unknown` regardless — and adding `pre_close_chain` to the
+  whitelist is what made it live, the same shape of latent defect as the missing
+  `pre_close` in the dataset content hash. The fix only ever *adds*
+  `adjustment_unknown`, so it can only fail closed. The detector's deliberate
+  freezing of provenance to the A/B prefix is left alone, since candidate
+  versions must stay stable.
 - Fixed base factor computation reading its thresholds from the global config
   singleton while the factor cache keyed on the config object passed in.
   `FactorService._compute_pattern_123_factors` and

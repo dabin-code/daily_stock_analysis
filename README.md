@@ -125,6 +125,14 @@ python scripts/audit_kline_completeness.py --trade-date 2026-04-17 --dry-run
 python scripts/fast_backfill.py --to-date 2026-04-17
 python scripts/approve_kline_skip.py --market cn --trade-date 2026-04-17 --approved-by ops-user --reason-type manual_review
 python scripts/approve_kline_skip.py --market cn --code 000001 --from-date 2026-04-10 --to-date 2026-04-17 --approved-by ops-user --reason-type manual_review
+python scripts/sync_listing_lifecycle.py --dry-run
+python scripts/sync_listing_lifecycle.py
+python scripts/validate_staging_before_promotion.py
+python scripts/promote_staging_to_production.py
+python scripts/promote_staging_to_production.py --execute
+python scripts/audit_adjustment_chain.py
+python scripts/audit_adjustment_chain.py --codes 002594,920402
+python scripts/audit_adjustment_chain.py --limit 200
 ```
 
 其中：
@@ -132,6 +140,9 @@ python scripts/approve_kline_skip.py --market cn --code 000001 --from-date 2026-
 - `audit_kline_completeness.py` 用于手工触发单次审计或完整补偿
 - `fast_backfill.py --to-date` 用于按交易日批量回填本地全市场日线数据到目标日期
 - `approve_kline_skip.py` 用于把人工确认无法拉取的 `candidate_skip` 升级为 `approved_skip`
+- `sync_listing_lifecycle.py` 用于回填 `instrument_master` 的上市/退市日期，缺少退市日期会让历史研究只剩幸存者、收益虚高；默认数据源为 Tushare，一次同步消耗 3 次 `stock_basic` 调用，先用 `--dry-run` 确认额度开销
+- `audit_adjustment_chain.py` 是**只读**的复权链离线抽查：把 `ADJ_APPLY_ON_READ` 用的那套解链规则跑在全表上，给出单日复权比值分布、每只股票的总复权倍数分布、断链统计与断链代码清单。它不写库（连接就是 SQLite 只读模式），用于在放开信任白名单前确认没有大面积断链；口径是**全历史**解链，断链统计相对生产窗口是上界
+- `validate_staging_before_promotion.py` 与 `promote_staging_to_production.py` 是 `stock_daily_staging` 晋升到生产表的两步闸门：先只读校验（口径、主键、OHLC 包络、`pre_close` 链条、交易日历对齐），全部通过后再晋升；晋升缺省是 dry-run，`--execute` 才写库，且只删除 staging 覆盖到的代码，保留指数等未覆盖数据。执行前务必先用 `backup_production_db.py` 备份
 - 一旦 `approved_skip` 对应缺口在后续治理中连续恢复成功，系统会自动把它回收为健康状态
 - `/api/v1/data-health/summary|coverage|gaps|operations|tasks` 用于 Web 控制台读取本地数据健康状态并轮询后台治理任务
 
@@ -202,11 +213,30 @@ BOTTOM_DIVERGENCE_V2_R2_WEIGHTS=0.35,0.15,0.15,0.15,0.10,0.10
 
 安全边界：
 
-- 只有复权因子完整有效且 provenance 为受信任的 `tushare_native` 或
-  `akshare_qfq_div_raw` 时才允许执行。
+- 只有复权因子完整有效且 provenance 为受信任的 `pre_close_chain`、`tushare_native`
+  或 `akshare_qfq_div_raw` 时才允许执行。`pre_close_chain` 是读取时按窗口现算并施加的
+  后复权因子（见下方 `ADJ_APPLY_ON_READ`）；被切段作废的 `pre_close_chain_anomalous`
+  不在白名单内。
 - provenance 为 unknown 时，early/R1 仅作为观察证据；历史 R2 显示为
   `major_unverified`，不会生成可执行交易计划。AI 复核不能绕过该硬门禁。
 - stale、invalidated、structure broken、extended 等状态均不可执行。
+
+读取时复权（`ADJ_APPLY_ON_READ`，默认 `true`）：
+
+```env
+ADJ_APPLY_ON_READ=true
+```
+
+- `stock_daily` 存的是**原始价**，`adj_factor` 列在日常同步中不被维护。开启后，
+  生产因子快照、回测因子窗口、回测前瞻/前置窗口三条读取路径会各自按窗口用
+  `f(t) = f(t-1) * close(t-1) / pre_close(t)` 现算后复权因子，归一到窗口锚日
+  （锚日因子恒为 1，入场价仍是当日真实可成交价），施加到 OHLC 与 `volume`，
+  并把 `adj_factor_source` 标成 `pre_close_chain`。`amount` 不缩放——价 × 量守恒。
+- **因子不落库**，关闭开关即完全回退，没有需要清理的数据。
+- 链条断裂（缺 `pre_close`、`pre_close` 高于前一日收盘、比值超过数据损坏警戒线）时
+  fail-closed：既不 ffill 也不按 1.0 补，对应行标 `pre_close_chain_anomalous`，
+  下游判为 `adjustment_unknown` 而不是拿部分复权的价格继续算。
+- 关闭后检测器会重新在带除权跳空的原始价上计算阻力区与量比，仅供排查使用。
 - v2 默认关闭；回滚只需设置 `BOTTOM_DIVERGENCE_V2_ENABLED=false`，并从请求策略中
   移除 `bottom_divergence_layered_entry_v2`。无需数据库迁移。
 

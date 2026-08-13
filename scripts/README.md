@@ -454,6 +454,106 @@ docker exec stock-analyzer python /app/backfill_instrument_boards.py --codes 600
 
 ---
 
+### 3.4 `sync_listing_lifecycle.py` — 回填上市/退市日期（消除幸存者偏差）
+
+**作用**：调 `ListingLifecycleService` 把全市场（**含已退市证券**）的 `list_date` / `delist_date` 写入 `instrument_master`。没有退市日期，2018 年上市、2021 年退市的股票在历史研究里整体缺席，而它们恰恰是亏损样本的主要来源，样本里只留幸存者会让回测收益虚高。脚本本身是薄壳，抓取编排与原子写都在 service 里。
+
+**⚠️ 额度是硬约束，先跑 `--dry-run`**：tushare `stock_basic` 在免费额度（120 积分）下实测被限到 **5 次/天**，另有约 1 次/分钟、1 次/小时的次级上限；拒绝文案形如 `抱歉，您访问接口(stock_basic)频率超限(5次/天)`。一次完整同步要 3 次调用（`L` / `D` / `P`），**失败的尝试同样烧额度**，因此脚本不重试、不做试探性调用，并在发起调用前把本次要花的次数打出来。`--dry-run` 只打印计划，一次调用都不发、一个字都不写。
+
+- `--source {tushare,baostock}`：默认 `tushare`；`baostock` 代码路径仍保留，但服务端当前不可用。
+- `--list-statuses`：默认 `L,D,P`，逗号分隔，**每个状态一次 API 调用**；仅对 tushare 有意义，和 `--source baostock` 同时传会直接报错退出（不静默忽略）。
+- `--pause-seconds`：默认 `65`，是**状态之间的间隔**（避开 ~1 次/分钟的次级上限），不是重试等待。
+- 跑完除了打印 `total` / `written` / `delisted`，还会回查库里 `list_date` / `delist_date` 非空的行数——后者才是「幸存者偏差可被纠正」的证据。
+
+**默认库路径**：优先取 `DATABASE_PATH`，否则回落到仓库内 `data/stock_analysis.db`；解析结果以 `[info] Target database: ...` 回显。
+
+```powershell
+# 本地：先确认计划与额度代价（不发任何调用）
+python scripts/sync_listing_lifecycle.py --dry-run
+
+# 本地：实际同步（消耗 3 次 stock_basic 额度）
+python scripts/sync_listing_lifecycle.py
+
+# 本地：只补在市 + 已退市，省下 1 次额度
+python scripts/sync_listing_lifecycle.py --list-statuses L,D
+
+# docker
+docker cp .\scripts\sync_listing_lifecycle.py stock-analyzer:/app/sync_listing_lifecycle.py
+docker exec stock-analyzer python /app/sync_listing_lifecycle.py --dry-run
+```
+
+**返回码**：`0` 成功；`1` 同步失败（限频类失败会多打一条 `[hint]` 说明额度可能已耗尽、立刻重跑只会更亏）；`2` 参数非法。
+
+---
+
+### 3.5 `validate_staging_before_promotion.py` — 晋升前的 staging 全表口径校验（只读）
+
+**作用**：在把 `stock_daily_staging` 覆盖到生产表之前，对整张 staging 做结构性与一致性校验。**任何一项 FAIL 都意味着不该晋升**。只读，不写库。
+
+校验分两类：结构性（主键唯一、价格为正、OHLC 包络、成交量非负、口径标注统一为 `raw`、日期格式）与一致性（`pct_chg` 与 `pre_close`/`close` 自洽、交易日落在 `trading_calendar` 的开市日上）。另外单独报告 `pre_close` 缺失分布——**缺失出现在非首个交易日即判 FAIL**，因为那意味着链条断了而不是新股上市。
+
+`pct_chg` 一项设了明确预算（10 行、单行偏差 0.5 个百分点）而非零容忍：上游该字段本身存在零星噪声（962 万行实测 1 行、偏差 0.065 个百分点，且该行 `pre_close` 与前一日收盘完全吻合）。零容忍会让这项在已知源数据瑕疵上长期红着，进而被忽略。`pct_chg` 是派生字段，可由 `close`/`pre_close` 重算。
+
+```powershell
+python scripts/validate_staging_before_promotion.py
+python scripts/validate_staging_before_promotion.py --db path\to\other.db
+```
+
+**返回码**：`0` 全部通过；`1` 有未通过项或 staging 为空 / 不可读。
+
+---
+
+### 3.6 `promote_staging_to_production.py` — staging 晋升为生产表
+
+**作用**：把 `stock_daily_staging` 覆盖写入 `stock_daily`。**前置**：先跑 §3.5 且全部通过，并已用 §4.6 做过整库备份。
+
+**不是「清空 stock_daily 再灌 staging」**：生产表里除 A 股个股外还有指数（`sh000001` 上证指数、`sh000905` 中证 500）和个别港股，staging 的回补范围并不覆盖它们；而 `sh000001` 正是配置项 `screening_market_guard_index` 的默认值，清表会直接打掉大盘风控的数据源。脚本按「staging 覆盖到的 code 集合」删除，其余行原样保留，并在计划里回显保留了多少行、多少个代码。
+
+**会被清空的列**：`ma5` / `ma10` / `ma20` / `volume_ratio` / `adj_factor` / `adj_factor_source` 在 staging 里是空的，晋升后变 NULL。这是有意为之——生产表原有的均线是用**前复权价**算的，与即将写入的原始价不配套，保留会得到「价格是原始价、均线是前复权均线」的错配。实际消费方 `src/services/factor_service.py` 从收盘价序列现算这些指标，不读存储列。
+
+缺省是 dry-run，只打印计划；`--execute` 才真正执行，全程单事务，失败回滚。
+
+```powershell
+# 先看计划（删多少、留多少、写多少、复制哪些列）
+python scripts/promote_staging_to_production.py
+
+# 确认无误后执行
+python scripts/promote_staging_to_production.py --execute
+```
+
+**返回码**：`0` 成功或 dry-run 正常；`1` staging 为空、staging 缺生产表的列（会丢数据）、或事务失败已回滚。
+
+---
+
+### 3.7 `audit_adjustment_chain.py` — 复权链离线抽查（只读）
+
+**作用**：把 `src/services/adjustment_chain.py` 的复权链解算跑在全表上，给出四份画像：单日复权比值 `close(t-1)/pre_close(t)` 的分布、每只股票的总复权倍数分布、断链统计（多少代码 / 多少行会被切段作废，按原因分类）、断链代码清单。**全程只读**，连接以 `mode=ro` 打开。
+
+**它不写 `adj_factor`**。复权因子不落库、只在读取时按窗口现算——日常同步的 `INSERT OR REPLACE` 列清单不含 `adj_factor`（见 `src/services/market_data_sync_service.py`），回填进去会被逐步擦掉；而 `pre_close` 在那份清单里被保住。
+
+**口径提醒**：这里按**全历史**解链（D = 每只股票最后一根 bar），生产路径上的窗口只有几百个交易日，所以断链统计是上界——窗口越短，落在窗口内的断链越少。
+
+**什么时候跑**：改动 `pre_close` 相关的取数 / 晋升链路后，或调整 `ADJ_APPLY_ON_READ` 的行为前。2026-08-13 全库基线（962 万行 / 5790 只）：47 处断链，全部是 `ratio_below_floor`（`pre_close` 高于前一日收盘的方向性错误）、全部落在北交所 `920xxx`、每只恰好一处，主板零命中；**无一行触发上界**；被切段作废 8053 行（0.084%）。偏离这份基线说明源数据口径变了，先查数据再改常数。
+
+```powershell
+# 全表抽查
+python scripts/audit_adjustment_chain.py
+
+# 只看某几只
+python scripts/audit_adjustment_chain.py --codes 002594,920402
+
+# 抽前 200 个代码，断链清单只打 10 行
+python scripts/audit_adjustment_chain.py --limit 200 --list-limit 10
+
+# docker
+docker cp .\scripts\audit_adjustment_chain.py stock-analyzer:/app/audit_adjustment_chain.py
+docker exec stock-analyzer python /app/audit_adjustment_chain.py --limit 200
+```
+
+**返回码**：`0` 正常；`1` 库不存在、不可读，或表里没有 `adj_convention='raw'` 的行。
+
+---
+
 ## 4. DB 一次性迁移
 
 所有 `migrate_*` 脚本都遵循同样的约定：
@@ -577,7 +677,7 @@ docker exec stock-analyzer python /app/migrate_stock_daily_pre_close.py --db /ap
 
 **作用**：`instrument_master` 加 `delist_date`（退市日期）列 + 索引。没有这一列时，日线里的「停牌 / 退市 / 抓取失败」三类缺口长得一模一样，缺口归因无从下手；更关键的是**幸存者偏差**——2018 年上市、2021 年退市的股票在只看在市名单的历史研究里整体缺席，而它们恰恰是亏损样本的主要来源，样本里只留幸存者会让回测收益虚高。
 
-**不回填**（有意为之）：存量行的退市日期无法事后判定，写任何值都是编造数据。存量行保持 NULL（含义是「未知 / 在市」），由 `ListingLifecycleService.sync_from_baostock()` 全量回填（它连已退市证券一起拉）。
+**不回填**（有意为之）：存量行的退市日期无法事后判定，写任何值都是编造数据。存量行保持 NULL（含义是「未知 / 在市」），由 §3.4 `sync_listing_lifecycle.py` 全量回填（它连已退市证券一起拉）。
 
 **默认库路径**：不带 `--db` 时优先取 `DATABASE_PATH`，否则回落到仓库内 `data/stock_analysis.db`；最终解析出的路径会以 `[info] Target database: ...` 回显，成功路径也有，用来确认动的是哪个文件。
 
@@ -736,6 +836,8 @@ DSA_MAC_ARCH=x64   bash scripts/build-desktop-macos.sh
 | 「pending_retry 越攒越多」 | `_kline_pending_inspect.py` 分类 → `_kline_root_cause_probe.py` 找根因 → `_kline_master_data_treatment.py --apply` 主数据治理 + `_kline_bulk_approve_skip.py --apply` 批量审批 |
 | 「全新部署 / 数据库空白」 | `data_reset_and_backfill.py --reset --backfill-watchlist --backfill-universe` → `fast_backfill.py --to-date <today>` |
 | 「DB schema 落后于代码」 | 按需跑对应的 `migrate_*` 脚本（启动时也会内联跑一次，幂等） |
+| 「历史回测样本只有在市股票（幸存者偏差）」 | `migrate_instrument_delist_date.py` 确认列已就位 → `sync_listing_lifecycle.py --dry-run` 核对额度 → `sync_listing_lifecycle.py` |
+| 「回测 `actionability_status` 全是 `adjustment_unknown` / 收益里有除权造成的假亏损」 | 确认 `ADJ_APPLY_ON_READ=true` → `audit_adjustment_chain.py` 核对断链是否偏离基线 |
 | 「评估选股策略历史表现」 | `run_historical_random_screening.py --sample-days 50 --seed 42` |
 | 「上线前体检」 | `python scripts/check_ai_assets.py` + `./scripts/ci_gate.sh` |
 
