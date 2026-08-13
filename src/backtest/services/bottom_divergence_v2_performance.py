@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from concurrent.futures import ProcessPoolExecutor
 import gzip
 import hashlib
@@ -14,6 +14,7 @@ from tempfile import TemporaryDirectory
 import time
 from typing import Any, Callable, Mapping, Optional, Sequence
 
+import numpy as np
 import pandas as pd
 
 from src.indicators.causal_bottom_divergence_detector import (
@@ -39,6 +40,79 @@ from .bottom_divergence_v2_validation import canonical_parameter_hash
 FROZEN_EVIDENCE_ALGORITHM_VERSION = (
     f"{CAUSAL_ALGORITHM_VERSION}+{ZONE_ALGORITHM_VERSION}"
 )
+
+# base 快照路径真正读取的全部配置字段。这是**白名单**而不是黑名单：
+# `Config` 有 232 个字段，其中绝大多数（LLM、通知、调度等）与因子计算无关，
+# 把它们纳入键只会让无关改动触发全市场重算，跨策略共享因此无法成立。
+#
+# 白名单的失败模式比黑名单危险：漏登记一个真正影响 base 的字段会导致**过度复用**，
+# 也就是拿旧参数的因子当新参数的结果用——算错，不是算慢。
+# `tests/test_base_factor_cache_key_whitelist.py` 枚举 `Config` 全部字段逐个
+# 变异重算，凡能改变 base 输出却未登记的字段都会让它变红。
+#
+# 只用于 base 快照。证据两层继续走 `_config_hash`：那两层的输出受
+# `bottom_divergence_v2_sync_window` 等字段影响，收窄会静默算错。
+BASE_FACTOR_CONFIG_FIELDS = frozenset({
+    "screening_factor_lookback_days",
+    "screening_min_list_days",
+    "screening_breakout_lookback_days",
+    "low123_max_p1_p2_bars",
+    "low123_max_breakout_gap",
+    "low123_break_tolerance",
+    "bottom_divergence_max_breakout_gap",
+    "bottom_divergence_break_tolerance",
+})
+
+# universe 里会决定 base 快照取值的全部列，`code` 在最前以便指纹按它排序。
+# 只哈希 code 是不够的——同一批 code 配不同元数据是不同的输入：
+#   `list_date` -> `days_since_listed`（`factor_service.py:183-188`），
+#                  再经 `:207-212` 影响 `risk_flags`，并落在 `:232`
+#   `is_st`     -> `:208` 的风险标记与 `:231` 的字段
+#   `circ_mv`   -> `:230`
+#   `name`      -> `:219`
+# 与 `BASE_FACTOR_CONFIG_FIELDS` 一样，这也是白名单，漏登记一列的后果是
+# 过度复用（算错），不是过度失效（算慢）。
+BASE_SNAPSHOT_UNIVERSE_COLUMNS = (
+    "code",
+    "name",
+    "list_date",
+    "is_st",
+    "circ_mv",
+)
+
+
+def _universe_cell_fingerprint(value: Any) -> str:
+    """把 universe 的单元格渲染成可安全哈希的带类型标签文本。
+
+    不能把原值直接交给 `canonical_json_dumps`：它以 `allow_nan=False` 运行，
+    `NaN` 会抛 `ValueError`，而 `np.int64` / `np.bool_` / `Timestamp` /
+    `NaT` / `date` 一律抛 `TypeError`（已实测）。
+
+    类型标签的作用是防止不同取值折叠成同一段文本：`1` / `1.0` / `"1"`
+    以及 `None` / `NaN` / `False` 都必须互相区分——它们在
+    `factor_service.py` 里走的是不同分支，`bool(nan)` 是 `True` 而
+    `bool(None)` 是 `False`。
+    """
+    if value is None:
+        return "none:"
+    if value is pd.NaT:
+        return "nat:"
+    # bool 早于 int：`bool` 是 `int` 的子类；`np.bool_` 两者都不是。
+    if isinstance(value, (bool, np.bool_)):
+        return f"bool:{bool(value)}"
+    # datetime 早于 date：`datetime` 是 `date` 的子类。
+    if isinstance(value, datetime):
+        return f"datetime:{value.isoformat()}"
+    if isinstance(value, date):
+        return f"date:{value.isoformat()}"
+    if isinstance(value, (int, np.integer)):
+        return f"int:{int(value)}"
+    if isinstance(value, (float, np.floating)):
+        number = float(value)
+        return "nan:" if number != number else f"float:{number!r}"
+    if isinstance(value, str):
+        return f"str:{value}"
+    return f"{type(value).__name__}:{value!r}"
 
 
 def _evaluate_factor_task(
@@ -287,9 +361,61 @@ class ValidationFactorCache:
             )
         return self._executor
 
-    def _base_path(self, trade_date: date, config_hash: str) -> Path:
+    @staticmethod
+    def _universe_fingerprint(universe: pd.DataFrame) -> str:
+        """指纹化 universe 中真正决定 base 快照取值的那几列。
+
+        只哈希 code 会让「同一批 code、不同元数据」的两个 universe 撞上同一份
+        缓存文件，第二次调用直接读回第一次的行——正是本改动要消灭的静默错误。
+
+        缺列与「有这列但值为空」分别记录，因为两者不可互换：
+        `info.get("is_st", False)` 在缺列时得到 `False`，在值为 `NaN` 时
+        `bool(nan)` 得到 `True`，还会多一个 `st` 风险标记。
+        （缺列与 `None` 在生产侧确实等价，这里仍分开记，代价只是多算一次。）
+        """
+        present = [
+            name
+            for name in BASE_SNAPSHOT_UNIVERSE_COLUMNS
+            if name in universe.columns
+        ]
+        absent = [
+            name
+            for name in BASE_SNAPSHOT_UNIVERSE_COLUMNS
+            if name not in universe.columns
+        ]
+        # 行序不该影响指纹：`factor_service.py:167` 以 code 为索引取用元数据。
+        # 渲染成字符串后再排序，避免混合类型列在 `sort_values` 上抛异常，
+        # 且因 `code` 是首列，排序等价于按 code 排。
+        rows = sorted(
+            [_universe_cell_fingerprint(record.get(name)) for name in present]
+            for record in universe.loc[:, present].to_dict("records")
+        )
+        return hashlib.sha256(
+            canonical_json_dumps({
+                "columns": present,
+                "absent_columns": absent,
+                "rows": rows,
+            }).encode("utf-8")
+        ).hexdigest()
+
+    def _base_path(
+        self,
+        trade_date: date,
+        config_hash: str,
+        *,
+        universe: pd.DataFrame,
+    ) -> Path:
+        # universe 与 bar 数据都是 base 快照的输入，必须进文件名。
+        # `data_version` 此前只被证据两层的键覆盖（`FrozenEvidenceCacheKey`），
+        # base 快照没带上它：今天缓存目录恒为进程内临时目录所以撞不上，但键的
+        # 正确性不该依赖这个偶然条件——阶段 2 要开跨进程复用。
+        data_version_hash = hashlib.sha256(
+            str(self.data_version).encode("utf-8")
+        ).hexdigest()[:16]
         return self._cache_directory / (
-            f"base-{trade_date.isoformat()}-{config_hash[:16]}.pkl.gz"
+            f"base-{trade_date.isoformat()}-{config_hash[:16]}"
+            f"-{self._universe_fingerprint(universe)[:16]}"
+            f"-{data_version_hash}.pkl.gz"
         )
 
     def _frozen_path(self, trade_date: date) -> Path:
@@ -381,18 +507,41 @@ class ValidationFactorCache:
         return self._partition_cache_keys("_evaluated")
 
     @staticmethod
-    def _config_hash(config: Any, *, include_grid: bool) -> str:
+    def _config_hash(config: Any) -> str:
+        """Hash every config field except the four grid fields.
+
+        The grid fields are covered by `_parameter_hash`, which is a separate
+        component of the frozen-evidence and evaluated-factor keys.
+        """
         payload = asdict(config)
-        if not include_grid:
-            for field_name in (
-                "bottom_divergence_v2_enabled",
-                "bottom_divergence_v2_cluster_pct",
-                "bottom_divergence_v2_atr_gap_multiplier",
-                "bottom_divergence_v2_zone_score_min",
-            ):
-                payload.pop(field_name, None)
+        for field_name in (
+            "bottom_divergence_v2_enabled",
+            "bottom_divergence_v2_cluster_pct",
+            "bottom_divergence_v2_atr_gap_multiplier",
+            "bottom_divergence_v2_zone_score_min",
+        ):
+            payload.pop(field_name, None)
         return hashlib.sha256(
             canonical_json_dumps(payload).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _base_config_hash(config: Any) -> str:
+        """Hash only the fields the base factor pass actually reads.
+
+        `_config_hash` stays as-is and keeps serving the frozen-evidence and
+        evaluated-factor layers: their output depends on fields such as
+        `bottom_divergence_v2_sync_window`, so narrowing those keys would make
+        the cache return one parameter set's evidence as another's.
+        """
+        payload = asdict(config)
+        base_payload = {
+            name: payload[name]
+            for name in sorted(BASE_FACTOR_CONFIG_FIELDS)
+            if name in payload
+        }
+        return hashlib.sha256(
+            canonical_json_dumps(base_payload).encode("utf-8")
         ).hexdigest()
 
     @staticmethod
@@ -439,8 +588,14 @@ class ValidationFactorCache:
             )
             for code in codes
         }
-        base_hash = self._config_hash(config, include_grid=False)
-        base_path = self._base_path(trade_date, base_hash)
+        # 两个口径刻意分开：base 快照只依赖白名单里的 8 个字段，而证据两层
+        # 仍需 `base_hash` 的全量口径——`bottom_divergence_v2_sync_window` 等
+        # 字段只由它覆盖，`_parameter_hash` 不含它们。
+        base_snapshot_hash = self._base_config_hash(config)
+        base_hash = self._config_hash(config)
+        base_path = self._base_path(
+            trade_date, base_snapshot_hash, universe=universe
+        )
         if base_path.exists():
             base_snapshot = pd.read_pickle(base_path, compression="gzip")
         else:

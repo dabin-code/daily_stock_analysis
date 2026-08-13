@@ -6,12 +6,14 @@ from datetime import date, timedelta
 import hashlib
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from src.backtest.services.bottom_divergence_v2_performance import (
+    BASE_FACTOR_CONFIG_FIELDS,
     CanonicalCheckpointStore,
     CheckpointCorruptionError,
     CheckpointMismatchError,
@@ -150,6 +152,326 @@ def test_v1_and_v2_legs_share_one_base_factor_pass():
         "第二条 leg 重算了基础因子，跨策略的因子复用已失效"
     )
     assert cache.stats["sql_bar_queries"] == 0
+
+
+def test_base_snapshot_key_ignores_fields_the_base_pass_never_reads():
+    """与 base 快照无关的字段不该进入 base 快照键。
+
+    base pass 强制关闭 v2（`bottom_divergence_v2_performance.py:447-450`），
+    所以 v2 的这些参数不可能改变 base 快照的取值。
+    """
+    left = Config(bottom_divergence_v2_sync_window=3)
+    right = Config(bottom_divergence_v2_sync_window=9)
+
+    assert ValidationFactorCache._base_config_hash(
+        left
+    ) == ValidationFactorCache._base_config_hash(right)
+
+
+def test_evidence_key_still_separates_v2_evidence_parameters():
+    """证据层的键必须继续区分 v2 参数——这层不能跟着收窄。
+
+    `sync_window` 决定 `major.confirmed`
+    （`causal_bottom_divergence_detector.py:1174`），`retention_bars` 在冻结阶段
+    就被烘进证据（`:679`）。它们只由这个键覆盖，`_parameter_hash` 不含它们；
+    一旦收窄，缓存会把一套参数的证据当成另一套参数的结果返回。
+    """
+    left = Config(bottom_divergence_v2_sync_window=3)
+    right = Config(bottom_divergence_v2_sync_window=9)
+
+    assert ValidationFactorCache._config_hash(
+        left
+    ) != ValidationFactorCache._config_hash(right)
+
+
+def test_base_snapshot_key_tracks_every_field_the_base_pass_reads():
+    """base 路径真正读取的字段必须改变 base 快照键。"""
+    baseline = Config()
+    for field_name in BASE_FACTOR_CONFIG_FIELDS:
+        current = getattr(baseline, field_name)
+        mutated = replace(baseline, **{field_name: current + 1})
+        assert ValidationFactorCache._base_config_hash(
+            baseline
+        ) != ValidationFactorCache._base_config_hash(mutated), (
+            f"{field_name} 影响 base 因子，却没有进入 base 快照键"
+        )
+
+
+def test_base_snapshot_path_separates_different_universes():
+    """universe 是 base 快照的输入，不同 universe 不得复用同一份缓存文件。
+
+    base 快照按 code 逐行构成。键里不含 universe 时，两条 leg 若配了不同的
+    预筛 universe 却撞上同一个 config 哈希，第二条会读回第一条的行集合。
+    """
+    cache = ValidationFactorCache.from_groups(
+        data_version="data-a",
+        trade_dates=(date(2024, 3, 1),),
+        bar_groups={},
+    )
+    left = cache._base_path(
+        date(2024, 3, 1),
+        "same-hash",
+        universe=pd.DataFrame([{"code": "000001", "name": "A"}]),
+    )
+    right = cache._base_path(
+        date(2024, 3, 1),
+        "same-hash",
+        universe=pd.DataFrame([
+            {"code": "000001", "name": "A"},
+            {"code": "000002", "name": "B"},
+        ]),
+    )
+    assert left != right
+
+
+# universe 里除 code 之外同样会改变 base 快照取值的列，以及一对确实不同的取值。
+# `code` 之外这四列的消费点：`list_date` 在 `factor_service.py:183-188` 决定
+# `days_since_listed`，进而经 `:207-212` 影响 `risk_flags`；`is_st` 在 `:208`
+# 与 `:231`；`circ_mv` 在 `:230`；`name` 在 `:219`。
+_UNIVERSE_METADATA_VARIANTS = (
+    ("list_date", "2015-01-05", "2025-06-02"),
+    ("is_st", False, True),
+    ("circ_mv", 1.0e9, 2.0e9),
+    ("name", "A", "B"),
+)
+
+
+def _one_stock_universe(**overrides) -> pd.DataFrame:
+    return pd.DataFrame([{"code": "000001", **overrides}])
+
+
+@pytest.mark.parametrize(
+    ("column", "left_value", "right_value"),
+    _UNIVERSE_METADATA_VARIANTS,
+)
+def test_universe_metadata_changes_the_base_snapshot_contents(
+    column,
+    left_value,
+    right_value,
+):
+    """先证明这几列真的会改变 base 快照，键的断言才不是空对空。
+
+    没有这条打底，「不同 universe 走不同缓存文件」就只是在钉一个实现细节：
+    万一某列其实不影响输出，分键只是白费算力而非修正正确性。
+    """
+    groups = {"000001": _bars("000001")}
+    trade_date = groups["000001"].iloc[-1]["date"]
+    service = FactorService(db_manager=MagicMock(), config=Config())
+
+    left = service.build_factor_snapshot_from_groups(
+        _one_stock_universe(**{column: left_value}),
+        groups,
+        trade_date=trade_date,
+    )
+    right = service.build_factor_snapshot_from_groups(
+        _one_stock_universe(**{column: right_value}),
+        groups,
+        trade_date=trade_date,
+    )
+
+    assert not left.empty and not right.empty, "夹具没产出行，测试没覆盖到目标"
+    assert not left.equals(right), (
+        f"universe 的 {column} 列不影响 base 快照，"
+        f"这条参数化用例的前提不成立，需要换取值或删掉它"
+    )
+
+
+@pytest.mark.parametrize(
+    ("column", "left_value", "right_value"),
+    _UNIVERSE_METADATA_VARIANTS,
+)
+def test_base_snapshot_path_separates_universe_metadata(
+    column,
+    left_value,
+    right_value,
+):
+    """只哈希 code 不够：同一批 code 配不同元数据也是不同的输入。
+
+    两个 universe 的 code 集合完全一致，只有元数据不同。键若只覆盖 code，
+    第二次调用会读回第一次的 pickle——正是本计划要消灭的
+    「拿一个输入的结果当另一个输入的结果」。
+    """
+    cache = ValidationFactorCache.from_groups(
+        data_version="data-a",
+        trade_dates=(date(2024, 3, 1),),
+        bar_groups={},
+    )
+
+    left = cache._base_path(
+        date(2024, 3, 1),
+        "same-hash",
+        universe=_one_stock_universe(**{column: left_value}),
+    )
+    right = cache._base_path(
+        date(2024, 3, 1),
+        "same-hash",
+        universe=_one_stock_universe(**{column: right_value}),
+    )
+
+    assert left != right, (
+        f"universe 只差 {column} 却撞上同一份 base 缓存文件"
+    )
+
+
+@pytest.mark.parametrize(
+    ("column", "left_value", "right_value"),
+    _UNIVERSE_METADATA_VARIANTS,
+)
+def test_cache_rebuilds_the_base_snapshot_for_changed_universe_metadata(
+    column,
+    left_value,
+    right_value,
+):
+    """端到端：同一个 cache 换 universe 元数据后必须重算而不是读回旧行。
+
+    这条比路径相等性更硬——它比对的是真正返回给调用方的快照内容。
+    """
+    groups = {"000001": _bars("000001")}
+    trade_date = groups["000001"].iloc[-1]["date"]
+    config = Config(bottom_divergence_v2_enabled=False)
+    cache = ValidationFactorCache.from_groups(
+        data_version="data-a",
+        trade_dates=(trade_date,),
+        bar_groups=groups,
+    )
+
+    first = cache.build_factor_snapshot(
+        config=config,
+        universe=_one_stock_universe(**{column: left_value}),
+        trade_date=trade_date,
+    )
+    second = cache.build_factor_snapshot(
+        config=config,
+        universe=_one_stock_universe(**{column: right_value}),
+        trade_date=trade_date,
+    )
+
+    assert not first.equals(second), (
+        f"universe 的 {column} 变了，缓存却返回了同一份 base 快照"
+    )
+    assert cache.stats["base_snapshot_builds"] == 2, (
+        "第二个 universe 命中了第一个的 base 缓存文件"
+    )
+
+
+def test_absent_universe_column_differs_from_a_present_null():
+    """列缺失与列存在但为空不是一回事，先证明它们的输出真的不同。
+
+    `factor_service.py:208` 走 `bool(info.get("is_st", False))`：
+    缺列拿到 `False`，列存在但为 `NaN` 时 `bool(nan)` 是 `True`，
+    还会多出一个 `st` 风险标记（`:231`、`:207-212`）。
+    """
+    groups = {"000001": _bars("000001")}
+    trade_date = groups["000001"].iloc[-1]["date"]
+    service = FactorService(db_manager=MagicMock(), config=Config())
+
+    absent = service.build_factor_snapshot_from_groups(
+        _one_stock_universe(name="A"),
+        groups,
+        trade_date=trade_date,
+    )
+    present_null = service.build_factor_snapshot_from_groups(
+        _one_stock_universe(name="A", is_st=float("nan")),
+        groups,
+        trade_date=trade_date,
+    )
+
+    assert not absent.equals(present_null), (
+        "缺 is_st 列与 is_st 为 NaN 的输出相同，这条前提不成立"
+    )
+
+
+def test_base_snapshot_path_separates_absent_column_from_present_null():
+    """指纹必须区分「没有这列」与「有这列但值为空」。"""
+    cache = ValidationFactorCache.from_groups(
+        data_version="data-a",
+        trade_dates=(date(2024, 3, 1),),
+        bar_groups={},
+    )
+
+    absent = cache._base_path(
+        date(2024, 3, 1),
+        "same-hash",
+        universe=_one_stock_universe(name="A"),
+    )
+    present_null = cache._base_path(
+        date(2024, 3, 1),
+        "same-hash",
+        universe=_one_stock_universe(name="A", is_st=float("nan")),
+    )
+
+    assert absent != present_null, (
+        "缺 is_st 列与 is_st 为 NaN 撞了同一份 base 缓存文件"
+    )
+
+
+def test_base_snapshot_path_includes_the_data_version():
+    """bar 数据决定 base 快照，data_version 必须进 base 快照文件名。
+
+    证据两层的键都带 `data_version`（`FrozenEvidenceCacheKey` 与
+    `_temporary_frozen_key`），base 快照此前没有。今天缓存目录恒为进程内
+    临时目录所以撞不上，但键的正确性不该依赖这个偶然条件——阶段 2 计划开
+    跨进程复用，届时同一目录下两个 data_version 会直接读到彼此的快照。
+    """
+    trade_date = date(2024, 3, 1)
+    universe = _one_stock_universe(name="A")
+    left = ValidationFactorCache.from_groups(
+        data_version="data-a",
+        trade_dates=(trade_date,),
+        bar_groups={},
+    )
+    right = ValidationFactorCache.from_groups(
+        data_version="data-b",
+        trade_dates=(trade_date,),
+        bar_groups={},
+    )
+
+    # 两个 cache 各有自己的临时目录，所以只比文件名。
+    assert (
+        left._base_path(trade_date, "same-hash", universe=universe).name
+        != right._base_path(trade_date, "same-hash", universe=universe).name
+    ), "两个 data_version 生成了同一个 base 快照文件名"
+
+
+def test_evidence_layer_is_not_collapsed_by_the_narrowed_base_key():
+    """证据层若跟着 base 键收窄，两套 v2 参数会共用同一份冻结证据。
+
+    这两个 config 只差 `bottom_divergence_v2_sync_window`，它不在
+    `BASE_FACTOR_CONFIG_FIELDS` 里（base pass 强制关闭 v2，它确实不影响
+    base 快照），但它决定 v2 证据的取值。因此 base 快照只算一次，
+    而冻结证据必须各算一次。
+
+    误伤形态取决于把三处证据键（`config_hash=base_hash`）改成
+    `base_snapshot_hash` 的范围：只改 `_temporary_frozen_key` 那一处时，
+    第二次调用会复用第一次冻结的证据，随后在 `evaluate_frozen_evidence`
+    抛 `ValueError("frozen causal evidence parameter mismatch")`；三处全改
+    才会安静地退化成 `frozen_evidence_builds == 1`。两种都算捕获成功。
+    """
+    groups = {"000001": _bars("000001")}
+    trade_date = groups["000001"].iloc[-2]["date"]
+    universe = pd.DataFrame([{"code": "000001", "name": "A"}])
+    cache = ValidationFactorCache.from_groups(
+        data_version="data-a",
+        trade_dates=(trade_date,),
+        bar_groups=groups,
+    )
+
+    for sync_window in (3, 9):
+        cache.build_factor_snapshot(
+            config=Config(
+                bottom_divergence_v2_enabled=True,
+                bottom_divergence_v2_sync_window=sync_window,
+            ),
+            universe=universe,
+            trade_date=trade_date,
+        )
+
+    assert cache.stats["frozen_evidence_builds"] == 2, (
+        "两套 v2 参数共用了同一份冻结证据，证据层缓存键被收窄了"
+    )
+    assert cache.stats["base_snapshot_builds"] == 1, (
+        "sync_window 不影响 base 快照，两次调用应共用同一份 base 缓存"
+    )
 
 
 def test_cache_keys_isolate_data_candidate_asof_algorithm_and_parameter():
