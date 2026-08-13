@@ -677,7 +677,62 @@ class TushareFetcher(BaseFetcher):
             logger.warning(f"Tushare 获取股票列表失败: {e}")
         
         return None
-    
+
+    def get_stock_lifecycle(self, list_status: str = 'L') -> Optional[pd.DataFrame]:
+        """
+        获取带上市/退市日期的股票基础信息
+
+        与 get_stock_list 的区别是**可以按 list_status 取到非在市证券**：
+        'D'（已退市）与 'P'（暂停上市）是消除幸存者偏差的关键样本，
+        只取默认的 'L' 等于把退市股整批丢掉。
+
+        必须走 _call_api_with_rate_limit：新建 ts.pro_api() 会绕过
+        _patch_api_endpoint 对 query 的端点重定向，落回 api.waditu.com 的 503，
+        表现为静默返回空 DataFrame；限频计数也会一起失效。
+
+        **「抓取失败」与「确实没有」必须可区分**：空结果一并折叠成 None 时，
+        调用方只能把两者按同一种情况处理。而 'P'（暂停上市）在现行退市规则下
+        已基本不再使用，全市场返回 0 行是合法结果——按失败处理会让同批已经抓
+        成功的状态一起作废。限频不受影响：tushare 客户端对限频是抛异常
+        （`抱歉，您访问接口(stock_basic)频率超限` / `您每小时最多访问该接口1次`），
+        走下面的 except 分支，照旧返回 None。
+
+        Args:
+            list_status: L=上市 D=退市 P=暂停上市
+
+        Returns:
+            原始 DataFrame（含 ts_code / list_date / delist_date / list_status）。
+            None 表示**抓取失败**（Token 未配置或调用抛异常）；空 DataFrame 表示
+            抓取成功但数据源在该状态下确实没有证券。
+        """
+        if self._api is None:
+            logger.warning("Tushare API 未初始化，无法获取股票生命周期信息")
+            return None
+
+        try:
+            df = self._call_api_with_rate_limit(
+                "stock_basic",
+                exchange='',
+                list_status=list_status,
+                fields='ts_code,symbol,name,list_date,delist_date,list_status,market',
+            )
+        except Exception as e:
+            logger.warning(f"Tushare 获取股票生命周期失败 (list_status={list_status}): {e}")
+            return None
+
+        if df is None:
+            logger.warning(f"Tushare 股票生命周期无返回: list_status={list_status}")
+            return None
+
+        if df.empty:
+            logger.warning(f"Tushare 股票生命周期返回为空: list_status={list_status}")
+            return df
+
+        logger.info(
+            f"Tushare 获取股票生命周期成功: list_status={list_status}, {len(df)} 条"
+        )
+        return df
+
     def get_realtime_quote(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
         """
         获取实时行情

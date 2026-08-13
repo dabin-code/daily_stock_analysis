@@ -10,6 +10,9 @@ import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest.mock import call, patch
+
+import pandas as pd
 
 from src.config import Config
 from src.storage import DatabaseManager
@@ -458,6 +461,314 @@ class ListingLifecycleSyncTestCase(_TempDatabaseTestCase):
 
         with self.assertRaises(RuntimeError):
             ListingLifecycleService().sync_from_baostock()
+
+
+def _lifecycle_frame(rows) -> "pd.DataFrame":
+    """按 tushare stock_basic 的字段顺序造 DataFrame。
+
+    列名与 get_stock_lifecycle 请求的 fields 一致；缺列的假数据会让映射测试
+    在字段改名时仍然通过，等于把回归防线漏掉。
+    """
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "ts_code", "symbol", "name", "list_date",
+            "delist_date", "list_status", "market",
+        ],
+    )
+
+
+class _FakeTushareFetcher:
+    """只实现 sync_from_tushare 用到的 get_stock_lifecycle。
+
+    通过 fetcher= 注入，比往 sys.modules 里塞假 tushare 模块直接：待验证的是
+    服务层的多状态编排与原子写，不是 SDK 的初始化路径。
+    """
+
+    def __init__(self, frames, failures=None):
+        self._frames = dict(frames)
+        self._failures = dict(failures or {})
+        self.calls = []
+
+    def get_stock_lifecycle(self, list_status="L"):
+        self.calls.append(list_status)
+        if list_status in self._failures:
+            raise self._failures[list_status]
+        # 预置里没有的状态一律当抓取失败（返回 None），对应上游限频/无权限
+        return self._frames.get(list_status)
+
+
+class ListingLifecycleTushareSyncTestCase(_TempDatabaseTestCase):
+    """sync_from_tushare 的多状态编排、原子写与字段映射，全部离线跑。"""
+
+    LISTED = [["600000.SH", "600000", "浦发银行", "19991110", float("nan"), "L", "主板"]]
+    DELISTED_ROWS = [["000033.SZ", "000033", "新都退", "19940103", "20160526", "D", "主板"]]
+    SUSPENDED = [["000029.SZ", "000029", "深深房A", "19931015", float("nan"), "P", "主板"]]
+
+    def setUp(self) -> None:
+        self._db_path = self._prepare_temp_db()
+        DatabaseManager.get_instance()
+
+    def _service(self):
+        from src.services.listing_lifecycle_service import ListingLifecycleService
+
+        return ListingLifecycleService()
+
+    def _row_count(self) -> int:
+        conn = sqlite3.connect(self._db_path)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM instrument_master").fetchone()[0]
+        finally:
+            conn.close()
+
+    def _full_fetcher(self) -> _FakeTushareFetcher:
+        return _FakeTushareFetcher({
+            "L": _lifecycle_frame(self.LISTED),
+            "D": _lifecycle_frame(self.DELISTED_ROWS),
+            "P": _lifecycle_frame(self.SUSPENDED),
+        })
+
+    def test_sync_covers_listed_delisted_and_suspended(self) -> None:
+        """默认必须把 L / D / P 三种状态都拉一遍。
+
+        只拉 L 等于把 2018 上市、2021 退市的股票整批丢掉，幸存者偏差原地复发，
+        而这正是这个服务存在的理由。
+        """
+        fetcher = self._full_fetcher()
+        svc = self._service()
+
+        stats = svc.sync_from_tushare(fetcher=fetcher)
+
+        self.assertEqual(fetcher.calls, ["L", "D", "P"])
+        self.assertEqual(stats, {"written": 3, "total": 3, "delisted": 1})
+
+        rows = svc.get_lifecycle(["600000", "000033", "000029"])
+        self.assertEqual(set(rows), {"600000", "000033", "000029"})
+        self.assertEqual(rows["600000"]["list_date"], date(1999, 11, 10))
+        self.assertIsNone(rows["600000"]["delist_date"])
+        self.assertEqual(rows["600000"]["listing_status"], "active")
+        self.assertEqual(rows["600000"]["name"], "浦发银行")
+        self.assertEqual(rows["000033"]["list_date"], date(1994, 1, 3))
+        self.assertEqual(rows["000033"]["delist_date"], date(2016, 5, 26))
+        self.assertEqual(rows["000033"]["listing_status"], "delisted")
+
+    def test_sync_writes_nothing_when_any_status_fails(self) -> None:
+        """任一状态失败必须整批不写。
+
+        分状态边拉边写的话，'D' 失败会留下一个「只有在市股票」的库：它看起来
+        同步成功，实际上带着幸存者偏差，比直接失败更难发现。把 upsert 挪进
+        循环，这条用例必须红。
+        """
+        fetcher = _FakeTushareFetcher({"L": _lifecycle_frame(self.LISTED)})
+        svc = self._service()
+
+        with self.assertRaises(RuntimeError) as ctx:
+            svc.sync_from_tushare(fetcher=fetcher)
+
+        self.assertIn("D", str(ctx.exception))
+        self.assertEqual(self._row_count(), 0, "任一状态失败时 instrument_master 必须一行都没有")
+
+    def test_sync_writes_nothing_when_fetch_raises(self) -> None:
+        """抓取抛异常同样是整批不写，且错误信息要点明是哪个状态。"""
+        fetcher = _FakeTushareFetcher(
+            {"L": _lifecycle_frame(self.LISTED)},
+            failures={"D": RuntimeError("抱歉，您每小时最多访问该接口1次")},
+        )
+        svc = self._service()
+
+        with self.assertRaises(RuntimeError) as ctx:
+            svc.sync_from_tushare(fetcher=fetcher)
+
+        self.assertIn("D", str(ctx.exception))
+        self.assertEqual(self._row_count(), 0)
+
+    def test_sync_writes_nothing_when_status_returns_empty_frame(self) -> None:
+        """'D' 返回空 DataFrame 算失败：全市场不可能一只退市股都没有。"""
+        fetcher = _FakeTushareFetcher({
+            "L": _lifecycle_frame(self.LISTED),
+            "D": _lifecycle_frame([]),
+        })
+        svc = self._service()
+
+        with self.assertRaises(RuntimeError):
+            svc.sync_from_tushare(fetcher=fetcher, list_statuses=("L", "D"))
+
+        self.assertEqual(self._row_count(), 0)
+
+    def test_sync_writes_nothing_when_listed_status_is_empty(self) -> None:
+        """'L' 返回空 DataFrame 同样算失败：全市场不可能一只在市股都没有。"""
+        fetcher = _FakeTushareFetcher({
+            "L": _lifecycle_frame([]),
+            "D": _lifecycle_frame(self.DELISTED_ROWS),
+        })
+        svc = self._service()
+
+        with self.assertRaises(RuntimeError) as ctx:
+            svc.sync_from_tushare(fetcher=fetcher, list_statuses=("L", "D"))
+
+        self.assertIn("L", str(ctx.exception))
+        self.assertEqual(self._row_count(), 0)
+
+    def test_sync_tolerates_legitimately_empty_suspended_status(self) -> None:
+        """'P' 返回空 DataFrame 不算失败，L / D 的成果必须照常落库。
+
+        现行退市规则下「暂停上市」已基本不再使用，'P' 返回 0 行是合法结果。
+        把它当失败会把两个已经抓成功的状态一起作废，而 stock_basic 免费额度约
+        每小时 1 次：操作员烧掉三个额度窗口、一个字没写，还会收到一条把原因
+        指向限频的错误信息。
+        """
+        fetcher = _FakeTushareFetcher({
+            "L": _lifecycle_frame(self.LISTED),
+            "D": _lifecycle_frame(self.DELISTED_ROWS),
+            "P": _lifecycle_frame([]),
+        })
+        svc = self._service()
+
+        stats = svc.sync_from_tushare(fetcher=fetcher)
+
+        self.assertEqual(fetcher.calls, ["L", "D", "P"])
+        self.assertEqual(stats, {"written": 2, "total": 2, "delisted": 1})
+        self.assertEqual(self._row_count(), 2)
+
+        rows = svc.get_lifecycle(["600000", "000033"])
+        self.assertEqual(set(rows), {"600000", "000033"})
+        self.assertEqual(rows["600000"]["list_date"], date(1999, 11, 10))
+        self.assertEqual(rows["600000"]["listing_status"], "active")
+        self.assertEqual(rows["000033"]["delist_date"], date(2016, 5, 26))
+        self.assertEqual(rows["000033"]["listing_status"], "delisted")
+
+    def test_sync_writes_nothing_when_suspended_fetch_fails(self) -> None:
+        """'P' 抓取失败（None）仍然是致命的，只有确实为空才容忍。
+
+        这两种情况正是本修复要区分的：None 说明这次抓取没拿到答案，继续写库
+        等于把「暂停上市股一只都没拉到」当成「一只都不存在」，退市样本再次
+        出现无声缺口。
+        """
+        fetcher = _FakeTushareFetcher({
+            "L": _lifecycle_frame(self.LISTED),
+            "D": _lifecycle_frame(self.DELISTED_ROWS),
+        })
+        svc = self._service()
+
+        with self.assertRaises(RuntimeError) as ctx:
+            svc.sync_from_tushare(fetcher=fetcher)
+
+        self.assertIn("P", str(ctx.exception))
+        self.assertEqual(self._row_count(), 0)
+
+    def test_sync_rejects_empty_list_statuses(self) -> None:
+        """状态列表为空必须报错，不能返回 written=0 假装同步成功。
+
+        「什么都没拉却报成功」与「空结果当失败」是同一类缺陷：调用方拿不到
+        真实结论。
+        """
+        svc = self._service()
+
+        with self.assertRaises(ValueError):
+            svc.sync_from_tushare(fetcher=self._full_fetcher(), list_statuses=())
+        with self.assertRaises(ValueError):
+            svc.sync_from_tushare(fetcher=self._full_fetcher(), list_statuses=None)
+
+        self.assertEqual(self._row_count(), 0)
+
+    def test_nan_delist_date_becomes_none_not_a_bogus_date(self) -> None:
+        """pandas 的 NaN 必须落成 NULL。
+
+        状态刻意取 'D'，绕开「在市清空 delist_date」那条分支：这样断言到的
+        NULL 只能来自日期解析本身，float('nan') 变成 'nan' 字符串或某个编造
+        日期都会被这条用例挡住。
+        """
+        fetcher = _FakeTushareFetcher({
+            "D": _lifecycle_frame(
+                [["000033.SZ", "000033", "新都退", "19940103", float("nan"), "D", "主板"]]
+            ),
+        })
+        svc = self._service()
+
+        svc.sync_from_tushare(fetcher=fetcher, list_statuses=("D",))
+
+        row = svc.get_lifecycle(["000033"])["000033"]
+        self.assertIsNone(row["delist_date"])
+        self.assertEqual(row["listing_status"], "delisted")
+
+    def test_suspended_is_active_and_only_d_is_delisted(self) -> None:
+        """'P'（暂停上市）仍在市，不能当退市处理。"""
+        svc = self._service()
+
+        svc.sync_from_tushare(
+            fetcher=_FakeTushareFetcher({"P": _lifecycle_frame(self.SUSPENDED)}),
+            list_statuses=("P",),
+        )
+        svc.sync_from_tushare(
+            fetcher=_FakeTushareFetcher({"D": _lifecycle_frame(self.DELISTED_ROWS)}),
+            list_statuses=("D",),
+        )
+
+        rows = svc.get_lifecycle(["000029", "000033"])
+        self.assertEqual(rows["000029"]["listing_status"], "active")
+        self.assertEqual(rows["000033"]["listing_status"], "delisted")
+
+    def test_pause_seconds_sleeps_only_between_status_fetches(self) -> None:
+        """免费额度下 stock_basic 约每小时 1 次，状态之间要能拉开间隔。
+
+        次数钉成 len(list_statuses) - 1：首次抓取前和最后一次抓取后都不该等，
+        否则操作员每跑一次同步就白等一个间隔。
+        """
+        fetcher = self._full_fetcher()
+        svc = self._service()
+
+        with patch("src.services.listing_lifecycle_service.time.sleep") as sleep_mock:
+            svc.sync_from_tushare(fetcher=fetcher, pause_seconds=1.5)
+
+        self.assertEqual(sleep_mock.call_args_list, [call(1.5), call(1.5)])
+
+    def test_sync_skips_rows_with_unusable_code(self) -> None:
+        """代码归一后为空的行直接跳过，不能写出无代码的行。"""
+        fetcher = _FakeTushareFetcher({
+            "L": _lifecycle_frame([
+                ["600000.SH", "600000", "浦发银行", "19991110", float("nan"), "L", "主板"],
+                ["", "", "未知", "19991110", float("nan"), "L", "主板"],
+            ]),
+        })
+        svc = self._service()
+
+        stats = svc.sync_from_tushare(fetcher=fetcher, list_statuses=("L",))
+
+        self.assertEqual(stats["total"], 1)
+        self.assertEqual(self._row_count(), 1)
+
+
+class TushareLifecycleHelpersTestCase(unittest.TestCase):
+    """模块级辅助函数：代码归一与日期解析。不需要数据库。"""
+
+    def test_normalize_tushare_code_strips_suffix(self) -> None:
+        from src.services.listing_lifecycle_service import (
+            _normalize_baostock_code,
+            _normalize_tushare_code,
+        )
+
+        self.assertEqual(_normalize_tushare_code("600000.SH"), "600000")
+        self.assertEqual(_normalize_tushare_code("000001.SZ"), "000001")
+        self.assertEqual(_normalize_tushare_code("920748.BJ"), "920748")
+        self.assertEqual(_normalize_tushare_code(""), "")
+        self.assertEqual(_normalize_tushare_code(None), "")
+
+        # 点号方向相反：baostock 是 sh.600000（交易所在点号前），tushare 是
+        # 600000.SH（交易所在点号后）。复用 baostock 那支会取到 'SH'，回填出
+        # 一批名叫 SH/SZ 的孤儿行。
+        self.assertEqual(_normalize_baostock_code("600000.SH"), "SH")
+
+    def test_as_date_parses_both_compact_and_iso(self) -> None:
+        from src.services.listing_lifecycle_service import _as_date
+
+        self.assertEqual(_as_date("19910403"), date(1991, 4, 3))
+        # baostock 的 ISO 形式必须继续可解析
+        self.assertEqual(_as_date("1991-04-03"), date(1991, 4, 3))
+        self.assertEqual(_as_date("1991-04-03 00:00:00"), date(1991, 4, 3))
+        self.assertIsNone(_as_date(""))
+        self.assertIsNone(_as_date(None))
+        self.assertIsNone(_as_date(float("nan")))
+        self.assertIsNone(_as_date("19911345"))
 
 
 if __name__ == "__main__":

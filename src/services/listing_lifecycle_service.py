@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -20,6 +21,12 @@ logger = logging.getLogger(__name__)
 
 ACTIVE = "active"
 DELISTED = "delisted"
+
+# 这些上市状态在全市场范围内不可能一只都没有，返回 0 行只会是抓取出了问题，
+# 必须按失败处理。'P'（暂停上市）刻意不在其中：现行退市规则下该状态已基本不
+# 再使用，返回 0 行是合法结果，按失败处理会把同批已经抓成功的 L / D 一起作废
+# ——而 stock_basic 免费额度约每小时 1 次，代价是三个额度窗口换来零写入。
+NON_EMPTY_LIST_STATUSES = frozenset({"L", "D"})
 
 
 class ListingLifecycleService:
@@ -195,6 +202,132 @@ class ListingLifecycleService:
         )
         return {"written": written, "total": len(rows), "delisted": delisted}
 
+    def sync_from_tushare(
+        self,
+        fetcher: Any = None,
+        list_statuses: Sequence[str] = ("L", "D", "P"),
+        pause_seconds: float = 0.0,
+    ) -> Dict[str, int]:
+        """tushare stock_basic 全量拉取上市/退市日期，baostock 不可用时的替代路径。
+
+        **必须逐个 list_status 拉一遍**：stock_basic 的 list_status 默认只给 'L'，
+        只拉在市清单等于把这个服务存在的理由（消除幸存者偏差）当场作废。
+        'P' 是暂停上市，仍然在市，不能按退市处理。
+
+        **全部拉完才写一次**：任何一个状态失败就抛错、一个字都不写。分状态边拉
+        边写的话，'D' 失败会留下一个「只有在市股票」的库——它看起来同步成功，
+        实际上带着幸存者偏差，比直接失败更难发现。
+
+        **空结果与抓取失败分开判定**：取数返回 None 一律致命（这次抓取没拿到
+        答案）；返回空 DataFrame 只对 NON_EMPTY_LIST_STATUSES 内的状态致命，
+        其余状态记一条告警后继续下一个状态。
+
+        pause_seconds 只在状态之间等待：免费额度下 stock_basic 约每小时 1 次
+        （`抱歉，您每小时最多访问该接口1次`）。等待与重试策略归调用脚本，这里
+        不内建重试循环，否则操作员无法控制一次同步会挂多久。
+
+        Args:
+            fetcher: 注入的取数对象，缺省在方法内构造 TushareFetcher
+            list_statuses: 要拉取的上市状态，缺省覆盖在市/退市/暂停上市
+            pause_seconds: 相邻两次状态抓取之间的等待秒数
+
+        Raises:
+            ValueError: list_statuses 为空
+            RuntimeError: 任一状态抓取失败，或不可为空的状态返回了 0 行
+
+        Returns:
+            {"written": 写入行数, "total": 映射后总行数, "delisted": 退市行数}
+        """
+        statuses = tuple(list_statuses or ())
+        if not statuses:
+            # 一个状态都不拉却返回 written=0，调用方会当成同步成功，
+            # 与「空结果当失败」是同一类缺陷：拿不到真实结论。
+            raise ValueError("sync_from_tushare requires at least one list_status")
+
+        if fetcher is None:
+            # 与 sync_from_baostock 的 `import baostock as bs` 同一取法：在方法内
+            # 导入，避免服务模块被引入时就拖上数据源依赖。
+            from data_provider.tushare_fetcher import TushareFetcher
+
+            fetcher = TushareFetcher()
+
+        rows: List[Dict[str, Any]] = []
+        for index, status in enumerate(statuses):
+            if index > 0:
+                time.sleep(pause_seconds)
+
+            try:
+                frame = fetcher.get_stock_lifecycle(list_status=status)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"tushare stock_basic failed for list_status={status}: {exc}"
+                ) from exc
+
+            if frame is None:
+                # 取数层用 None 表示这次抓取失败（限频、无权限、Token 缺失）。
+                raise RuntimeError(
+                    f"tushare stock_basic fetch failed for list_status={status}"
+                )
+
+            if frame.empty:
+                if str(status).strip().upper() in NON_EMPTY_LIST_STATUSES:
+                    raise RuntimeError(
+                        f"tushare stock_basic returned no rows for list_status={status}"
+                    )
+                logger.warning(
+                    "tushare stock_basic returned no rows for list_status=%s, "
+                    "treated as legitimately empty",
+                    status,
+                )
+                continue
+
+            for record in frame.to_dict("records"):
+                code = _normalize_tushare_code(record.get("ts_code"))
+                if not code:
+                    continue
+                raw_name = record.get("name")
+                # pandas 缺失值是 float('nan')，str() 会得到 'nan' 这种假名字
+                name = raw_name.strip() if isinstance(raw_name, str) else ""
+                rows.append({
+                    "code": code,
+                    "name": name or code,
+                    "list_date": _as_date(record.get("list_date")),
+                    "delist_date": _as_date(record.get("delist_date")),
+                    "listing_status": (
+                        DELISTED
+                        if str(record.get("list_status") or "").strip().upper() == "D"
+                        else ACTIVE
+                    ),
+                })
+
+        written = self.upsert_lifecycle(rows)
+        delisted = sum(1 for r in rows if r["listing_status"] == DELISTED)
+        logger.info(
+            "tushare listing lifecycle synced: total=%d written=%d delisted=%d",
+            len(rows),
+            written,
+            delisted,
+        )
+        return {"written": written, "total": len(rows), "delisted": delisted}
+
+
+def _normalize_tushare_code(value: Any) -> str:
+    """`600000.SH` / `000001.SZ` → 仓库统一的 `600000` / `000001`。
+
+    **不能复用 `_normalize_baostock_code`**：两家的点号方向是反的。baostock 给
+    `sh.600000`（交易所在点号前）所以取 `split('.')[1]`；tushare 给 `600000.SH`
+    （交易所在点号后），同一句会取到 `SH`，而 `normalize_stock_code('SH')` 原样
+    返回，结果是回填出一批名叫 SH / SZ 的孤儿行。剥后缀的取法与
+    `data_provider/tushare_fetcher.py:665` 一致，再交给 `normalize_stock_code`
+    做最终归一（北交所 `920748.BJ` 也走同一条路）。
+    """
+    from data_provider.base import normalize_stock_code
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return normalize_stock_code(text.split('.')[0]).strip().upper()
+
 
 def _normalize_baostock_code(value: Any) -> str:
     """`sh.600000` / `sz.000001` → 仓库统一的 `600000` / `000001`。
@@ -215,15 +348,29 @@ def _normalize_baostock_code(value: Any) -> str:
 
 
 def _as_date(value: Any) -> Optional[date]:
-    """空串、None、非法日期统一返回 None——缺失比编造一个日期安全。"""
+    """空串、None、非法日期统一返回 None——缺失比编造一个日期安全。
+
+    两种源格式都要认：baostock 的 `1991-04-03` 与 tushare 的 `19910403`。
+    紧凑形式**必须显式解析**，不能指望 `date.fromisoformat`——它只在 3.11+ 才
+    接受无分隔符形式，而 README 声明支持 3.10+，靠它等于让回填结果随解释器
+    版本漂移（3.10 上整批上市日期会静默变成 NULL）。
+
+    NaN 单独拦一道：tushare 对在市股票的 delist_date 给的是 float('nan')，
+    走到通用分支会被 str() 变成 'nan' 并逐股打一条 WARNING，全市场同步下是
+    几千行噪声，真正解析失败的日期会被埋掉。
+    """
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
         return value
+    if isinstance(value, float) and value != value:
+        return None
     text = str(value or "").strip()
     if not text:
         return None
     try:
+        if len(text) == 8 and text.isdigit():
+            return datetime.strptime(text, "%Y%m%d").date()
         return date.fromisoformat(text[:10])
     except ValueError:
         logger.warning("unparsable date from source: %r", value)
