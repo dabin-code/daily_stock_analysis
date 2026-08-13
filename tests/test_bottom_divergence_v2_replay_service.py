@@ -176,6 +176,33 @@ def test_content_hash_changes_when_cost_config_changes(tmp_path) -> None:
     source._engine.dispose()
 
 
+def test_content_hash_changes_when_only_pre_close_changes(tmp_path) -> None:
+    """`pre_close` 变了就是另一份数据集，哪怕 OHLCV 一模一样。
+
+    自 gate-3 起 `pre_close` 决定复权链，进而决定回测看到的每一个价格
+    （`src/services/adjustment_chain.py`）。它不进内容哈希的话，两份复权
+    结果完全不同的数据集会共用同一个 data_version，冻结证据与 base 快照缓存
+    会跨数据集复用——是算错，不是算慢。
+    """
+    source = _database(tmp_path / "source.db")
+    start = _seed_source(source)
+    config = Config(backtest_buy_cost_bps=1.0)
+    first, _, _ = _copy_version(source, start, config)
+
+    with source.get_session() as session:
+        bar = session.execute(
+            select(StockDaily).where(
+                StockDaily.date == start + timedelta(days=7)
+            )
+        ).scalar_one()
+        bar.pre_close = float(bar.close) / 2.0
+        session.commit()
+    mutated, _, _ = _copy_version(source, start, config)
+
+    assert mutated != first
+    source._engine.dispose()
+
+
 def _add_board_membership(
     manager: DatabaseManager,
     *,

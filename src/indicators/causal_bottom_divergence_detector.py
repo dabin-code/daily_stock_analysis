@@ -64,9 +64,20 @@ _MAJOR_NON_ACTIONABLE_STAGES = {
     "below_r2": "breakout_failed",
     "price_below_major_zone": "breakout_failed",
 }
+# 只收可信段的标记。``pre_close_chain`` 由 ``src/services/adjustment_chain.py`` 在读取时
+# 写入，代表这一段价格已经按 f(t)=f(t-1)*close(t-1)/pre_close(t) 施加过复权。
+#
+# ``pre_close_chain_anomalous`` **绝不能**进来：它标的是被切段作废、**没有**施加复权的行，
+# 放进白名单等于让一段带除权跳空的原始价顶着可信标记穿过门禁——正是本门禁要挡的那件事。
+#
+# 这份清单在 `factor_service._bottom_divergence_v2_metadata` 与
+# `strategies/bottom_divergence_layered_entry` 各有一份同义副本，三份必须一致：
+# 漏改实盘那份的后果是「回测放行、实盘拒绝」。`tests/test_adjustment_trust_whitelist.py`
+# 钉住三份相等。
 _TRUSTED_ADJUSTMENT_SOURCES = {
     "tushare_native",
     "akshare_qfq_div_raw",
+    "pre_close_chain",
 }
 
 _date_at = date_at_v2

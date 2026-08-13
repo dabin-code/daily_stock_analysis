@@ -892,6 +892,10 @@ def test_major_confirmation_controls_replay_sample_and_event_evidence(
         __import__("types").SimpleNamespace(
             date=signal_date + timedelta(days=index),
             close=44.0,
+            # 首根接回信号日收盘（factor["close"] = 43.27），其余与前一日收盘
+            # 相等：窗口内无除权，复权因子恒为 1，这批 bar 的作用是钉样本与
+            # 事件证据，不该顺带引入价格缩放。缺这一列会让前瞻窗口整段作废。
+            pre_close=43.27 if index == 1 else 44.0,
             high=45.0,
             low=42.0,
             amount=10_000_000.0,

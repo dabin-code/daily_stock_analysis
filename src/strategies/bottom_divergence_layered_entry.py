@@ -17,9 +17,14 @@ from src.indicators.resistance_zone_detector import (
 )
 
 
+# 实盘侧的信任白名单（`_has_trusted_adjustment` 用它决定是否允许执行）。
+# 必须与 `causal_bottom_divergence_detector` / `factor_service` 的两份保持一致：
+# 只加 `pre_close_chain`（读取时已施加复权的可信段），不加 `pre_close_chain_anomalous`
+# （被切段作废、未施加复权）。漏改这份即「回测放行、实盘拒绝」。
 _TRUSTED_ADJUSTMENT_SOURCES = frozenset({
     "tushare_native",
     "akshare_qfq_div_raw",
+    "pre_close_chain",
 })
 _UNSAFE_DATA_SOURCE_MARKERS = frozenset({
     "unknown",

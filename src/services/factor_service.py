@@ -29,6 +29,7 @@ from src.indicators.resistance_zone_detector import (
     ResistanceZoneParams,
 )
 from src.indicators.shrink_pullback_detector import ShrinkPullbackDetector
+from src.services.adjustment_chain import apply_read_adjustment
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +134,10 @@ class FactorService:
                     "volume": row.volume,
                     "amount": row.amount,
                     "pct_chg": row.pct_chg,
+                    # 复权链的唯一依据。日常同步的列清单保住了它
+                    # （`market_data_sync_service.py:360-369`），
+                    # `scripts/validate_staging_before_promotion.py` 守着它。
+                    "pre_close": row.pre_close,
                     "data_source": row.data_source,
                     "adj_factor": row.adj_factor,
                     "adj_factor_source": row.adj_factor_source,
@@ -162,7 +167,17 @@ class FactorService:
         trade_date: date,
         persist: bool = False,
     ) -> pd.DataFrame:
-        """Build an identical snapshot from preloaded, date-bounded bars."""
+        """Build an identical snapshot from preloaded, date-bounded bars.
+
+        复权在这里施加，而不是在 `build_factor_snapshot` 取完数之后：本方法有
+        三个调用方（生产取数、回测串行分支、回测多进程分支
+        `bottom_divergence_v2_performance.py:134-155` 与 `:629-637`），只在
+        生产入口施加会得到「实盘复权、回测不复权」的两套口径。放在这里是把
+        约束变成结构性的——任何调用方都绕不过去。
+
+        回测侧的窗口在 `ValidationFactorCache._window` 已经施加过，这里靠
+        `is_adjusted` 识别并跳过，不会二次施加把因子平方。
+        """
         snapshots = []
         universe_map = universe_df.set_index("code").to_dict("index")
         for code in sorted(bar_groups):
@@ -174,6 +189,11 @@ class FactorService:
             latest_trade_date = pd.to_datetime(group.iloc[-1]["date"]).date()
             if latest_trade_date != trade_date:
                 continue
+
+            # 必须在末行日期核对之后：施加时按窗口末行归一，末行不是
+            # trade_date 的 group 会被下面丢弃，提前施加等于按错误的锚算一遍。
+            if self.config.adj_apply_on_read:
+                group = apply_read_adjustment(group)
 
             latest = group.iloc[-1]
             close_series = group["close"].astype(float)
@@ -974,9 +994,13 @@ class FactorService:
         group: pd.DataFrame,
     ) -> tuple[ResistanceZoneMetadata, bool]:
         """Build deterministic provenance metadata and adjustment safety state."""
+        # `pre_close_chain` 是 `adjustment_chain.apply_read_adjustment` 写下的可信段标记。
+        # 不收 `pre_close_chain_anomalous`：那是被切段作废、未施加复权的行。
+        # 三处白名单（本处 / 检测器 / Strategy E v2 实盘封装）必须一致。
         trusted_adjustment_sources = {
             "tushare_native",
             "akshare_qfq_div_raw",
+            "pre_close_chain",
         }
 
         def normalized_values(column: str) -> tuple[list[str], bool]:
@@ -1085,8 +1109,8 @@ class FactorService:
                 "invalid_config"
             ]
             return factors
-        metadata, _ = self._bottom_divergence_v2_metadata(
-            group
+        metadata, group_adjustment_unknown = (
+            self._bottom_divergence_v2_metadata(group)
         )
         detector_result = (
             CausalBottomDivergenceDetector.detect(
@@ -1133,7 +1157,25 @@ class FactorService:
             or metadata.adj_factor_source
             or ""
         ).strip().lower()
-        adjustment_unknown = candidate_adjustment_source == "unknown"
+        # 两级判定取「或」，不是取候选级覆盖整组级。
+        #
+        # `zone_metadata` 是检测器冻结到 A/B 前缀那一段的 provenance，只看
+        # `visible.iloc[a_idx:b_idx+1]`；而阻力区是在**整个可见窗口**上找摆动高点的。
+        # 复权链在窗口内断掉时，`apply_read_adjustment` 只作废断点之前的前缀，那段保留
+        # 原始价、标 `pre_close_chain_anomalous`。若断点落在 A 之前，前缀就不在
+        # `zone_metadata` 的取值范围里，候选级判定看不见它。
+        #
+        # 原写法 `zone_metadata.get(...) or metadata.adj_factor_source` 是**回落**而非
+        # 合取：候选级只要给出非空值，整组级的 unknown 就再也起不了作用，于是一段
+        # 部分复权的价格会顶着 `actionable` 出去。
+        #
+        # 这个洞在 `pre_close_chain` 进白名单之前是死的（没有任何来源被信任，整组必然
+        # unknown），是 Task 4 把它变活的——同 `_HASH_BAR_FIELDS` 漏 `pre_close`。
+        # 取「或」只会**增加** unknown，方向上永远是 fail-closed。
+        adjustment_unknown = (
+            group_adjustment_unknown
+            or candidate_adjustment_source == "unknown"
+        )
         early_event_index = early.get("bar_index")
         near_event_index = (
             near.get("cleared_confirmed") or {}

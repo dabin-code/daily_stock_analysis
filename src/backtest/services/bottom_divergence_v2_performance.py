@@ -23,6 +23,7 @@ from src.indicators.causal_bottom_divergence_detector import (
 from src.indicators.resistance_zone_detector import (
     ALGORITHM_VERSION as ZONE_ALGORITHM_VERSION,
 )
+from src.services.adjustment_chain import apply_read_adjustment
 
 from .bottom_divergence_v2_checkpoint import (  # noqa: F401
     DEFAULT_V1_STRATEGY_PATH,
@@ -53,6 +54,12 @@ FROZEN_EVIDENCE_ALGORITHM_VERSION = (
 # 只用于 base 快照。证据两层继续走 `_config_hash`：那两层的输出受
 # `bottom_divergence_v2_sync_window` 等字段影响，收窄会静默算错。
 BASE_FACTOR_CONFIG_FIELDS = frozenset({
+    # 读取时是否施加复权。开关一翻，`_window` 喂给 base pass 的价格与成交量
+    # 就换了一套口径，漏登记会让第二次调用读回第一次的 base 快照文件。
+    # 变异测试探不到它（那条测试直接调 `build_factor_snapshot_from_groups`，
+    # 绕开了 `_window`，而它的夹具没有 `pre_close` 列），所以由
+    # `test_adjustment_switch_changes_both_the_window_and_the_base_key` 守。
+    "adj_apply_on_read",
     "screening_factor_lookback_days",
     "screening_min_list_days",
     "screening_breakout_lookback_days",
@@ -559,7 +566,16 @@ class ValidationFactorCache:
         code: str,
         trade_date: date,
         lookback_days: int,
+        *,
+        adjust: bool = True,
     ) -> pd.DataFrame:
+        """回测侧唯一的取窗口，也是回测侧唯一的复权施加点。
+
+        复权必须落在这里而不是 `from_database`：后者一次性拉整段区间，结构上
+        不知道单个回放日 D，在那里归一只能除以晚于 D 的因子，等于把 D 之后的
+        分红信息带进 D，直接违反时点安全。这里切出来的窗口末行恰好就是 D，
+        而 base 快照与 v2 证据两层消费的都是它，一处施加两层同口径。
+        """
         frame = self._bar_groups.get(code)
         if frame is None:
             return pd.DataFrame()
@@ -568,7 +584,10 @@ class ValidationFactorCache:
         )
         end = pd.Timestamp(trade_date)
         mask = (frame["date"] >= start) & (frame["date"] <= end)
-        return frame.loc[mask].reset_index(drop=True)
+        window = frame.loc[mask].reset_index(drop=True)
+        if not adjust:
+            return window
+        return apply_read_adjustment(window)
 
     def build_factor_snapshot(
         self,
@@ -585,6 +604,7 @@ class ValidationFactorCache:
                 code,
                 trade_date,
                 config.screening_factor_lookback_days,
+                adjust=config.adj_apply_on_read,
             )
             for code in codes
         }

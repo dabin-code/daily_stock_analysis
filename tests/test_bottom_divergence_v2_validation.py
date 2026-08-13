@@ -2063,10 +2063,16 @@ class _FakeStockRepository:
                 "eval_window_days": eval_window_days,
             }
         )
+        # pre_close 与前一日收盘逐位相等 = 窗口内没有除权，复权因子恒为 1。
+        # 这批 bar 用来钉评估器的调用与取数，不该顺带引入价格缩放；缺这一列
+        # 则整个前瞻窗口按 fail-closed 丢弃，测的就不是原来那件事了。
+        # 首根前瞻 bar 的 pre_close 必须等于信号日收盘（100.0，见各用例的
+        # factor_snapshot），否则锚点到首根之间会被算出一次假除权。
         return [
             SimpleNamespace(
                 date=analysis_date + timedelta(days=index + 1),
                 close=101.0,
+                pre_close=100.0 if index == 0 else 101.0,
                 high=103.0,
                 low=99.0,
                 amount=1_000_000.0,
@@ -2078,6 +2084,7 @@ class _FakeStockRepository:
         return [
             SimpleNamespace(
                 close=100.0 + index,
+                pre_close=100.0 + max(index - 1, 0),
                 amount=1_000_000.0 + index,
             )
             for index in range(count)

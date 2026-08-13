@@ -702,6 +702,11 @@ class Config:
     # 「stock_daily 是不复权权威源」的设计冲突，且购买积分后会静默生效。
     # 默认关闭，待新复权体系（stock_daily_adj）就绪后本开关连同函数一并移除。
     tushare_qfq_enabled: bool = False
+    # 读取时按窗口现算后复权因子，并施加到 OHLC 与 volume
+    # （`src/services/adjustment_chain.py`，gate-3）。因子不落库，关掉即完全
+    # 回退到原始价读取，没有需要清理的数据。关掉会让检测器重新在带除权跳空的
+    # 价格上算阻力位，只在排查时用。
+    adj_apply_on_read: bool = True
     kline_governance_enabled: bool = False
     kline_governance_schedule_time: str = "17:00"
     kline_governance_run_immediately: bool = False
@@ -1416,6 +1421,7 @@ class Config:
             screening_market_guard_enabled=parse_env_bool(os.getenv('SCREENING_MARKET_GUARD_ENABLED'), default=True),
             screening_market_guard_index=os.getenv('SCREENING_MARKET_GUARD_INDEX', 'sh000001'),
             tushare_qfq_enabled=parse_env_bool(os.getenv('TUSHARE_QFQ_ENABLED'), default=False),
+            adj_apply_on_read=parse_env_bool(os.getenv('ADJ_APPLY_ON_READ'), default=True),
             kline_governance_enabled=parse_env_bool(os.getenv('KLINE_GOVERNANCE_ENABLED'), default=False),
             kline_governance_schedule_time=os.getenv('KLINE_GOVERNANCE_SCHEDULE_TIME', '17:00'),
             kline_governance_run_immediately=parse_env_bool(

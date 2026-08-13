@@ -73,6 +73,190 @@ class ReplayDependencies:
     stock_repository: Any
 
 
+# ── 前瞻 / 前置窗口的复权（gate-3 落点 2）──────────────────────────────
+#
+# `entry_close` 取自因子快照（已按 D 归一，因此等于 D 当日真实可成交价），而
+# `get_forward_bars` / `get_prior_bars` 走的是 `stock_repo.py` 的裸
+# `select(StockDaily)`，拿到的是**原始价**。两者混用的后果不是精度问题：前瞻
+# 窗口内一次除权就被算成亏损，1145 个送转事件会造成 33%~66% 的假亏损，而回测
+# 照常产出样本——「验收通过但数值全错」。
+#
+# 不改 `stock_repo.py`：那是共享仓储层，五层流水线（`backtest_service`）也在
+# 用它，在那里施加会把波及面扩到本计划之外。
+_ADJUSTABLE_BAR_FIELDS = (
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "pre_close",
+    "volume",
+    "amount",
+)
+
+
+def _bars_to_frame(
+    bars: Sequence[Any],
+    *,
+    leading: Optional[dict] = None,
+) -> Optional[Any]:
+    """把 bar 对象序列转成复权链要的窗口；缺 close/pre_close 时返回 None。
+
+    返回 None 表示「这批 bar 解算不出复权链」，调用方一律 fail-closed。
+    生产侧的 `StockDaily` 行 100% 带 `pre_close`，走到这个分支的只可能是
+    内存里构造的桩对象。
+
+    ``leading`` 是拼在最前面的锚点行，前瞻窗口用它把 D 接回序列。和
+    `pd.concat` 一个只有 close/pre_close 的单行 DataFrame 不同，这里让锚点
+    与 bar 走同一次 `DataFrame` 构造，列的 dtype 由整列共同决定。
+    """
+    import pandas as pd
+
+    records = []
+    if leading is not None:
+        records.append({
+            name: leading.get(name) for name in _ADJUSTABLE_BAR_FIELDS
+        })
+    for bar in bars:
+        if getattr(bar, "close", None) is None:
+            return None
+        if getattr(bar, "pre_close", None) is None:
+            return None
+        records.append({
+            name: getattr(bar, name, None)
+            for name in _ADJUSTABLE_BAR_FIELDS
+        })
+    frame = pd.DataFrame(records)
+    if frame["date"].isna().any():
+        # 日期缺失时不留空列：复权链只在该列存在时校验升序，留个全 NaT 的列
+        # 会让它把顺序正常的窗口判成乱序。
+        frame = frame.drop(columns=["date"])
+    else:
+        frame["date"] = pd.to_datetime(frame["date"])
+    return frame
+
+
+def _frame_to_bars(frame: Any) -> list[Any]:
+    """把复权后的窗口还原成 bar 对象。
+
+    只回填评估链路真正读的字段。`date` 还原成 `date` 而不是 `Timestamp`：
+    `future_trade_dates_20d` 会被成本模型按交易日比较。
+    """
+    import pandas as pd
+
+    def cell(record: dict, name: str) -> Any:
+        value = record.get(name)
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return None
+        return float(value)
+
+    bars = []
+    for record in frame.to_dict("records"):
+        raw_date = record.get("date")
+        bars.append(SimpleNamespace(
+            date=(
+                pd.Timestamp(raw_date).date()
+                if raw_date is not None and not pd.isna(raw_date)
+                else None
+            ),
+            open=cell(record, "open"),
+            high=cell(record, "high"),
+            low=cell(record, "low"),
+            close=cell(record, "close"),
+            pre_close=cell(record, "pre_close"),
+            volume=cell(record, "volume"),
+            amount=cell(record, "amount"),
+            adj_factor=cell(record, "adj_factor"),
+            adj_factor_source=record.get("adj_factor_source"),
+        ))
+    return bars
+
+
+def _all_trusted(frame: Any) -> bool:
+    from src.services.adjustment_chain import (
+        ADJ_FACTOR_SOURCE_COLUMN,
+        TRUSTED_SOURCE,
+    )
+
+    return bool((frame[ADJ_FACTOR_SOURCE_COLUMN] == TRUSTED_SOURCE).all())
+
+
+def _adjusted_forward_bars(
+    bars: Sequence[Any],
+    *,
+    signal_date: date,
+    anchor_close: float,
+    config: Config,
+) -> list[Any]:
+    """把前瞻 bar 复权到锚 D = ``signal_date``。
+
+    数学上要的是 ``g(t) = f(t)/f(D)``，而 D 本身不在前瞻窗口里
+    （`get_forward_bars` 取的是 ``date > analysis_date``）。缺的那一环是
+    ``ratio(D+1) = close(D)/pre_close(D+1)``，只需要 ``close(D)``——它就是
+    `entry_close`，因为因子快照已按 D 归一、``g(D) == 1``。
+
+    于是把 D 拼成序列首行交给 `apply_read_adjustment_from_anchor`，首行因子恒
+    为 1，入场价不动，除权日之后的 bar 被抬到同一尺度。
+
+    fail-closed 时返回空列表而不是原始 bar：跨过一处无法解释的价格跳变算出来
+    的收益是个错数，比「这个样本没有前瞻窗口」更糟。
+    """
+    from src.services.adjustment_chain import (
+        apply_read_adjustment_from_anchor,
+    )
+
+    ordered = list(bars)
+    if not config.adj_apply_on_read or not ordered:
+        return ordered
+    if not (math.isfinite(anchor_close) and anchor_close > 0.0):
+        return []
+    combined = _bars_to_frame(ordered, leading={
+        "date": signal_date,
+        "close": anchor_close,
+        # 首行的 pre_close 从不参与计算（`analyze_window` 的 ratio[0] 恒为
+        # 1），填 close 只是为了不给窗口留一个语义不明的空值。
+        "pre_close": anchor_close,
+    })
+    if combined is None:
+        return []
+    adjusted = apply_read_adjustment_from_anchor(combined)
+    if not _all_trusted(adjusted):
+        return []
+    return _frame_to_bars(adjusted.iloc[1:].reset_index(drop=True))
+
+
+def _adjusted_prior_bars(
+    bars: Sequence[Any],
+    *,
+    config: Config,
+) -> list[Any]:
+    """把信号日之前的 bar 复权，供 `compute_pre_signal_features` 使用。
+
+    这里按窗口**末行**归一，而不是像前瞻窗口那样接到 D 上，是因为拿不到
+    ``pre_close(D)``：前置窗口止于 ``signal_date - 1``，而因子快照只给
+    ``close(D)``。两种锚只差一个常数——
+    ``f(t)/f(D) = [f(t)/f(末行)] · [f(末行)/f(D)]``——
+    而这两个消费方都对常数免疫：波动率是收益率的标准差（比值里常数约掉），
+    流动性用 `amount`（复权模块按价×量守恒刻意不动它）。真正要修的是窗口
+    **内部**的除权跳空，那一段两种锚给出的结果逐位相同。
+
+    整窗 fail-closed：`apply_adjustment` 对被作废段按 1.0 原样保留，混着算
+    标准差会得到一个两种尺度拼出来的数，比没有更糟。
+    """
+    from src.services.adjustment_chain import apply_read_adjustment
+
+    ordered = list(bars)
+    if not config.adj_apply_on_read or not ordered:
+        return ordered
+    frame = _bars_to_frame(ordered)
+    if frame is None:
+        return []
+    adjusted = apply_read_adjustment(frame)
+    if not _all_trusted(adjusted):
+        return []
+    return _frame_to_bars(adjusted)
+
+
 def _parse_position_weight(trade_plan_json: Optional[str]) -> Optional[float]:
     if not trade_plan_json:
         return None
@@ -343,18 +527,28 @@ def _build_validation_sample(
         and math.isfinite(position_weight)
         and 0.0 < position_weight <= 1.0
     )
-    forward_bars = stock_repository.get_forward_bars(
-        code=candidate.code,
-        analysis_date=signal_date,
-        eval_window_days=20,
-    )
-    prior_bars = stock_repository.get_prior_bars(
-        code=candidate.code,
+    # entry_close 必须先算：它就是 close(D)（因子快照已按 D 归一，g(D)==1），
+    # 也是前瞻窗口接回 D 所缺的那一个数。
+    entry_close = float(factor.get("close") or 0.0)
+    forward_bars = _adjusted_forward_bars(
+        stock_repository.get_forward_bars(
+            code=candidate.code,
+            analysis_date=signal_date,
+            eval_window_days=20,
+        ),
         signal_date=signal_date,
-        count=20,
+        anchor_close=entry_close,
+        config=config,
+    )
+    prior_bars = _adjusted_prior_bars(
+        stock_repository.get_prior_bars(
+            code=candidate.code,
+            signal_date=signal_date,
+            count=20,
+        ),
+        config=config,
     )
     volatility, liquidity = compute_pre_signal_features(prior_bars)
-    entry_close = float(factor.get("close") or 0.0)
     closes = tuple(float(bar.close) for bar in forward_bars)
     highs = tuple(float(bar.high) for bar in forward_bars)
     lows = tuple(float(bar.low) for bar in forward_bars)

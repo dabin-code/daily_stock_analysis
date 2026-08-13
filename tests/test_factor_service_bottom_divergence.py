@@ -127,11 +127,21 @@ class TestFactorServiceBottomDivergence(unittest.TestCase):
         self.assertEqual(service.min_list_days, 234)
         self.assertEqual(service.breakout_lookback_days, 45)
 
-    def test_stock_daily_adjustment_metadata_reaches_group(self):
-        trade_date = date(2026, 8, 5)
+    @staticmethod
+    def _adjustment_metadata_rows(trade_date: date) -> list:
+        """20 根含除权的日线：第 10 根 10 送 10，pre_close 减半。"""
         rows = []
+        close = 10.0
         for index in range(20):
-            close = 10.0 + index * 0.1
+            previous_close = close
+            if index == 0:
+                pre_close = None
+            elif index == 10:
+                pre_close = previous_close / 2.0
+            else:
+                pre_close = previous_close
+            if index > 0:
+                close = (pre_close or previous_close) + 0.1
             rows.append(SimpleNamespace(
                 code="TEST001",
                 date=trade_date - timedelta(days=19 - index),
@@ -139,6 +149,7 @@ class TestFactorServiceBottomDivergence(unittest.TestCase):
                 high=close + 0.2,
                 low=close - 0.2,
                 close=close,
+                pre_close=pre_close,
                 volume=1000.0,
                 amount=close * 1000.0,
                 pct_chg=1.0,
@@ -146,7 +157,9 @@ class TestFactorServiceBottomDivergence(unittest.TestCase):
                 adj_factor=1.25,
                 adj_factor_source="known_b" if index % 2 else "known_a",
             ))
+        return rows
 
+    def _capture_snapshot_group(self, *, trade_date, rows, config):
         scalars = MagicMock()
         scalars.all.return_value = rows
         execution = MagicMock()
@@ -165,7 +178,7 @@ class TestFactorServiceBottomDivergence(unittest.TestCase):
             captured["group"] = group.copy()
             return {}
 
-        service = FactorService(db_manager=FakeDb(), config=Config())
+        service = FactorService(db_manager=FakeDb(), config=config)
         universe = pd.DataFrame([{
             "code": "TEST001",
             "name": "Test",
@@ -178,8 +191,20 @@ class TestFactorServiceBottomDivergence(unittest.TestCase):
             side_effect=capture_group,
         ), patch.object(service, "_enrich_base_scores"):
             service.build_factor_snapshot(universe, trade_date=trade_date)
+        return captured["group"]
 
-        group = captured["group"]
+    def test_stock_daily_adjustment_metadata_reaches_group_when_switch_off(self):
+        """`ADJ_APPLY_ON_READ=false` 时取数元数据必须逐字到达 group。
+
+        这是回滚路径的判据：关掉开关后 group 必须与接入复权之前完全一致。
+        """
+        trade_date = date(2026, 8, 5)
+        group = self._capture_snapshot_group(
+            trade_date=trade_date,
+            rows=self._adjustment_metadata_rows(trade_date),
+            config=Config(adj_apply_on_read=False),
+        )
+
         self.assertEqual(
             {"data_source", "adj_factor", "adj_factor_source"}.difference(group),
             set(),
@@ -187,6 +212,26 @@ class TestFactorServiceBottomDivergence(unittest.TestCase):
         self.assertEqual(set(group["data_source"]), {"source_a", "source_b"})
         self.assertEqual(set(group["adj_factor_source"]), {"known_a", "known_b"})
         self.assertTrue((group["adj_factor"] == 1.25).all())
+
+    def test_production_group_carries_the_recomputed_adjustment_chain(self):
+        """开关默认打开时，group 拿到的是现算的复权链而不是取数时的旧标记。
+
+        取数时的 `adj_factor_source`（这里是 known_a/known_b）必须被换掉：
+        留着它等于让一段刚被复权过的价格顶着旧口径的来源标记进下游门禁。
+        """
+        trade_date = date(2026, 8, 5)
+        group = self._capture_snapshot_group(
+            trade_date=trade_date,
+            rows=self._adjustment_metadata_rows(trade_date),
+            config=Config(),
+        )
+
+        self.assertEqual(set(group["data_source"]), {"source_a", "source_b"})
+        self.assertEqual(set(group["adj_factor_source"]), {"pre_close_chain"})
+        # 末行即 D，因子恒为 1；除权（第 10 根 10 送 10）之前的 bar 被折半。
+        self.assertAlmostEqual(float(group["adj_factor"].iloc[-1]), 1.0)
+        self.assertAlmostEqual(float(group["adj_factor"].iloc[0]), 0.5)
+        self.assertAlmostEqual(float(group["adj_factor"].iloc[10]), 1.0)
 
     @patch("src.services.factor_service.CausalBottomDivergenceDetector.detect")
     def test_v2_disabled_returns_stable_schema_without_detector_call(self, detect_mock):

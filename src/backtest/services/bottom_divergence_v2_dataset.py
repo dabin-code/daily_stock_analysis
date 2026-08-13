@@ -22,6 +22,11 @@ _HASH_BAR_FIELDS = (
     "high",
     "low",
     "close",
+    # `pre_close` 是复权链的唯一输入（`src/services/adjustment_chain.py`），
+    # 从 gate-3 起它决定回测看到的每一个价格与成交量。不哈希它，两份只有
+    # `pre_close` 不同的隔离数据集会得到同一个 data_version，于是冻结证据与
+    # base 快照缓存会跨数据集复用——和白名单漏登记同类的过度复用。
+    "pre_close",
     "volume",
     "amount",
     "pct_chg",
