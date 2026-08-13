@@ -36,6 +36,7 @@ from src.backtest.services.bottom_divergence_v2_report import (
     _read_universe_codes,
     _write_report,
     canonicalize_report,
+    resolve_pipeline_mode,
 )
 from src.backtest.services.bottom_divergence_v2_validation import (
     BottomDivergenceV2Validator,
@@ -69,6 +70,21 @@ def _validated_cost_model(config: Config) -> dict[str, float]:
     return {name: float(value) for name, value in costs.items()}
 
 
+def _apply_signal_research_mode(
+    args: argparse.Namespace,
+    config: Config,
+) -> Config:
+    """把 `--bypass-l2-theme-filter` 落到 config 上。
+
+    只加不减：flag 没给时保持 config 自身的取值（可能来自
+    `SIGNAL_RESEARCH_BYPASS_L2_THEME_FILTER`），否则命令行会把显式配置静默
+    翻回去。两个入口都调用它，重复调用是幂等的。
+    """
+    if getattr(args, "bypass_l2_theme_filter", False):
+        return replace(config, signal_research_bypass_l2_theme_filter=True)
+    return config
+
+
 def _zero_cost_result(
     args: argparse.Namespace,
     config: Config,
@@ -89,6 +105,7 @@ def _zero_cost_result(
         **costs,
     )
     report.update({
+        "pipeline_mode": resolve_pipeline_mode(config),
         "date_range": {
             "from": args.date_from.isoformat(),
             "to": args.date_to.isoformat(),
@@ -108,7 +125,7 @@ def _run_validation_cli_core(
     base_config: Optional[Config] = None,
 ) -> tuple[int, dict]:
     """Execute tuning replay, one locked test replay, and canonical output."""
-    config = base_config or get_config()
+    config = _apply_signal_research_mode(args, base_config or get_config())
     zero_cost = _zero_cost_result(args, config)
     if zero_cost is not None:
         return zero_cost
@@ -282,6 +299,7 @@ def _run_validation_cli_core(
             replay_service=metadata_service,
             universe=universe,
             parameter_snapshots=snapshots,
+            config=config,
         )
         _write_report(args.output, report)
         return 1, report
@@ -363,6 +381,7 @@ def _run_validation_cli_core(
         replay_service=metadata_service,
         universe=universe,
         parameter_snapshots=snapshots,
+        config=config,
     )
     _write_report(args.output, report)
     exit_code = 0 if report["eligible"] and report["passed"] else 1
@@ -377,7 +396,7 @@ def run_validation_cli(
     isolation_observer: Optional[Callable[[Any, Any], None]] = None,
 ) -> tuple[int, dict]:
     """Run against an injected replay boundary or an isolated local copy."""
-    config = base_config or get_config()
+    config = _apply_signal_research_mode(args, base_config or get_config())
     zero_cost = _zero_cost_result(args, config)
     if zero_cost is not None:
         return zero_cost

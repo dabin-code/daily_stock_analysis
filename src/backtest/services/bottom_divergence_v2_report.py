@@ -11,6 +11,30 @@ from typing import Any, Optional
 from .bottom_divergence_v2_validation import ValidationInputError
 
 
+# 报告里声明「这份数字回答的是哪个问题」的两个取值。
+#
+# `deployed` 的回放保留部署侧的全部过滤（含 L2 主线题材收窄），回答的是
+# 「按今天的部署口径，这套参数会选出什么」；`signal_measurement` 跳过题材
+# 收窄，回答的是「信号本身有没有预测力」。两者的样本量、期望、胜率没有可比
+# 性，报告不写清楚模式，隔几天再看这个 JSON 就无从分辨。
+PIPELINE_MODE_DEPLOYED = "deployed"
+PIPELINE_MODE_SIGNAL_MEASUREMENT = "signal_measurement"
+
+
+def resolve_pipeline_mode(config: Any) -> str:
+    """Name the question this run answers, from the run's own config.
+
+    刻意用直接属性访问而不是 `getattr(..., False)`：读不到这个字段时兜底成
+    `deployed`，等于把一次测量运行标成部署运行——正是这个字段要防的事。
+    宁可抛 AttributeError。
+    """
+    return (
+        PIPELINE_MODE_SIGNAL_MEASUREMENT
+        if config.signal_research_bypass_l2_theme_filter
+        else PIPELINE_MODE_DEPLOYED
+    )
+
+
 def canonical_json_dumps(payload: Any) -> str:
     """Serialize canonical UTF-8 JSON suitable for hashing and audit diffs."""
     return json.dumps(
@@ -102,9 +126,11 @@ def _enrich_report(
     replay_service: Any,
     universe: Any,
     parameter_snapshots: dict[str, dict[str, float]],
+    config: Any,
 ) -> dict:
     return canonicalize_report({
         **report,
+        "pipeline_mode": resolve_pipeline_mode(config),
         "data_version": replay_service.data_version(),
         "universe_identity": replay_service.universe_identity(universe),
         "date_range": {

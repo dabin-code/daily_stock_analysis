@@ -494,6 +494,9 @@ def replay_historical_dates(
             db_manager=dependencies.db_manager,
             skill_manager=skill_manager,
             lock_universe=False,
+            bypass_theme_filter=(
+                config.signal_research_bypass_l2_theme_filter
+            ),
         )
         candidates_with_context = [
             (

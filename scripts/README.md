@@ -759,6 +759,15 @@ python scripts/validate_bottom_divergence_v2.py --date-from 2026-06-01 --date-to
 
 ⚠️ 缓存键覆盖 `data_version`、universe 指纹、base 配置白名单与算法版本，任一不同都会重算而不是返回旧结果。**但改了 base 因子的计算代码却没有 bump `BASE_SNAPSHOT_ALGORITHM_VERSION`（在 `src/backtest/services/bottom_divergence_v2_performance.py`），持久化目录就会返回旧算法算出的因子**。拿不准时直接删掉整个缓存目录。
 
+**信号研究测量模式**
+
+```powershell
+# 跳过 L2 主线题材收窄，测量信号本身的预测力
+python scripts/validate_bottom_divergence_v2.py --date-from 2026-06-01 --date-to 2026-07-15 --market cn --universe-codes data/universe_smoke.txt --bypass-l2-theme-filter --output .claude/reviews/v2-measurement.json
+```
+
+默认关闭；关闭时行为与未引入该开关时完全一致。打开后 L2 不再按主线题材收窄 universe，因此报告回答的是「信号本身有没有 edge」而不是「部署口径会买什么」，两者的数字不可比。测量模式的运行在 `l2_filter_mode`（取 `theme_filter_bypassed_for_measurement`）、报告的 `pipeline_mode`、证据层缓存键与断点身份哈希上都与部署模式不同，不会互相续跑或复用证据；base 因子快照仍然共享，因为 L2 在它之后执行、改不到它。也可用环境变量 `SIGNAL_RESEARCH_BYPASS_L2_THEME_FILTER=true` 打开。
+
 ---
 
 ## 6. CI / 治理校验

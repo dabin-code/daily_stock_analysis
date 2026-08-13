@@ -92,6 +92,21 @@ def build_parser() -> argparse.ArgumentParser:
             "stale directory costs a recompute, never a wrong answer"
         ),
     )
+    parser.add_argument(
+        "--bypass-l2-theme-filter",
+        action="store_true",
+        help=(
+            "signal-research measurement mode: skip the L2 main-theme "
+            "universe shrink so every stock carrying an actionable stage "
+            "reaches the screener on its own event day. This answers "
+            "'does the signal itself have edge', NOT 'what would the "
+            "deployed pipeline have bought' — the two sets of numbers are "
+            "not comparable. The report records pipeline_mode="
+            "signal_measurement and the factor cache keys differ, so a "
+            "measurement run can neither be mistaken for nor served from a "
+            "deployed-mode run"
+        ),
+    )
     parser.add_argument("--progress-every", type=int, default=100)
     parser.add_argument("--workers", type=int, default=4)
     return parser

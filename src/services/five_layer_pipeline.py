@@ -134,6 +134,14 @@ _THEME_PRIORITY: Dict[str, int] = {
 # L2 universe 缩小: 主线板块候选不足时的最低阈值
 MIN_THEME_CANDIDATES = 10
 
+# 信号研究测量模式下 `l2_filter_mode` 的取值。
+#
+# 刻意与 `theme_universe_locked` 分开：后者声称「universe 已在上游锁定到
+# 指定板块」，是部署侧的一种正常形态；这个值声称的是「本次运行故意不按题材
+# 过滤，为的是测量信号本身」。两者合用一个取值，运行自己的统计就会对
+# 「universe 为什么这么宽」给出错误的解释，而两种口径的数字不可比。
+L2_FILTER_MODE_MEASUREMENT = "theme_filter_bypassed_for_measurement"
+
 
 @dataclass
 class PipelineResult:
@@ -158,6 +166,7 @@ class FiveLayerPipeline:
         db_manager: Any,
         skill_manager: Optional[Any] = None,
         lock_universe: bool = False,
+        bypass_theme_filter: bool = False,
     ) -> PipelineResult:
         stats: Dict[str, Any] = {
             "universe_before": len(snapshot_df),
@@ -308,7 +317,19 @@ class FiveLayerPipeline:
         l2_filter_mode = "full_universe"
         theme_member_candidate_count = 0
 
-        if lock_universe:
+        if bypass_theme_filter:
+            # 信号研究测量模式：整层跳过题材收窄，让全部 universe 进入选股。
+            # 排在 lock_universe 之前，是因为两者同时为真时必须报出测量模式——
+            # 部署侧的取值一旦出现在测量运行上，这份数字就会被当成可比的。
+            l2_filter_mode = L2_FILTER_MODE_MEASUREMENT
+            logger.info(
+                "pipeline L2: signal-measurement mode, theme shrink bypassed "
+                "(%d stocks, lock_universe=%s); these numbers are NOT "
+                "comparable with a deployed-mode run",
+                len(snapshot_df),
+                lock_universe,
+            )
+        elif lock_universe:
             # 题材选股已在 universe 层锁定为指定板块成分股，
             # 此处跳过热点板块收窄，让全部成分股进入策略筛选。
             l2_filter_mode = "theme_universe_locked"

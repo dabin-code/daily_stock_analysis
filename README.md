@@ -278,6 +278,17 @@ python scripts/validate_bottom_divergence_v2.py \
 `--workers` 默认 `4`，内存充足的 Windows 主机可使用 `12`；基准峰值约
 `1.71 GB`，正式全市场运行前应先按机器资源完成小样本基准。
 
+`--bypass-l2-theme-filter`（等价环境变量 `SIGNAL_RESEARCH_BYPASS_L2_THEME_FILTER`）
+可选，用于**信号研究测量模式**：跳过五层流水线 L2 的主线题材收窄，让全部 universe
+进入选股。默认关闭，关闭时行为与改动前完全一致。打开后回答的是「信号本身有没有
+预测力」，而不是「按部署口径今天会买什么」——题材收窄会让信号在其板块当天不热时
+从不被记录，等板块热起来事件已经过期，因此两种模式的样本量、期望与胜率**没有可比性**。
+测量模式的运行在多处带有不同标识：`l2_filter_mode` 取
+`theme_filter_bypassed_for_measurement`（与部署侧的 `theme_universe_locked` 区分开）、
+报告写 `pipeline_mode=signal_measurement`、因子缓存的证据层键与断点身份哈希也随之改变，
+因此两种模式既不会互相续跑，也不会互相复用证据。该开关只接到历史回放路径，
+每日选股链路结构上取不到它。
+
 交易成本配置为 `BACKTEST_BUY_COST_BPS`、`BACKTEST_SELL_COST_BPS` 和
 `BACKTEST_SLIPPAGE_BPS`。三项默认均为 `0.0`；零成本运行会先写出 canonical JSON，
 以 `ZERO_COST_MODEL` 和退出码 1 fail-close，不复制数据库、不执行长时间全市场回放。

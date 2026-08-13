@@ -11,6 +11,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`SIGNAL_RESEARCH_BYPASS_L2_THEME_FILTER` / `--bypass-l2-theme-filter` lets the
+  signal-research replay skip the L2 main-theme universe shrink, so the backtest can
+  answer whether the divergence signal itself has edge.** The signal-research replay
+  loses 97.09% of pipeline candidates before they become validation samples, and
+  95.6 of those 97.1 points come from one filter: a candidate only becomes a sample
+  on its own event date. Of the 2,083 identities that never produced a sample,
+  646 (31%) were removed by the L2 shrink on their event day — a sector-rotation
+  heuristic that has nothing to do with the signal being validated. A signal firing
+  on a day when its board is not hot is silently never recorded, and by the time the
+  board heats up the event is stale and dropped for good. That is correct for live
+  trading and wrong for measuring the signal, so the switch separates the two
+  questions rather than changing either answer.
+  Measured on ten trading days (2026-03-02 to 2026-03-13) over the 400-stock broad
+  universe, the shrink is the dominant constriction: universe rows reaching the
+  screener go from 67.5 to 398.6 per day, pipeline candidates from 31.5 to 162.2,
+  and validation samples over the window from 10 to 41.
+  **The two modes are separated at every layer that persists or reports a result,
+  because their numbers are not comparable.** `l2_filter_mode` carries
+  `theme_filter_bypassed_for_measurement`, deliberately distinct from the existing
+  `theme_universe_locked` — that value claims the universe was already locked to
+  specific boards upstream, which is a deployed-mode shape, and merging the two
+  would make a run's own statistics misexplain why its universe was wide. The
+  measurement label also wins when both switches are set, since a deployed label on
+  a measurement run invites a false comparison while the reverse only loses
+  information. The validation report gains `pipeline_mode`; the evidence-layer cache
+  key and the checkpoint identity both pick the field up from `asdict(config)`, so
+  a measurement run can neither resume a deployed checkpoint nor be served
+  deployed-mode evidence. That last one is verified by measurement rather than by
+  reading the hash: replaying the same code and day in both modes rebuilds the
+  frozen evidence twice instead of reusing it.
+  The switch is deliberately **not** in `BASE_FACTOR_CONFIG_FIELDS`: L2 runs after
+  the base factor pass, so the base snapshot is bit-identical in both modes and the
+  two share one cache entry. Adding it there would double full-market factor cost
+  for nothing. It is also not wired into the deployed screening path at all —
+  `screening_task_service` never passes it — so a stray environment variable cannot
+  move live stock selection.
+  Behaviour with the switch off is unchanged rather than merely equivalent, pinned
+  by running the same ten-day replay before and after the change and hashing every
+  per-day pipeline statistic, every selected candidate code, and the whole replay
+  batch: `8d05cbcc…` both times, with the second run recomputing all 3,986 pieces of
+  frozen evidence from bars rather than echoing a cache.
+  One cost is worth stating: because the evidence-layer key covers the whole
+  `Config`, adding the field invalidates the frozen-evidence and evaluated-factor
+  layers of any existing warm cache. Base snapshots survive. That is the safe
+  direction — a recompute, not a wrong answer — and it is the price of the
+  cross-mode isolation above.
 - **`run_data_manifest` records what data a run actually read, and
   `compare_manifests` turns "are these two runs comparable" into a verdict the code
   produces.** The database is alive — daily sync writes `stock_daily`, staging gets

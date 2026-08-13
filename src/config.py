@@ -593,6 +593,20 @@ class Config:
         repr=False,
     )
 
+    # === 信号研究测量模式（仅离线回放）===
+    # 打开后，五层流水线的 L2 主线题材收窄整层跳过，全部 universe 进入选股。
+    #
+    # 这不是"更宽松的部署参数"，而是另一个问题的答案。部署侧要回答的是
+    # 「这只票今天能不能买」，题材收窄是其中合法的一环；信号研究要回答的是
+    # 「这个背离信号本身有没有预测力」，而收窄会让信号在其板块当天不热时
+    # 从不被记录，等板块热起来事件已经过期。两种口径的数字不可比。
+    #
+    # 因此该开关只接到回放路径（`replay_historical_dates`），部署侧的
+    # `screening_task_service` 结构上取不到它；开启的运行会在
+    # `l2_filter_mode`、验证报告、证据层缓存键与 checkpoint 身份上都带上
+    # 与部署模式不同的取值。
+    signal_research_bypass_l2_theme_filter: bool = False
+
     # === 回测配置 ===
     backtest_enabled: bool = True
     backtest_eval_window_days: int = 10
@@ -1298,6 +1312,10 @@ class Config:
             bottom_divergence_v2_r2_weights=bottom_divergence_v2_r2_weights,
             _bottom_divergence_v2_parse_errors=tuple(
                 bottom_divergence_v2_parse_errors
+            ),
+            signal_research_bypass_l2_theme_filter=parse_env_bool(
+                os.getenv('SIGNAL_RESEARCH_BYPASS_L2_THEME_FILTER'),
+                default=False,
             ),
             backtest_enabled=os.getenv('BACKTEST_ENABLED', 'true').lower() == 'true',
             backtest_eval_window_days=int(os.getenv('BACKTEST_EVAL_WINDOW_DAYS', '10')),
