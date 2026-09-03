@@ -11,7 +11,10 @@ import pandas as pd
 
 from data_provider.base import DataFetchError
 from src.config import Config
-from src.services.market_data_sync_service import MarketDataSyncService
+from src.services.market_data_sync_service import (
+    MarketDataSyncService,
+    _wan_to_base,
+)
 from src.storage import DatabaseManager
 
 
@@ -920,6 +923,135 @@ class BulkSyncAdjustmentMetadataTestCase(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertAlmostEqual(row[0], 12.0, places=4)
         self.assertEqual(row[1], "raw")
+
+
+class WanToBaseUnitTestCase(unittest.TestCase):
+    """_wan_to_base 负责 Tushare daily_basic 的股本/市值单位换算（万股/万元 → 股/元）。"""
+
+    def test_wan_to_base_multiplies_by_ten_thousand(self) -> None:
+        self.assertEqual(_wan_to_base(1.5), 15000.0)  # 1.5 万股 = 15000 股
+
+    def test_wan_to_base_none_and_nan_and_invalid_return_none(self) -> None:
+        self.assertIsNone(_wan_to_base(None))
+        self.assertIsNone(_wan_to_base(float("nan")))
+        self.assertIsNone(_wan_to_base("not-a-number"))
+
+    def test_wan_to_base_zero_stays_zero(self) -> None:
+        self.assertEqual(_wan_to_base(0.0), 0.0)
+
+
+class DailyBasicSyncTestCase(unittest.TestCase):
+    """daily_basic 在 daily 之后用 UPDATE 补写基本面列，不覆盖 OHLCV 既有列。"""
+
+    def setUp(self) -> None:
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self._db_path = os.path.join(self._temp_dir.name, "test_daily_basic.db")
+        os.environ["DATABASE_PATH"] = self._db_path
+        os.environ["TUSHARE_TOKEN"] = "test-token"
+
+        Config.reset_instance()
+        DatabaseManager.reset_instance()
+        self.db = DatabaseManager.get_instance()
+
+    def tearDown(self) -> None:
+        DatabaseManager.reset_instance()
+        Config.reset_instance()
+        os.environ.pop("DATABASE_PATH", None)
+        os.environ.pop("TUSHARE_TOKEN", None)
+        self._temp_dir.cleanup()
+
+    @staticmethod
+    def _daily_frame() -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20260313",
+                    "open": 12.0,
+                    "high": 12.3,
+                    "low": 11.9,
+                    "close": 12.1,
+                    "vol": 2000.0,
+                    "amount": 2_420.0,
+                    "pct_chg": 1.1,
+                    "pre_close": 12.0,
+                }
+            ]
+        )
+
+    @staticmethod
+    def _basic_frame() -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20260313",
+                    "turnover_rate": 3.5,     # 百分比直存
+                    "float_share": 1000.0,    # 万股 → 10_000_000 股
+                    "circ_mv": 121_000.0,     # 万元 → 12.1 亿
+                    "total_share": 2000.0,
+                    "total_mv": 242_000.0,
+                }
+            ]
+        )
+
+    def _run_bulk_sync(self, trade_date: date):
+        fake_tushare = SimpleNamespace(
+            set_token=lambda _token: None,
+            pro_api=lambda: SimpleNamespace(
+                daily=lambda trade_date: self._daily_frame(),
+                daily_basic=lambda trade_date: self._basic_frame(),
+            ),
+        )
+        service = MarketDataSyncService(db_manager=self.db, fetcher_manager=None)
+        with patch.dict(sys.modules, {"tushare": fake_tushare}):
+            return service._try_bulk_sync(trade_date, {"000001"})
+
+    def test_daily_basic_updates_fundamental_columns(self) -> None:
+        trade_date = date(2026, 3, 13)
+        synced, _universe = self._run_bulk_sync(trade_date)
+        self.assertEqual(synced, 1)
+
+        conn = sqlite3.connect(self._db_path)
+        try:
+            turnover, float_share, circ_mv, close = conn.execute(
+                "SELECT turnover_rate, float_share, circ_mv, close FROM stock_daily "
+                "WHERE code='000001' AND date='2026-03-13'"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(turnover, 3.5, "换手率百分比直存")
+        self.assertEqual(float_share, 1000.0 * 10000, "流通股本万股→股")
+        self.assertEqual(circ_mv, 121_000.0 * 10000, "流通市值万元→元")
+        self.assertAlmostEqual(close, 12.1, places=4, msg="daily_basic 不得覆盖 OHLCV")
+
+    def test_daily_basic_failure_does_not_block_daily_ohlcv(self) -> None:
+        """daily_basic 缺失（api 无此方法）时，daily 的 OHLCV 仍须落库。"""
+        trade_date = date(2026, 3, 13)
+        fake_tushare = SimpleNamespace(
+            set_token=lambda _token: None,
+            # 只有 daily、没有 daily_basic → _sync_daily_basic 抛 AttributeError，
+            # 被 _try_bulk_sync 的 try/except 捕获，不阻断行情。
+            pro_api=lambda: SimpleNamespace(daily=lambda trade_date: self._daily_frame()),
+        )
+        service = MarketDataSyncService(db_manager=self.db, fetcher_manager=None)
+        with patch.dict(sys.modules, {"tushare": fake_tushare}):
+            synced, _universe = service._try_bulk_sync(trade_date, {"000001"})
+
+        self.assertEqual(synced, 1)
+
+        conn = sqlite3.connect(self._db_path)
+        try:
+            close, turnover = conn.execute(
+                "SELECT close, turnover_rate FROM stock_daily "
+                "WHERE code='000001' AND date='2026-03-13'"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertAlmostEqual(close, 12.1, places=4)
+        self.assertIsNone(turnover, "daily_basic 缺失时换手率应落 NULL，不伪造")
 
 
 if __name__ == "__main__":

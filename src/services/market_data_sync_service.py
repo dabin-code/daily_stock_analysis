@@ -34,6 +34,62 @@ _SOURCE_ATTEMPT_PATTERN = re.compile(
 )
 
 
+def _wan_to_base(value) -> Optional[float]:
+    """Tushare 股本/市值单位换算：万股/万元 → 股/元（×10000）。
+
+    daily_basic 的 float_share/total_share 为万股、circ_mv/total_mv 为万元。
+    None / NaN / 非法值一律返回 None 落库 NULL，绝不编造成 0.0（0 会让下游
+    换手率/市值打分静默退化，比缺失更隐蔽）。
+    """
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if v != v:  # NaN 判断（NaN != NaN 恒为 True），避免引入 pandas 依赖
+        return None
+    return v * 10000.0
+
+
+def _patch_tushare_endpoint(api, token: str) -> None:
+    """Patch tushare SDK 默认的 api.waditu.com（已废弃）到 api.tushare.pro。
+
+    与 TushareFetcher._patch_api_endpoint 同逻辑，这里独立一份是因为
+    _try_bulk_sync 直接 ts.pro_api() 绕过 TushareFetcher 类，SDK 默认
+    endpoint 无法解析会抛 DNS 错误（No address associated with hostname）。
+    """
+    import json as _json
+    import types
+
+    import pandas as pd
+    import requests
+
+    tushare_api_url = "http://api.tushare.pro"
+    _token = token
+    _timeout = getattr(api, "_DataApi__timeout", 30)
+
+    def patched_query(self_api, api_name, fields="", **kwargs):
+        req_params = {
+            "api_name": api_name,
+            "token": _token,
+            "params": kwargs,
+            "fields": fields,
+        }
+        res = requests.post(tushare_api_url, json=req_params, timeout=_timeout)
+        if res.status_code != 200:
+            raise Exception(f"Tushare API HTTP {res.status_code}")
+        result = _json.loads(res.text)
+        if result["code"] != 0:
+            raise Exception(result["msg"])
+        data = result["data"]
+        columns = data["fields"]
+        items = data["items"]
+        return pd.DataFrame(items, columns=columns)
+
+    api.query = types.MethodType(patched_query, api)
+
+
 class MarketDataSyncService:
     """全市场日线增量同步服务。"""
 
@@ -319,6 +375,9 @@ class MarketDataSyncService:
             try:
                 ts.set_token(config.tushare_token)
                 api = ts.pro_api()
+                # SDK 默认 endpoint api.waditu.com 已废弃，patch 到 api.tushare.pro，
+                # 否则 daily/daily_basic 都会抛 DNS 解析错误。
+                _patch_tushare_endpoint(api, config.tushare_token)
 
                 # Tushare API 超时保护：防止 api.daily() 无限阻塞
                 with ThreadPoolExecutor(max_workers=1) as executor:
@@ -397,6 +456,20 @@ class MarketDataSyncService:
                         synced += 1
                     # commit 由 begin() 上下文管理器自动处理
 
+                # ── 每日基本面同步：换手率 / 流通股本 / 流通市值 ──
+                # daily_basic 一次全市场调用补齐日频基本面，供选股因子层读取真实值
+                # （替代 factor_service 里 volume_ratio*2 的伪造换手率）。
+                # 失败不阻断 OHLCV 同步：换手率/市值缺失可接受，行情缺失不可接受。
+                try:
+                    basic_synced = self._sync_daily_basic(api, td_str, needed_codes)
+                    logger.info(
+                        f"[BulkSync] daily_basic 同步 {trade_date}: {basic_synced} 只"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[BulkSync] daily_basic 同步失败（换手率/市值缺失，不阻断行情）: {e}"
+                    )
+
                 logger.info(
                     f"[BulkSync] Tushare 批量同步 {trade_date}: {synced}/{len(needed_codes)} 只 "
                     f"(bulk universe={len(bulk_returned)} 只)"
@@ -411,6 +484,63 @@ class MarketDataSyncService:
                 else:
                     logger.warning(f"[BulkSync] Tushare 批量同步失败，降级到逐只模式: {e}")
                     return None
+
+    def _sync_daily_basic(
+        self, api, td_str: str, needed_codes: set
+    ) -> int:
+        """拉取并落库当日基本面（换手率/流通股本/流通市值）到 stock_daily。
+
+        在 daily 的 OHLCV 写入之后调用，用 UPDATE 只补基本面列，避免
+        INSERT OR REPLACE 把 pre_close / adj_convention 等既有列清空。
+        失败由调用方兜底：换手率/市值缺失可接受，行情缺失不可接受。
+        """
+        from sqlalchemy import text
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(api.daily_basic, trade_date=td_str)
+            try:
+                df = future.result(timeout=_BULK_FETCH_TIMEOUT)
+            except FuturesTimeoutError:
+                future.cancel()
+                logger.warning(
+                    f"[BulkSync] daily_basic({td_str}) 超时（{_BULK_FETCH_TIMEOUT}s）"
+                )
+                return 0
+
+        if df is None or df.empty:
+            logger.info(f"[BulkSync] daily_basic({td_str}) 返回空，可能非交易日")
+            return 0
+
+        updated = 0
+        with self.db._engine.begin() as conn:
+            for _, row in df.iterrows():
+                ts_code = str(row.get("ts_code", ""))
+                code = ts_code.split(".")[0] if ts_code else ""
+                if not code or code not in needed_codes:
+                    continue
+
+                td = str(row.get("trade_date", ""))
+                date_str = f"{td[:4]}-{td[4:6]}-{td[6:8]}" if len(td) == 8 else td
+
+                conn.execute(
+                    text(
+                        "UPDATE stock_daily SET "
+                        "turnover_rate=:turnover_rate, float_share=:float_share, "
+                        "circ_mv=:circ_mv, total_share=:total_share, total_mv=:total_mv "
+                        "WHERE code=:code AND date=:date"
+                    ),
+                    {
+                        "turnover_rate": row.get("turnover_rate"),
+                        "float_share": _wan_to_base(row.get("float_share")),
+                        "circ_mv": _wan_to_base(row.get("circ_mv")),
+                        "total_share": _wan_to_base(row.get("total_share")),
+                        "total_mv": _wan_to_base(row.get("total_mv")),
+                        "code": code,
+                        "date": date_str,
+                    },
+                )
+                updated += 1
+        return updated
 
     @staticmethod
     def _is_bulk_sentinel_enabled() -> bool:

@@ -22,6 +22,15 @@ screening:
     - field: ma100_low123_confirmed
       op: "=="
       value: true
+    # SOP 2.1：距 MA100 不得过远（站稳 MA100），超出 6% 已脱离最佳买点区（防追高）
+    - field: ma100_distance_pct
+      op: "<="
+      value: 6.0
+    # SOP 2.3：P3-P2 埋伏区允许缩量回踩，但刚突破 P2 的确认买点必须放量
+    # （分状态门控在 factor_service 的 ma100_low123_volume_confirmed 计算）
+    - field: ma100_low123_volume_confirmed
+      op: "=="
+      value: true
   scoring:
     - field: ma100_low123_pattern_strength
       weight: 40

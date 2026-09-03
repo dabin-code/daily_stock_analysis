@@ -36,13 +36,15 @@ _EXECUTE_RUN_DEADLINE_SECONDS: int = 30 * 60  # 30 分钟
 _CN_MARKET_CLOSE_TIME = dt_time(hour=15, minute=0)
 
 # ── L1 硬开关：市场环境 → 候选上限映射 ───────────────────────────────────────
+# SOP 1.1 大盘过滤器：MA100 线下（defensive / stand_aside）一律强制空仓、严禁个股。
 # stand_aside → 0 候选（总开关关闭）
-# defensive / balanced / aggressive → 不额外缩减候选上限
+# defensive → 0 候选（指数 < MA100，SOP 强制空仓或 ETF 观察）
+# balanced / aggressive → 不额外缩减候选上限
 def _make_regime_candidate_cap() -> dict:
     from src.schemas.trading_types import MarketRegime
     return {
         MarketRegime.STAND_ASIDE: 0,
-        MarketRegime.DEFENSIVE: None,
+        MarketRegime.DEFENSIVE: 0,
         MarketRegime.BALANCED: None,
         MarketRegime.AGGRESSIVE: None,
     }

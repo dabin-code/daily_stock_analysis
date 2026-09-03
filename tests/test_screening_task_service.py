@@ -3503,8 +3503,8 @@ def test_execute_run_adds_warning_when_market_guard_unsafe():
     assert result["status"] == "completed"
 
 
-def test_execute_run_keeps_candidate_limit_under_defensive_regime():
-    """defensive 环境只加风险提示，不应缩减用户请求的 candidate_limit。"""
+def test_execute_run_skips_pipeline_under_defensive_regime():
+    """defensive 环境（指数 < MA100）按 SOP 1.1 强制空仓，跳过选股输出 0 候选。"""
     from src.schemas.trading_types import MarketRegime, RiskLevel
 
     db = MagicMock()
@@ -3608,9 +3608,9 @@ def test_execute_run_keeps_candidate_limit_under_defensive_regime():
         )
 
     assert result["status"] == "completed"
-    assert pipeline_cls.return_value.run.call_args.kwargs["candidate_limit"] == 5
+    pipeline_cls.return_value.run.assert_not_called()
     saved_candidates = db.save_screening_candidates.call_args.kwargs["candidates"]
-    assert len(saved_candidates) == 5
+    assert len(saved_candidates) == 0
     # MarketGuard 被正确构造
     guard_cls.assert_called_once_with(
         fetcher_manager=market_data_sync_service.fetcher_manager,

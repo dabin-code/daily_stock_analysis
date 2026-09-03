@@ -19,6 +19,11 @@ setup_type: bottom_divergence_breakout
 
 screening:
   filters:
+    # SOP 1.1 全局前提：所有做多指令必须以价格运行在 MA100 之上为前提。
+    # 底背离双突破也必须站上 MA100，否则是 MA100 下方的弱势反抽，严禁做多。
+    - field: above_ma100
+      op: "=="
+      value: true
     - field: bottom_divergence_double_breakout
       op: "=="
       value: true

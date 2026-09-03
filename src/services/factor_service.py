@@ -34,6 +34,23 @@ from src.services.adjustment_chain import apply_read_adjustment
 logger = logging.getLogger(__name__)
 
 
+def _finite_float_or_none(value: Any) -> Optional[float]:
+    """安全转 float：None / NaN / 非法值一律返回 None。
+
+    用于读取 daily_basic 落库的真实换手率/市值字段——缺失应落 None 让下游
+    打分保守降级，而不是伪造 0.0 或 proxy 值静默污染。
+    """
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if v != v:  # NaN（NaN != NaN 恒为 True）
+        return None
+    return v
+
+
 # ─── ma100_60min_combined gating constants ────────────────────────────
 # Maximum bars since the most recent *real* upward crossing of MA100 that
 # still counts as a fresh breakout (inclusive; 0 = crossed on latest bar).
@@ -49,6 +66,10 @@ _MA100_60MIN_PRE_BELOW_RATIO_MIN = 0.6
 # crossing that closed at-or-below MA100.  Either ratio OR consecutive
 # count satisfies the pre-breakout background condition.
 _MA100_60MIN_PRE_CONSECUTIVE_BELOW_MIN = 3
+# ─── ma100_low123 成交量门槛 ─────────────────────────────────────────
+# SOP 2.3：低位 123 的 P3-P2 埋伏区允许缩量回踩，但刚突破 P2 的确认买点必须放量
+# （量比 ≥ 1.5）。用于 ma100_low123_volume_confirmed 分状态门控。
+_LOW123_VOLUME_RATIO_MIN = 1.5
 
 
 class FactorService:
@@ -134,6 +155,11 @@ class FactorService:
                     "volume": row.volume,
                     "amount": row.amount,
                     "pct_chg": row.pct_chg,
+                    # 每日基本面（daily_basic 每日同步落库），供换手率/市值打分
+                    # 读取真实值，替代 volume_ratio*2 伪造。
+                    "turnover_rate": row.turnover_rate,
+                    "float_share": row.float_share,
+                    "circ_mv": row.circ_mv,
                     # 复权链的唯一依据。日常同步的列清单保住了它
                     # （`market_data_sync_service.py:360-369`），
                     # `scripts/validate_staging_before_promotion.py` 守着它。
@@ -219,7 +245,9 @@ class FactorService:
             avg_amount = float(prior_amount.tail(5).mean()) if not prior_amount.empty else 0.0
             avg_volume = float(prior_volume.tail(5).mean()) if not prior_volume.empty else 0.0
             volume_ratio = float(latest["volume"]) / avg_volume if avg_volume else 0.0
-            turnover_rate = round(min(volume_ratio * 2.0, 100.0), 4)
+            # 换手率：读 daily_basic 每日同步落库的真实值；缺失/NaN/非法置 None，
+            # 不再用 volume_ratio*2 伪造（伪造值会让"高换手优先级"失真）。
+            turnover_rate = _finite_float_or_none(latest.get("turnover_rate"))
             trend_score = self._compute_trend_score(
                 close=float(latest["close"]),
                 ma5=float(close_series.tail(5).mean()),
@@ -251,7 +279,7 @@ class FactorService:
                     "avg_amount": round(avg_amount, 2),
                     "breakout_ratio": round(breakout_ratio, 4),
                     "pct_chg": float(latest["pct_chg"] or 0.0),
-                    "circ_mv": info.get("circ_mv"),
+                    "circ_mv": _finite_float_or_none(latest.get("circ_mv")),
                     "is_st": bool(info.get("is_st", False)),
                     "days_since_listed": int(days_since_listed),
                     "turnover_rate": turnover_rate,
@@ -1530,6 +1558,25 @@ class FactorService:
         )
         watchlist = above_ma100 and p123_watching
 
+        # ── 成交量确认（SOP 2.3 分状态）──
+        # P3-P2 埋伏区允许缩量回踩（埋伏本身就该缩量），但刚突破 P2 的确认买点
+        # 必须放量（量比 ≥ _LOW123_VOLUME_RATIO_MIN），否则是无量假突破。
+        volume_series = (
+            group["volume"].astype(float).fillna(0.0)
+            if "volume" in group.columns
+            else pd.Series(dtype=float)
+        )
+        if len(volume_series) >= 6:
+            latest_volume = float(volume_series.iloc[-1])
+            avg_volume = float(volume_series.iloc[:-1].tail(5).mean())
+            volume_ratio = latest_volume / avg_volume if avg_volume else 0.0
+        else:
+            volume_ratio = 0.0
+        volume_confirmed = bool(
+            in_pre_p2_entry_zone
+            or (just_breakout_p2 and volume_ratio >= _LOW123_VOLUME_RATIO_MIN)
+        )
+
         # ── MA score (breakout recency + distance) ──
         breakout_days = int(ma100_factors.get("ma100_breakout_days", 0))
         distance_pct = abs(float(ma100_factors.get("ma100_distance_pct", 0.0)))
@@ -1570,6 +1617,7 @@ class FactorService:
 
         return {
             "ma100_low123_confirmed": confirmed,
+            "ma100_low123_volume_confirmed": volume_confirmed,
             "ma100_low123_watchlist": watchlist,
             "ma100_low123_state": p123_state,
             "ma100_low123_data_complete": data_complete,

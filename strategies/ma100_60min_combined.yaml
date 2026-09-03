@@ -22,6 +22,10 @@ screening:
     - field: ma100_60min_confirmed
       op: "=="
       value: true
+    # SOP 2.1：放量突破 MA100，无量突破为假突破
+    - field: volume_ratio
+      op: ">="
+      value: 1.5
   scoring:
     - field: ma100_60min_freshness_score
       weight: 35

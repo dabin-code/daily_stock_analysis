@@ -36,6 +36,8 @@ _MIN_BOUNCE_PCT = 0.025        # P1→P2 最小反弹幅度（2.5%）
 _MAX_P1_P2_BARS = 30           # P1→P2 最大跨度（根数）：超过则视为松散结构，非同一轮低位123
 _MAX_P3_TO_BREAKOUT_BARS = 20  # P2突破距 P3 的最大间隔（根数）：超过则视为陈旧突破，不计为有效买点
 _BREAK_TOLERANCE = 0.0         # 破位容差比例：P3后最低价跌破 P1*(1-tol) 才算破位，默认严格跌破
+# SOP 5.1 结构止损：设在 P3（或 P1）下方统一缓冲（0.5%），与底背离检测器口径一致
+_STRUCTURAL_STOP_BUFFER_PCT = 0.005
 # 历史兼容参数：低位123不再以 P2→P3 回撤深度作为硬门槛，
 # 仅保留 P3 > P1 的结构要求。detect() 仍保留这两个参数以兼容旧调用。
 _MAX_RETRACE_PCT = 0.85
@@ -592,7 +594,7 @@ class Low123TrendlineDetector:
         # - 其他 → structure_only
         if latest_close > p2_val and bo_p2_bar is not None:
             entry_price = float(close.iloc[bo_p2_bar])
-            stop_loss = round(p3_val, 4)
+            stop_loss = round(p3_val * (1 - _STRUCTURAL_STOP_BUFFER_PCT), 4)
             pb_reentry, tr_stop = cls._compute_post_breakout_signals(
                 df, close, p2_val, p3_val, bo_p2_bar, last_idx,
             )

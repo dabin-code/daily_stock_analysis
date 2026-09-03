@@ -51,6 +51,8 @@ _LOW_POSITION_PCT = 0.30    # A 须在近60 bar 价格区间最低30%分位
 _MIN_DIF_NEGATIVE_RATIO = 0.005  # DIF 须低于 -price*0.5%（过滤零轴噪音）
 _MAX_BREAKOUT_GAP = 30      # 双突破距 B 的最大间隔 bars：超过视为陈旧突破，不计双突破确认
 _BREAK_TOLERANCE = 0.0      # 破位容差比例（0~1）：B 后最低价跌破 min(A,B)*(1-tol) 视为结构失效
+# SOP 5.1 结构止损：设在 A/B 低点下方统一缓冲（0.5%），与低位123检测器口径一致
+_STRUCTURAL_STOP_BUFFER_PCT = 0.005
 
 # ---------------------------------------------------------------------------
 # 六种有效形态定义
@@ -746,8 +748,8 @@ class BottomDivergenceBreakoutDetector:
 
         entry_price = None
         stop_loss_price = None
-        # 书中要求止损设在"新低点下方"，留3%缓冲
-        initial_stop_loss = round(min(a_price, b_price) * 0.97, 4)
+        # SOP 5.1 要求止损设在"新低点下方"，统一 0.5% 缓冲（与低位123口径一致）
+        initial_stop_loss = round(min(a_price, b_price) * (1 - _STRUCTURAL_STOP_BUFFER_PCT), 4)
 
         if state == "confirmed":
             entry_bar = confirmation_bar

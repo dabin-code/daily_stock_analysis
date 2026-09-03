@@ -102,7 +102,15 @@ class StockDaily(Base):
     ma10 = Column(Float)
     ma20 = Column(Float)
     volume_ratio = Column(Float)  # 量比
-    
+
+    # 每日基本面（Tushare daily_basic，每日收盘后由 market_data_sync_service 同步）
+    # 均为日频字段：换手率每天变，股本/市值随价格与股本每天变。
+    turnover_rate = Column(Float)  # 换手率（%）
+    float_share = Column(Float)    # 流通股本（股）
+    circ_mv = Column(Float)        # 流通市值（元）
+    total_share = Column(Float)    # 总股本（股）
+    total_mv = Column(Float)       # 总市值（元）
+
     # 数据来源
     data_source = Column(String(50))  # 记录数据来源（如 AkshareFetcher）
 
@@ -166,6 +174,11 @@ class StockDaily(Base):
             'ma10': self.ma10,
             'ma20': self.ma20,
             'volume_ratio': self.volume_ratio,
+            'turnover_rate': self.turnover_rate,
+            'float_share': self.float_share,
+            'circ_mv': self.circ_mv,
+            'total_share': self.total_share,
+            'total_mv': self.total_mv,
             'data_source': self.data_source,
             'adj_factor': self.adj_factor,
             'adj_anchor_date': self.adj_anchor_date,
@@ -1431,6 +1444,7 @@ class DatabaseManager:
                 self._migrate_sqlite_run_data_manifest_fields()
                 self._migrate_sqlite_stock_daily_adj_factor_fields()
                 self._migrate_sqlite_stock_daily_pre_close_fields()
+                self._migrate_sqlite_stock_daily_fundamental_fields()
                 self._migrate_sqlite_instrument_delist_date_field()
         except Exception as exc:
             logger.exception("Inline database migration failed: %s", exc)
@@ -1696,6 +1710,38 @@ class DatabaseManager:
                     "CREATE INDEX IF NOT EXISTS ix_stock_daily_adj_convention "
                     "ON stock_daily(adj_convention)",
                 )
+
+            if not added:
+                return
+
+            logger.info(
+                "Applying inline SQLite migration: added %s to stock_daily",
+                ", ".join(added),
+            )
+
+    def _migrate_sqlite_stock_daily_fundamental_fields(self) -> None:
+        """向后兼容：给已有 stock_daily 补基本面五列（换手率/股本/市值）。
+
+        全部留 NULL，不做任何回填：历史换手率、流通股本、流通市值是日频字段，
+        事后无法从既有 OHLCV 行可靠重建，编造默认值会让选股因子静默吃进假数据。
+        存量行由每日 daily_basic 同步（market_data_sync_service）或历史回填填充。
+        """
+        with self._engine.begin() as conn:
+            existing = {
+                row[1]
+                for row in conn.exec_driver_sql(
+                    "PRAGMA table_info(stock_daily)"
+                ).fetchall()
+            }
+            added: List[str] = []
+            for col in (
+                "turnover_rate", "float_share", "circ_mv", "total_share", "total_mv",
+            ):
+                if col not in existing:
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE stock_daily ADD COLUMN {col} FLOAT"
+                    )
+                    added.append(col)
 
             if not added:
                 return
