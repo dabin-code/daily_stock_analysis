@@ -36,7 +36,7 @@ from src.indicators.resistance_zone_detector import ResistanceZoneDetector
 _MIN_BARS = 60
 _SWING_ORDER = 5
 _LOOKBACK = 100
-_MIN_AB_GAP = 10            # A/B 最小间隔 bars
+_MIN_AB_GAP = 20            # A/B 最小间隔 bars（约1个月），过滤短促杂波，只认"肉眼可见的清晰波段"
 _MAX_AB_GAP = 60            # A/B 最大间隔 bars，避免跨越数月拼接结构
 _FLAT_TOLERANCE = 0.05      # 价格 flat 判定容差（5%）
 _MACD_FLAT_TOLERANCE = 0.30 # MACD flat 判定容差（30%，DIF/DEA 波动大于价格）
