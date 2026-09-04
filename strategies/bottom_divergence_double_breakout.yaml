@@ -24,6 +24,10 @@ screening:
     - field: above_ma100
       op: "=="
       value: true
+    # SOP 2.1/2.2 放量突破：双突破必须放量（量比 ≥1.5），无量突破为假突破。
+    - field: volume_ratio
+      op: ">="
+      value: 1.5
     - field: bottom_divergence_double_breakout
       op: "=="
       value: true

@@ -156,10 +156,11 @@ class FactorService:
                     "amount": row.amount,
                     "pct_chg": row.pct_chg,
                     # 每日基本面（daily_basic 每日同步落库），供换手率/市值打分
-                    # 读取真实值，替代 volume_ratio*2 伪造。
-                    "turnover_rate": row.turnover_rate,
-                    "float_share": row.float_share,
-                    "circ_mv": row.circ_mv,
+                    # 读取真实值，替代 volume_ratio*2 伪造。用 getattr 兼容
+                    # SimpleNamespace 测试夹具（缺列时返回 None，不报 AttributeError）。
+                    "turnover_rate": getattr(row, "turnover_rate", None),
+                    "float_share": getattr(row, "float_share", None),
+                    "circ_mv": getattr(row, "circ_mv", None),
                     # 复权链的唯一依据。日常同步的列清单保住了它
                     # （`market_data_sync_service.py:360-369`），
                     # `scripts/validate_staging_before_promotion.py` 守着它。

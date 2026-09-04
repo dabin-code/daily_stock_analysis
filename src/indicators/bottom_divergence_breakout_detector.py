@@ -23,10 +23,12 @@ import numpy as np
 import pandas as pd
 
 from src.indicators.divergence_detector import (
+    DivergenceDetector,
     compute_macd,
     find_swing_highs,
     find_swing_lows,
 )
+from src.indicators.resistance_zone_detector import ResistanceZoneDetector
 
 # ---------------------------------------------------------------------------
 # 可调默认参数（均可通过 detect() kwargs 覆盖）
@@ -751,6 +753,36 @@ class BottomDivergenceBreakoutDetector:
         # SOP 5.1 要求止损设在"新低点下方"，统一 0.5% 缓冲（与低位123口径一致）
         initial_stop_loss = round(min(a_price, b_price) * (1 - _STRUCTURAL_STOP_BUFFER_PCT), 4)
 
+        # --- 止盈结构触发（SOP 5.2）：远期强阻力位 + 红柱高位顶背离 ---
+        # 顶背离：价格 higher-high + MACD 红柱 lower-high（DivergenceDetector.detect_bearish）
+        top_divergence = False
+        try:
+            df_for_div = df[["close"]].copy()
+            if "high" in df.columns:
+                df_for_div["high"] = df["high"].values
+            if "low" in df.columns:
+                df_for_div["low"] = df["low"].values
+            top_divergence = bool(
+                DivergenceDetector.detect_bearish(df_for_div).get("found", False)
+            )
+        except Exception:
+            top_divergence = False
+
+        # 远期强阻力：R1 阻力区上沿（有市场记忆的供给区，SOP 5.2"强阻力"）
+        far_resistance = None
+        try:
+            rz = ResistanceZoneDetector.calculate(
+                df,
+                a_idx=a_idx,
+                b_idx=b_idx,
+                candidate_version="bottom-divergence-v1",
+            )
+            r1_zone = rz.get("r1")
+            if r1_zone:
+                far_resistance = r1_zone.get("upper") or r1_zone.get("upper_body")
+        except Exception:
+            far_resistance = None
+
         if state == "confirmed":
             entry_bar = confirmation_bar
             entry_price = round(float(close.iloc[entry_bar]), 4)
@@ -770,18 +802,34 @@ class BottomDivergenceBreakoutDetector:
             low_col=df["low"].reset_index(drop=True) if "low" in df.columns else close,
         )
 
-        # --- 退出计划（书中：自然止损法 + 分批止盈） ---
+        # --- 退出计划（SOP 5.2：结构止盈 + 自然止损法） ---
+        # 首目标：远期强阻力（R1 上沿）优先；无 R1 或 R1 不高于入场价时回退 +10%
+        tp_first_price = (
+            far_resistance
+            if (far_resistance and entry_price and far_resistance > entry_price)
+            else None
+        )
+        take_profit_targets = []
+        if tp_first_price:
+            take_profit_targets.append({
+                "price": round(tp_first_price, 4),
+                "action": "减半仓",
+                "label": "远期强阻力(R1)",
+            })
+        else:
+            take_profit_targets.append({"pct": 10, "action": "减半仓", "label": "首目标+10%"})
+        take_profit_targets.append({"pct": 20, "action": "再减1/4", "label": "次目标+20%"})
+        take_profit_targets.append({"remaining": True, "action": "跌破最近低点清仓", "label": "尾仓跟踪止损"})
+
         exit_plan = {
             "initial_stop_loss": initial_stop_loss,
             "critical_zone_lower": round(min(
                 tl_proj or initial_stop_loss,
                 h_price * 0.97,
             ), 4),
-            "take_profit_targets": [
-                {"pct": 10, "action": "减半仓", "label": "首目标+10%"},
-                {"pct": 20, "action": "再减1/4", "label": "次目标+20%"},
-                {"remaining": True, "action": "跌破最近低点清仓", "label": "尾仓跟踪止损"},
-            ],
+            "take_profit_targets": take_profit_targets,
+            "take_profit_resistance": far_resistance,
+            "top_divergence": top_divergence,
             "invalidation_days": 3,
             "trailing_stop_method": "natural_stop_loss",
         }
